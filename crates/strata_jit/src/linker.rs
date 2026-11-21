@@ -22,7 +22,8 @@ pub fn link_shared_object(obj_path: &Path, out_dylib: &Path) -> Result<(), JitEr
             .arg("-fPIC")
             .arg(obj_path)
             .arg("-o")
-            .arg(out_dylib);
+            .arg(out_dylib)
+            .arg("-lm");
     }
 
     let output = cmd.output().map_err(|e| {

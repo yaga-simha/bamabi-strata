@@ -8,7 +8,6 @@
 
 pub mod bevy_native;
 pub mod c99;
-pub mod expr;
 pub mod rust_guest;
 
 use serde::{Deserialize, Serialize};
