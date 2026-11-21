@@ -1,0 +1,39 @@
+[package]
+name = "stratac"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Unified CLI, incremental Salsa builder, Ed25519/BamPack packager, and headless sim_test runner for Strata v2.0"
+
+[[bin]]
+name = "stratac"
+path = "src/main.rs"
+
+[features]
+default = ["sim-runner"]
+sim-runner = ["dep:bamabi_host", "dep:bamabi_native_rt", "dep:bevy_app", "dep:bevy_ecs"]
+
+[dependencies]
+bamabi_host = { workspace = true, features = ["signature-verification"], optional = true }
+bamabi_manifest.workspace = true
+bamabi_native_rt = { workspace = true, optional = true }
+bamabi_sdk_gen.workspace = true
+bamabi_sys.workspace = true
+bamabi_trust.workspace = true
+bevy_app = { workspace = true, optional = true }
+bevy_ecs = { workspace = true, optional = true }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+strata_codegen.workspace = true
+strata_jit.workspace = true
+strata_mir.workspace = true
+strata_sema.workspace = true
+strata_syntax.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,171 @@
+// =========================================================================
+// COOKBOOK 3: SOULSLIKE COMBAT & BONFIRE RESET (soulslike_combat.strata)
+// Demonstrates: @soa, timeline, InputBuffer, obs cascade, @persist, despawn_all
+// =========================================================================
+module genres::soulslike @version(1.0.0);
+
+enum CombatAction { LightAttack = 0, HeavyAttack = 1, DodgeRoll = 2, Parry = 3 }
+
+resource SimClock { dt: sec = 16.6667_ms } // 60 Hz deterministic combat clock
+
+component Pos3D { xyz: vec3 = vec3::ZERO }
+
+@soa @summary_tick
+component CombatantBody @require(Pos3D) {
+    hot {
+        hp:      f32 = 800.0,
+        poise:   f32 = 80.0,
+        stamina: f32 = 120.0,
+        state_flags: u32 = 0, // bit 0 = Exhausted, bit 1 = RiposteVulnerable
+    }
+    cold caps {
+        max_hp:             f32 = 800.0,
+        max_poise:          f32 = 80.0,
+        max_stamina:        f32 = 120.0,
+        stamina_regen_rate: f32 = 42.0,
+        stamina_delay_rem:  sec = 0.0_s,
+        poise_delay_rem:    sec = 0.0_s,
+    }
+}
+
+assert_layout(CombatantBody::hot, size == 16, align == 4);
+
+component ActionQueue { buffer: InputBuffer<CombatAction, 3> }
+component EnemySpawnerAnchor @persist @require(Pos3D) { archetype_id: u16 }
+tag RespawnAtGrace, BossEntity;
+
+@persist component Bloodstain { runes_held: u64 = 0, active: bool = false }
+@persist object ActiveBloodstain { Bloodstain {}, Pos3D {} }
+
+@sparse
+timeline DodgeRollTimeline @rate(60_hz) @duration(28_f) {
+    window iframes  =  2_f .. 15_f; // 13 frames of invulnerability
+    window recovery = 15_f .. 28_f;
+    window cancel   = 22_f .. 28_f;
+}
+
+@sparse
+timeline HeavySlashTimeline @rate(60_hz) @duration(52_f) {
+    window startup     =  0_f .. 18_f;
+    window hyper_armor = 12_f .. 32_f;
+    window parryable   = 14_f .. 20_f;
+    window active_hit  = 18_f .. 26_f;
+    window recovery    = 26_f .. 52_f;
+}
+
+@sparse
+timeline ParryShieldTimeline @rate(60_hz) @duration(30_f) {
+    window startup      =  0_f ..  4_f;
+    window active_parry =  4_f .. 12_f; // 8-frame parry window
+    window recovery     = 12_f .. 30_f;
+}
+
+@sparse component RiposteOpen { remaining: sec = 2.4_s }
+
+event WeaponStrike { attacker: Ref<CombatantBody>, hp_dmg: f32, poise_dmg: f32 }
+event PostureBroken { victim: Ref<CombatantBody> }
+event RestAtGraceEvent { player: Ref<CombatantBody> }
+
+// Parallel stamina & poise regeneration across all active combatants (16B hot stratum!)
+@par(chunk = 512)
+sys tick_stamina_and_poise(clk: &res SimClock) {
+    uniform let dt = clk.dt;
+    uniform let dt_s = dt.as_secs();
+
+    for c in query(
+        stamina: &mut CombatantBody.stamina,
+        poise:   &mut CombatantBody.poise,
+        flags:   &mut CombatantBody.state_flags,
+        caps:    &mut CombatantBody::caps,
+    ) {
+        if c.caps.stamina_delay_rem > 0.0_s {
+            c.caps.stamina_delay_rem -= dt;
+        } else if c.stamina < c.caps.max_stamina {
+            let regen_mult = if (c.flags & 1) != 0 { 0.65 } else { 1.0 }; // Exhaustion penalty
+            c.stamina = min(c.caps.max_stamina, c.stamina + c.caps.stamina_regen_rate * regen_mult * dt_s);
+            if c.stamina >= c.caps.max_stamina * 0.35 {
+                c.flags &= !1_u32; // Clear Exhausted once recovered to 35%
+            }
+        }
+
+        if c.caps.poise_delay_rem > 0.0_s {
+            c.caps.poise_delay_rem -= dt;
+        } else if c.poise < c.caps.max_poise {
+            c.poise = min(c.caps.max_poise, c.poise + 25.0 * dt_s);
+        }
+    }
+}
+
+// Zero-polling combat resolution: checks i-frames, active parry vs parryable, hyper-armor, & poise break!
+obs on_weapon_strike(trg: &Trigger<WeaponStrike, CombatantBody>) {
+    let ev = trg.payload;
+    let victim_id = trg.target;
+
+    // 1. Check defender DodgeRoll i-frames (1-instruction bitmask check!)
+    if let Some(roll) = query_one(tl: &DodgeRollTimeline).on(victim_id) {
+        if roll.tl.in(iframes) { return; }
+    }
+
+    // 2. Check defender active parry against attacker's parryable window!
+    if let Some(parry) = query_one(tl: &ParryShieldTimeline).on(victim_id) {
+        if parry.tl.in(active_parry) {
+            if let Some(atk_tl) = query_one(tl: &HeavySlashTimeline).on(ev.attacker) {
+                if atk_tl.tl.in(parryable) {
+                    remove<HeavySlashTimeline>(ev.attacker);
+                    trigger(ev.attacker, PostureBroken { victim: ev.attacker });
+                    return;
+                }
+            }
+        }
+    }
+
+    // 3. Apply HP & Poise damage (halved poise dmg during hyper-armor)
+    if let Some(v) = query_one(
+        hp:    &mut CombatantBody.hp,
+        poise: &mut CombatantBody.poise,
+        caps:  &mut CombatantBody::caps,
+        slash: ?&HeavySlashTimeline,
+    ).on(victim_id) {
+        let ha_mult = if let Some(s) = v.slash { if s.in(hyper_armor) { 0.5 } else { 1.0 } } else { 1.0 };
+        v.hp    -= ev.hp_dmg;
+        v.poise -= ev.poise_dmg * ha_mult;
+        v.caps.poise_delay_rem = 3.0_s;
+
+        if v.poise <= 0.0 {
+            v.poise = v.caps.max_poise;
+            trigger(victim_id, PostureBroken { victim: victim_id });
+        }
+    }
+}
+
+obs on_posture_broken(trg: &Trigger<PostureBroken, CombatantBody>) {
+    insert(trg.target, RiposteOpen { remaining: 2.4_s });
+    if let Some(v) = query_one(flags: &mut CombatantBody.state_flags).on(trg.target) {
+        v.flags |= 2_u32; // RiposteVulnerable
+    }
+}
+
+// Bonfire / Grace Reset: clears all RespawnAtGrace enemies in 1 call (Slot 40) & respawns from @persist anchors!
+obs on_rest_at_grace(trg: &Trigger<RestAtGraceEvent>) {
+    despawn_all<With<RespawnAtGrace>>();
+
+    if let Some(p) = query_one(hp: &mut CombatantBody.hp, st: &mut CombatantBody.stamina, caps: &CombatantBody::caps).on(trg.payload.player) {
+        p.hp = p.caps.max_hp;
+        p.st = p.caps.max_stamina;
+    }
+
+    for anchor in query(pos: &Pos3D.xyz).with<EnemySpawnerAnchor>() {
+        spawn {
+            CombatantBody {},
+            Pos3D { xyz: anchor.pos },
+            RespawnAtGrace,
+        };
+    }
+}
+
+schedule FixedUpdate {
+    seq SoulslikeCombat {
+        set Timelines { DodgeRollTimeline, HeavySlashTimeline, ParryShieldTimeline }
+        set Resources { tick_stamina_and_poise }
+    }
+}

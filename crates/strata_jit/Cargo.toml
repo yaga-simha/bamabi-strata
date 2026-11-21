@@ -1,0 +1,28 @@
+[package]
+name = "strata_jit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Zero-Bevy Cranelift PIC native .dylib/.so compiler for StrataMir targeting bamabi ABI 0.3.0"
+
+[dependencies]
+bamabi_sys.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-module.workspace = true
+cranelift-object.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strata_codegen.workspace = true
+strata_mir.workspace = true
+strata_sema.workspace = true
+target-lexicon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+strata_syntax.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

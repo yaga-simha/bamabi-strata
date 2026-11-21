@@ -1,0 +1,27 @@
+[package]
+name = "strata_lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Zero-Bevy tower-lsp Language Server and SystemTelemetryDigest64 / BRP telemetry subscriber for Strata v2.0"
+
+[[bin]]
+name = "strata-lsp"
+path = "src/main.rs"
+
+[dependencies]
+bamabi_sys.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strata_sema.workspace = true
+strata_syntax.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower-lsp.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

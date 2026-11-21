@@ -1,0 +1,26 @@
+name: Nightly Deep Verification
+
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  extended-proptest-and-parity:
+    name: Extended Proptest (1024 cases) & 4-Way Parity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run extended property-based and 4-way differential parity suite
+        run: cargo xtask nightly --cases 1024

@@ -1,0 +1,28 @@
+[package]
+name = "bamabi_native_rt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Zero-overhead Tier 3 static Bevy 0.20 runtime adapter and AbiPod primitives for bamabi-strata"
+
+[features]
+default = ["shared-bridge"]
+shared-bridge = ["dep:bamabi_host"]
+static-console = []
+
+[dependencies]
+bamabi_sys.workspace = true
+bamabi_host = { workspace = true, optional = true }
+bevy_app.workspace = true
+bevy_ecs.workspace = true
+bevy_reflect.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

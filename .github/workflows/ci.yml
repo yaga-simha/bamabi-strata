@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality-and-tests:
+    name: Format, Lint, Isolation & Tests
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify formatting and BENCHMARKS.md structure
+        run: |
+          set -euo pipefail
+          cargo xtask fmt
+          cargo xtask bench --check-docs
+
+      - name: Run policy, zero-Bevy/static-console isolation, clippy, and strict rustdoc
+        run: cargo xtask lint
+
+      - name: Run workspace unit, integration, parity, proptest, static-console, and doc tests
+        run: cargo xtask test
+
+  audit:
+    name: ABI Lock, Typos & Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Spellcheck repository (`typos`)
+        uses: crate-ci/typos@v1.31.1
+
+      - name: Install `cargo-deny`
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Verify abi-lock.toml, Cargo.lock pin, and cargo-deny
+        run: cargo xtask audit --skip-typos
+
+  kani:
+    name: Kani Formal Verification (PO-S1..PO-S10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Kani Verifier & run workspace proofs
+        uses: model-checking/kani-github-action@69d357bade1eb7b32bc3fc3d5c3d173c5bfa5237 # v1
+        with:
+          kani-version: '0.68.0'
+          args: >-
+            -p strata_sema -p strata_mir -p strata_jit -p strata_lsp
+            -Z unstable-options
+            --harness-timeout 10m
+            --output-format terse
+            -j
+
+      - name: Verify `bamabi_native_rt` proofs (`PO-S1`..`PO-S5`, `static-console`)
+        run: cargo xtask kani --crate bamabi_native_rt --timeout 600
+
+  benchmarks:
+    name: Compiler & 4-Tier Execution Benchmarks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmark suite (`--quick` on PRs, full on main push)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          if [ "${{ github.event_name }}" = "push" ] && { [ "${{ github.ref }}" = "refs/heads/main" ] || [ "${{ github.ref }}" = "refs/heads/master" ]; }; then
+            cargo xtask bench --write-docs --json target/bench-results.json
+          else
+            cargo xtask bench --quick --no-write-docs --json target/bench-results.json
+          fi
+          cat target/bench-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark JSON & Markdown artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            target/bench-results.json
+            target/bench-summary.md
+            BENCHMARKS.md
+          if-no-files-found: warn

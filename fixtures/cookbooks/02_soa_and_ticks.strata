@@ -1,0 +1,40 @@
+module tutorial::soa_and_ticks @version(1.0.0);
+
+@soa @summary_tick
+component DroneHull {
+    hot {
+        hp:     f32 = 100.0,
+        shield: f32 = 50.0,
+        heat:   f32 = 0.0,
+        flags:  u32 = 0,          // 16 B hot stratum -> 4 drones/cache line
+    }
+    cold telemetry {
+        serial_code: InlineStr<32>,
+        flight_log:  SmallVec<vec3, 4>,
+    }
+}
+
+assert_layout(DroneHull::hot, size == 16, align == 4);
+
+stream FleetDigest { min_hp: f32, overheated_count: u32 }
+
+@par(chunk = 1024)
+sys clamp_overheated_drones() {
+    // `&mut?` marks change ticks ONLY on rows where `heat >= 100.0`!
+    for d in query(hp: &mut? DroneHull.hp, heat: &mut? DroneHull.heat) {
+        if d.heat >= 100.0 {
+            d.hp   = max(0.0, d.hp - 5.0);
+            d.heat = 95.0;
+        }
+    }
+}
+
+@par(read_only, chunk = 2048)
+sys audit_fleet_health() {
+    let (lowest_hp, hot_cnt) = for d in query(hp: &DroneHull.hp, heat: &DroneHull.heat)
+    reduce (
+        min_hp:  min(9999.0, d.hp),
+        hot_cnt: sum(0_u32,  if d.heat >= 80.0 { 1_u32 } else { 0_u32 }),
+    );
+    emit(FleetDigest { min_hp: lowest_hp, overheated_count: hot_cnt });
+}

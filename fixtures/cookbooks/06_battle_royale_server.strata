@@ -1,0 +1,188 @@
+// =========================================================================
+// COOKBOOK 4: BATTLE ROYALE SERVER (battle_royale_server.strata)
+// Demonstrates: @deterministic, @rollback, spatial_history, curve, &mut?, par reduce, task
+// =========================================================================
+module genres::battle_royale @version(1.0.0) @deterministic;
+
+const MAX_PLAYERS: u32 = 128;
+
+curve RifleDamageFalloff(meters -> f32) = [
+    (0.0_m,   34.0),
+    (50.0_m,  34.0),
+    (120.0_m, 22.0),
+    (300.0_m, 14.0),
+];
+
+@rollback
+resource MatchClock { tick: u32 = 0, dt: sec = 16.6667_ms }
+
+@rollback
+resource StormCircle {
+    center_xz:   vec2   = vec2::ZERO,
+    radius:      meters = 1200.0_m,
+    target_rad:  meters = 200.0_m,
+    shrink_rate: mps    = 12.0_mps,
+    dps:         f32    = 8.0,
+    alive_count: u32    = 100,
+}
+
+relation InSquad    [exclusive, cleanup_remove];
+relation EquippedOn [exclusive, cascade_despawn] { slot: u8 }
+relation IsA        [acyclic];
+
+@rollback component Pos3D { xyz: vec3 = vec3::ZERO }
+@rollback component HitCapsule { radius: meters = 0.45_m, half_height: meters = 0.9_m }
+
+@soa @rollback @summary_tick
+component PlayerVitals @require(Pos3D, HitCapsule) {
+    hot {
+        hp:      f32 = 100.0,
+        shield:  f32 = 100.0,
+        bleed:   f32 = 100.0,
+        flags:   u32 = 0, // bit 0 = Downed, bit 1 = Eliminated
+    }
+    cold meta {
+        player_slot: u16 = 0,
+        kills:       u16 = 0,
+        ping_ticks:  u8  = 0,
+    }
+}
+
+component BallisticRound @require(Pos3D) {
+    prev_xyz:     vec3,
+    vel:          vec3,
+    traveled_m:   meters = 0.0_m,
+    shooter:      Ref<PlayerVitals>,
+    rewind_tick:  u32,
+    ttl:          sec    = 3.0_s,
+}
+
+tag AlivePlayer;
+
+// 16-frame (~266ms @ 60Hz) zero-allocation ring buffer for lag-compensated ballistic sweeps!
+spatial_history PlayerHitHistory(
+    frames:    16,
+    cell_size: 16.0_m,
+    bounds:    vec2(-2048.0_m, -2048.0_m)..vec2(2048.0_m, 2048.0_m),
+    capacity:  MAX_PLAYERS,
+) over AlivePlayer by Pos3D.xyz cache (cap: HitCapsule);
+
+event BulletHitEvent {
+    round:   Ref<BallisticRound>,
+    shooter: Ref<PlayerVitals>,
+    victim:  Ref<PlayerVitals>,
+    dist_m:  meters,
+}
+
+// Interruptible 5-second squad revive coroutine (`@sparse` AbiPod, zero heap!)
+@sparse
+task SquadReviveTask(patient: Ref<PlayerVitals>)
+    on (medic_pos: &Pos3D.xyz, medic_flags: &PlayerVitals.flags)
+    using (clk: &res MatchClock)
+{
+    abort_if (medic_flags & 3_u32) != 0 { } // Abort if medic gets downed/eliminated!
+
+    race {
+        branch {
+            wait 5.0_s;
+            if let Some(p) = query_one(hp: &mut PlayerVitals.hp, flags: &mut PlayerVitals.flags).on(patient) {
+                p.flags &= !1_u32; // Clear Downed bit
+                p.hp = 30.0;
+            }
+        }
+        branch {
+            wait_until {
+                if let Some(p) = query_one(pos: &Pos3D.xyz).on(patient) {
+                    distance(medic_pos, p.pos) > 3.0 // Abort if medic moves >3m away
+                } else {
+                    true
+                }
+            };
+        }
+    }
+}
+
+// Parallel ballistic integration + lag-compensated segment sweep across thousands of rounds!
+@par(chunk = 512)
+sys simulate_ballistics(clk: &res MatchClock, hist: &res PlayerHitHistory) {
+    uniform let dt_s = clk.dt.as_secs();
+    uniform let grav = vec3(0.0, -9.81, 0.0) * dt_s;
+
+    for b in query(xyz: &mut Pos3D.xyz, r: &mut BallisticRound) {
+        b.r.ttl -= clk.dt;
+        if b.r.ttl <= 0.0_s {
+            despawn(b.id);
+            continue;
+        }
+        b.r.prev_xyz = b.xyz;
+        b.r.vel     += grav;
+        let step     = b.r.vel * dt_s;
+        b.xyz       += step;
+        b.r.traveled_m += meters(length(step));
+
+        // Lock-free O(1) cell-ray probe into historical player positions at shooter's rewind_tick!
+        for hit in hist.query_segment_at(b.r.rewind_tick, b.r.prev_xyz, b.xyz) {
+            if hit.id != b.r.shooter {
+                trigger(hit.id, BulletHitEvent {
+                    round:   b.id,
+                    shooter: b.r.shooter,
+                    victim:  hit.id,
+                    dist_m:  b.r.traveled_m,
+                });
+                break;
+            }
+        }
+    }
+}
+
+// Storm damage uses `&mut?` selective tick dirtying (Slots 14-15): safe players stay 100% clean!
+@par(chunk = 64)
+sys apply_storm_damage(clk: &res MatchClock, storm: &res StormCircle) {
+    uniform let center = storm.center_xz;
+    uniform let rad_sq = sqr(storm.radius.raw());
+    uniform let dmg    = storm.dps * clk.dt.as_secs();
+
+    for p in query(pos: &Pos3D.xyz, hp: &mut? PlayerVitals.hp, flags: &mut? PlayerVitals.flags)
+        .with<AlivePlayer>()
+    {
+        if distance_sq(p.pos.xz, center) > rad_sq {
+            p.hp -= dmg;
+            if p.hp <= 0.0 {
+                p.flags |= 1_u32; // Downed
+            }
+        }
+    }
+}
+
+// Zero-arena parallel alive count via Slot 59 `par_for_each_chunk_readonly`
+@par(read_only, chunk = 64)
+sys count_alive_players(storm: &mut res StormCircle) {
+    let alive = for p in query(flags: &PlayerVitals.flags).with<AlivePlayer>()
+    reduce (
+        total: sum(0_u32, if (p.flags & 2_u32) == 0 { 1_u32 } else { 0_u32 }),
+    );
+    storm.alive_count = alive;
+}
+
+obs on_bullet_hit(trg: &Trigger<BulletHitEvent, PlayerVitals>) {
+    let ev = trg.payload;
+    despawn(ev.round);
+
+    let dmg = RifleDamageFalloff.sample(ev.dist_m);
+    if let Some(v) = query_one(hp: &mut PlayerVitals.hp, shield: &mut PlayerVitals.shield, flags: &mut PlayerVitals.flags).on(ev.victim) {
+        let absorbed = min(v.shield, dmg);
+        v.shield -= absorbed;
+        v.hp     -= (dmg - absorbed);
+        if v.hp <= 0.0 {
+            v.flags |= 1_u32;
+        }
+    }
+}
+
+schedule FixedUpdate {
+    seq BattleRoyaleServerTick {
+        set Ballistics { simulate_ballistics }
+        par WorldRules { apply_storm_damage, SquadReviveTask }
+        set Telemetry  { count_alive_players }
+    }
+}

@@ -1,0 +1,40 @@
+module tutorial::rain_swarm @version(1.0.0);
+
+const GRAVITY: mps2 = -9.81_mps2;
+
+resource SimClock { dt: sec = 8.3333_ms }
+
+component Pos3D { xyz: vec3 = vec3::ZERO }
+component Vel3D { dxyz: vec3 = vec3::ZERO }
+component Raindrop @require(Pos3D, Vel3D) { elasticity: f32 = 0.65 }
+
+// Slot 39 `cmd_spawn_batch`: 2.66x faster SoA bulk spawn than scalar loops!
+sys seed_rainstorm() effects(spawns: [Raindrop]) {
+    spawn_batch(2000) |i| {
+        let x = ((i % 50) as f32) * 1.2 - 30.0;
+        let z = ((i / 50) as f32) * 1.2 - 24.0;
+        {
+            Raindrop   { elasticity: 0.60 },
+            Pos3D      { xyz: vec3(x, 25.0 + ((i % 13) as f32), z) },
+        }
+    };
+}
+
+// Slot 27 `par_for_each_chunk` + BAM_RESTRICT contiguous SIMD slices (~0.15 ns/entity)
+@par(chunk = 1024)
+sys integrate_rain(clk: &res SimClock) effects(writes: [Pos3D, Vel3D], reads: [Raindrop]) {
+    uniform let dt = clk.dt.as_secs();
+    uniform let g  = GRAVITY.raw() * dt;
+
+    for d in query(xyz: &mut Pos3D.xyz, dxyz: &mut Vel3D.dxyz, bounce: &Raindrop.elasticity) {
+        d.dxyz.y += g;
+        d.xyz    += d.dxyz * dt;
+        if d.xyz.y <= 0.0 {
+            d.xyz.y  = 0.0;
+            d.dxyz.y = -d.dxyz.y * d.bounce;
+        }
+    }
+}
+
+schedule Startup     { seed_rainstorm }
+schedule FixedUpdate { integrate_rain }

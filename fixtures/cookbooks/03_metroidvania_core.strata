@@ -1,0 +1,188 @@
+// =========================================================================
+// COOKBOOK 1: METROIDVANIA (metroidvania_core.strata)
+// Demonstrates: GraceWindow, InputBuffer, task, timeline, @persist, despawn_all, sim_test
+// =========================================================================
+module genres::metroidvania @version(1.0.0);
+
+enum Action { Jump = 0, Dash = 1, Attack = 2 }
+
+resource SimClock   { dt: sec = 8.3333_ms, hitstop_rem: sec = 0.0_s }
+resource PadInput   { move_x: f32 = 0.0, jump_held: bool = false, jump_pressed: bool = false, dash_pressed: bool = false, attack_pressed: bool = false }
+resource ActiveZone { room_id: u16 = 1, pending_room_id: u16 = 0, transition_requested: bool = false }
+
+component Pos2D { xy: vec2 = vec2::ZERO }
+component Vel2D { dxy: vec2 = vec2::ZERO }
+component Facing { dir_x: f32 = 1.0 }
+
+component KinematicBody @require(Pos2D, Vel2D, Facing) {
+    grounded:        bool = false,
+    on_wall_dir:     i8   = 0,     // -1 left wall, 0 none, +1 right wall
+    coyote:          GraceWindow,  // 95ms post-ledge jump grace
+    wall_coyote:     GraceWindow,  // 80ms post-wall jump grace
+    inputs:          InputBuffer<Action, 4>,
+    air_dashes_left: u8   = 1,
+    has_double_jump: bool = false,
+    has_air_dash:    bool = true,
+}
+
+component RoomEnemy @require(Pos2D, Vel2D) { hp: f32 = 40.0, room_id: u16 = 1 }
+tag TransientRoomEntity;
+
+// Persistent Metroidvania world progression survives room unloads & mod reloads (Slot 38/56)
+@persist
+component WorldUnlockFlags {
+    ability_mask:  BitSet<32>,  // bit 0 = AirDash, bit 1 = DoubleJump, bit 2 = WallCling
+    boss_defeated: BitSet<64>,
+    visited_rooms: BitSet<256>,
+}
+
+object PlayerHero {
+    KinematicBody {},
+    Pos2D { xy: vec2(0.0, 2.0) },
+}
+
+@persist
+object CampaignProgress {
+    WorldUnlockFlags {},
+}
+
+// Frame-accurate 120Hz slash timeline (startup -> active hitbox -> recovery)
+@sparse
+timeline BladeSlash @rate(120_hz) @duration(24_f) {
+    window startup  =  0_f ..  4_f;
+    window active   =  4_f .. 10_f;
+    window recovery = 10_f .. 24_f;
+
+    at 4_f => trigger(self, SlashArcActive { reach: 2.2_m, damage: 20.0 });
+}
+
+event SlashArcActive { reach: meters, damage: f32 }
+
+// Zero-alloc stackless coroutine for snappy horizontal air-dash with wall-bonk abort!
+@sparse
+task AirDashTask(dir_x: f32, speed: mps = 26.0_mps)
+    on (vel: &mut Vel2D.dxy, body: &mut KinematicBody)
+    using (clk: &res SimClock)
+{
+    abort_if body.on_wall_dir != 0 {
+        vel.x = 0.0;
+    }
+
+    // 140ms zero-gravity high-speed dash
+    race {
+        branch {
+            loop {
+                vel = vec2(dir_x * speed.raw(), 0.0);
+                yield_tick;
+            }
+        }
+        branch {
+            wait 140.0_ms;
+        }
+    }
+
+    // Smooth end-of-dash momentum bleed
+    vel.x *= 0.45;
+}
+
+spatial_grid RoomEnemyGrid(
+    cell_size: 4.0_m,
+    bounds:    vec2(-128.0_m, -64.0_m)..vec2(128.0_m, 64.0_m),
+    capacity:  512,
+) over RoomEnemy by Pos2D.xy;
+
+sys sample_platformer_inputs(clk: &res SimClock, pad: &res PadInput) {
+    if let Some(p) = query_one(body: &mut KinematicBody, face: &mut Facing, vel: &mut Vel2D.dxy).on(PlayerHero) {
+        if pad.move_x >  0.1 { p.face.dir_x =  1.0; }
+        if pad.move_x < -0.1 { p.face.dir_x = -1.0; }
+
+        if pad.jump_pressed   { p.body.inputs.push(Action::Jump,   120.0_ms); }
+        if pad.dash_pressed   { p.body.inputs.push(Action::Dash,   100.0_ms); }
+        if pad.attack_pressed { p.body.inputs.push(Action::Attack, 100.0_ms); }
+
+        if p.body.grounded {
+            p.body.coyote.arm(95.0_ms);
+            p.body.air_dashes_left = 1;
+        }
+        if p.body.on_wall_dir != 0 {
+            p.body.wall_coyote.arm(80.0_ms);
+        }
+
+        // Consume buffered jump inside coyote window
+        if p.body.coyote.is_active() && p.body.inputs.consume(Action::Jump) {
+            p.vel.y = 14.5;
+            p.body.grounded = false;
+            p.body.coyote.clear();
+        } else if !pad.jump_held && p.vel.y > 4.0 {
+            // Variable jump cut on early button release
+            p.vel.y *= 0.55;
+        }
+
+        // Launch stackless AirDashTask if unlocked & buffered
+        if p.body.has_air_dash && p.body.air_dashes_left > 0 && p.body.inputs.consume(Action::Dash) {
+            p.body.air_dashes_left -= 1;
+            insert(p.id, AirDashTask::start(p.face.dir_x, 26.0_mps));
+        }
+
+        if p.body.inputs.consume(Action::Attack) {
+            insert @if_new(p.id, BladeSlash::start());
+        }
+    }
+}
+
+// Active hitbox observer with hitstop freeze-frame feedback
+obs on_slash_active(
+    trg:  &Trigger<SlashArcActive>,
+    grid: &res RoomEnemyGrid,
+    clk:  &mut res SimClock,
+) {
+    let ev = trg.payload;
+    if let Some(hero) = query_one(xy: &Pos2D.xy, face: &Facing.dir_x).on(PlayerHero) {
+        let hit_center = hero.xy + vec2(hero.face * ev.reach.raw() * 0.5, 0.0);
+        for cand in grid.query_disc(hit_center, ev.reach * 0.6) {
+            if let Some(e) = query_one(enemy: &mut RoomEnemy, vel: &mut Vel2D.dxy).on(cand.id) {
+                e.enemy.hp -= ev.damage;
+                e.vel = vec2(hero.face * 9.0, 4.5); // Crisp knockback impulse
+                clk.hitstop_rem = 45.0_ms;          // 45ms tactile hitstop freeze!
+                if e.enemy.hp <= 0.0 {
+                    despawn(e.id);
+                }
+            }
+        }
+    }
+}
+
+// Instant room streaming: Slot 40 `despawn_all` clears transient enemies; `@persist` flags survive!
+sys handle_room_transition(zone: &mut res ActiveZone) {
+    if !zone.transition_requested { return; }
+    zone.transition_requested = false;
+    zone.room_id = zone.pending_room_id;
+
+    despawn_all<With<TransientRoomEntity>>();
+
+    if let Some(prog) = query_one(flags: &mut WorldUnlockFlags).on(CampaignProgress) {
+        prog.flags.visited_rooms.set(zone.room_id as u32);
+    }
+}
+
+schedule FixedUpdate run_if(res<SimClock>().hitstop_rem <= 0.0_s) {
+    seq MetroidvaniaFrame {
+        set InputAndTasks { sample_platformer_inputs, AirDashTask, BladeSlash }
+        set RoomStreaming { handle_room_transition }
+    }
+}
+
+sim_test "coyote_time_allows_late_jump_within_95ms" {
+    if let Some(p) = query_one(body: &mut KinematicBody).on(PlayerHero) {
+        p.body.grounded = true;
+    }
+    step_fixed(1); // Arms 95ms coyote window
+    if let Some(p) = query_one(body: &mut KinematicBody).on(PlayerHero) {
+        p.body.grounded = false; // Walked off ledge
+    }
+    step_fixed(6); // 50ms later (< 95ms)
+    res_mut<PadInput>().jump_pressed = true;
+    step_fixed(1);
+    let vy = query_one(vel: &Vel2D.dxy).on(PlayerHero).unwrap().vel.y;
+    assert(vy > 14.0);
+}

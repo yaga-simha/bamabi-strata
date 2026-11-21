@@ -1,0 +1,63 @@
+# `typos` spellchecker configuration for `bamabi-strata`
+
+[files]
+extend-exclude = [
+    "target/",
+    "**/target/",
+    "Cargo.lock",
+    "**/Cargo.lock",
+    "*.dylib",
+    "*.so",
+    "*.dll",
+]
+
+[default]
+extend-ignore-re = [
+    "0x[0-9a-fA-F_]+",
+    "\"[A-Za-z0-9_]+\"",
+]
+
+[default.extend-identifiers]
+# Intentional compiler, ABI, Cranelift, and ECS identifiers
+nd = "nd"
+ro = "ro"
+ot = "ot"
+ba = "ba"
+pn = "pn"
+fref = "fref"
+ser = "ser"
+Stratac = "Stratac"
+STRATAC = "STRATAC"
+sdesc = "sdesc"
+cdesc = "cdesc"
+rdesc = "rdesc"
+qdesc = "qdesc"
+qdescs = "qdescs"
+qterms = "qterms"
+rterms = "rterms"
+qres = "qres"
+qrc = "qrc"
+f32s = "f32s"
+brp = "brp"
+
+[default.extend-words]
+# Domain acronyms, crates, and technical terms
+soa = "soa"
+stratac = "stratac"
+bamabi = "bamabi"
+cranelift = "cranelift"
+proptest = "proptest"
+kani = "kani"
+cbmc = "cbmc"
+miri = "miri"
+salsa = "salsa"
+rowan = "rowan"
+rustdoc = "rustdoc"
+xtask = "xtask"
+cdylib = "cdylib"
+bampack = "bampack"
+codelens = "codelens"
+codelenses = "codelenses"
+metroidvania = "metroidvania"
+soulslike = "soulslike"
+typos = "typos"

@@ -1,0 +1,129 @@
+// =========================================================================
+// COOKBOOK 2: COZY LIFE-SIM (cozy_valley.strata)
+// Demonstrates: table, curve, relation [symmetric], atomic placement, @persist, fsm
+// =========================================================================
+module genres::cozy_valley @version(1.0.0);
+
+enum Season   { Spring = 0, Summer = 1, Autumn = 2, Winter = 3 }
+enum Weather  { Sunny = 0, Rainy = 1, Stormy = 2, Snowy = 3 }
+enum CropKind { Turnip = 0, Strawberry = 1, Pumpkin = 2, Starfruit = 3 }
+enum MealKind { TurnipSoup = 0, BerryTart = 1, PumpkinPie = 2 }
+
+table CropSpec by CropKind {
+    seed_cost:   u32,
+    sell_price:  u32,
+    grow_days:   u8,
+    regrow_days: u8,
+    seasons:     BitSet<4>,
+} = {
+    Turnip     => { seed_cost:  20, sell_price:  60, grow_days:  4, regrow_days: 0, seasons: bits(0) },
+    Strawberry => { seed_cost: 100, sell_price: 120, grow_days:  8, regrow_days: 4, seasons: bits(0) },
+    Pumpkin    => { seed_cost: 100, sell_price: 320, grow_days: 13, regrow_days: 0, seasons: bits(2) },
+    Starfruit  => { seed_cost: 400, sell_price: 750, grow_days: 13, regrow_days: 0, seasons: bits(1) },
+};
+
+table CookingRecipe by MealKind {
+    primary_crop:   CropKind,
+    crop_qty:       u8,
+    energy_restore: f32,
+    sell_price:     u32,
+} = {
+    TurnipSoup => { primary_crop: CropKind::Turnip,     crop_qty: 2, energy_restore: 45.0, sell_price: 160 },
+    BerryTart  => { primary_crop: CropKind::Strawberry, crop_qty: 3, energy_restore: 75.0, sell_price: 420 },
+    PumpkinPie => { primary_crop: CropKind::Pumpkin,    crop_qty: 2, energy_restore: 120.0, sell_price: 780 },
+};
+
+// Friendship heart bonus multiplier curve (0..1000 affinity -> price/gift quality bonus)
+curve FriendshipBonusCurve(f32 -> f32) = [
+    (0.0,    1.00),
+    (250.0,  1.10),
+    (600.0,  1.25),
+    (1000.0, 1.50),
+];
+
+@persist
+resource VillageCalendar {
+    day_of_season: u8      = 1,
+    season:        Season  = Season::Spring,
+    weather:       Weather = Weather::Sunny,
+    minute_of_day: u16     = 360, // 06:00 AM
+}
+
+// Symmetric friendship graph: updating (A, B) automatically mirrors (B, A) in ModRelationGraph!
+relation Affinity [symmetric] { points: i16 = 0, gifted_today: bool = false }
+
+@persist component GridCoord { cell: ivec2 = ivec2(0, 0) }
+@persist component FarmPlot @require(GridCoord) {
+    crop:       CropKind = CropKind::Turnip,
+    age_days:   u8       = 0,
+    watered:    bool     = false,
+    withered:   bool     = false,
+    harvestable: bool    = false,
+}
+
+@persist component PlacedDecor @require(GridCoord) { decor_id: u16, footprint_w: u8 = 1, footprint_h: u8 = 1 }
+@persist component FarmerWallet { coins: u64 = 500, energy: f32 = 100.0 }
+
+@persist
+fsm VillagerRoutine(cal: &res VillageCalendar) @require(GridCoord) {
+    initial AtHome;
+
+    state AtHome {
+        to AtTownSquare when cal.minute_of_day >= 540 && cal.weather != Weather::Stormy; // 09:00 AM
+    }
+    state AtTownSquare {
+        to AtTavern when cal.minute_of_day >= 1020; // 05:00 PM
+    }
+    state AtTavern {
+        to AtHome when cal.minute_of_day >= 1320;   // 10:00 PM
+    }
+}
+
+event AdvanceDayEvent;
+event PlaceDecorRequest { farmer: Ref<FarmerWallet>, decor_id: u16, cell: ivec2, cost: u64 }
+event PlacementRejected { farmer: Ref<FarmerWallet> }
+
+// Parallel dawn crop tick across thousands of farm plots!
+@par(chunk = 1024)
+obs on_dawn_grow_crops(trg: &Trigger<AdvanceDayEvent>, cal: &res VillageCalendar) {
+    uniform let season_bit = cal.season as u32;
+    uniform let auto_water = (cal.weather == Weather::Rainy) || (cal.weather == Weather::Stormy);
+
+    for p in query(plot: &mut FarmPlot) {
+        let spec = CropSpec[p.plot.crop];
+        if !spec.seasons.get(season_bit) {
+            p.plot.withered = true;
+            p.plot.harvestable = false;
+            continue;
+        }
+        if p.plot.watered && !p.plot.withered {
+            p.plot.age_days = min(255_u8, p.plot.age_days + 1);
+            if p.plot.age_days >= spec.grow_days {
+                p.plot.harvestable = true;
+            }
+        }
+        p.plot.watered = auto_water;
+    }
+}
+
+// Atomic decor placement: checks grid occupancy & coin balance; zero partial state on failure!
+obs on_place_decor(trg: &Trigger<PlaceDecorRequest>) {
+    let req = trg.payload;
+    atomic {
+        let Some(w) = query_one(wallet: &mut FarmerWallet).on(req.farmer) else { require_true(false); };
+        require_true(w.wallet.coins >= req.cost);
+
+        let occupied = query(c: &GridCoord.cell).with<PlacedDecor>().where(c == req.cell).count() > 0;
+        require_true(!occupied);
+
+        w.wallet.coins -= req.cost;
+        spawn @persistent {
+            PlacedDecor { decor_id: req.decor_id, footprint_w: 1, footprint_h: 1 },
+            GridCoord   { cell: req.cell },
+        };
+    } on_rollback {
+        trigger(req.farmer, PlacementRejected { farmer: req.farmer });
+    }
+}
+
+schedule Update { VillagerRoutine }
