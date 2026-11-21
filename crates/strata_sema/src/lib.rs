@@ -11,6 +11,7 @@ pub mod checks;
 pub mod db;
 pub mod diagnostics;
 pub mod hir;
+pub mod hir_lower;
 #[cfg(kani)]
 mod kani_proofs;
 pub mod layout;
@@ -21,6 +22,10 @@ pub use access::{
 };
 pub use db::{SemaDb, SourceFile, analyze_source};
 pub use diagnostics::{Diagnostic, FixIt, Severity, Span, codes};
-pub use hir::AnalyzedModule;
+pub use hir::{
+    AnalyzedModule, HirAssignOp, HirAtomic, HirBinOp, HirCall, HirCompInit, HirExpr, HirFn, HirFor,
+    HirForIter, HirFsmTransition, HirLValue, HirMatch, HirMatchArm, HirParam, HirParamKind,
+    HirQuery, HirQueryTerm, HirReduceEntry, HirSpawn, HirStmt, HirUnOp,
+};
 pub use layout::{SolvedField, SolvedLayout, compute_wire_identity, solve_pod_layout};
 pub use types::{Ty, UnitDim};

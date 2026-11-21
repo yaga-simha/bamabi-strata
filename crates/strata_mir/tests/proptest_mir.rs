@@ -44,15 +44,25 @@ proptest! {
         field_count in 1usize..6,
         det in any::<bool>(),
         selective in any::<bool>(),
+        with_optional in any::<bool>(),
     ) {
         let det_attr = if det { " @deterministic" } else { "" };
         let fields: String = (0..field_count).map(|i| format!("f{i}: f32 = 1.0")).collect::<Vec<_>>().join(", ");
         let borrow = if selective { "&mut?" } else { "&mut" };
+        let opt_decl = if with_optional { "component Bonus { val: f32 = 2.0 }\n" } else { "" };
+        let opt_term = if with_optional { ", b: ?&Bonus" } else { "" };
+        let opt_body = if with_optional {
+            "if let Some(opt) = e.b { e.c.f0 += opt.val; } else { e.c.f0 += 1.0; }"
+        } else {
+            "e.c.f0 += 1.0;"
+        };
         let src = format!(
             "module prop::mir @version(1.0.0){det_attr};\n\
-             component C {{ {fields} }}\n\
-             sys s() {{ for e in query(c: {borrow} C) {{ e.c.f0 += 1.0; }} }}\n\
-             schedule Update {{ s }}\n"
+             resource SimClock {{ dt: sec = 16.6667_ms }}\n\
+             component C {{ {fields}, grace: GraceWindow }}\n\
+             {opt_decl}\
+             sys s() {{ for e in query(c: {borrow} C{opt_term}) {{ {opt_body} }} }}\n\
+             schedule FixedUpdate {{ s }}\n"
         );
         let sema = analyze_source("prop_mir.strata", &src);
         prop_assert!(sema.ok(), "{:?}", sema.diagnostics);

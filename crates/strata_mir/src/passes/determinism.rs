@@ -1,36 +1,34 @@
-//! `@deterministic` enforcement pass.
+//! `@deterministic` strict-math & reduction-order enforcement pass.
 //!
-//! Disables FMA contraction, enforces deterministic `libm`/fixed-point transcendentals, and locks
-//! `ParForEachChunkReadonly` reductions into deterministic associative order whenever
-//! `@deterministic` is active.
+//! Disables hardware FMA contraction (`allow_fma = false`), routes math intrinsics to
+//! deterministic software libm (`deterministic = true`), and enforces fixed tree-reduction order on
+//! parallel readonly chunks across both ECS functions and helper functions.
 
-use crate::ir::{Inst, MirModule};
+use crate::ir::{Inst, MirFunction, MirModule};
 
-/// Enforces `@deterministic` invariants across every function in `module`.
+/// Rewrites every MIR function and helper function under `@deterministic` modules to eliminate
+/// hardware-dependent FMA / nondeterministic reduction ordering.
 pub fn run(module: &mut MirModule) {
-    for func in &mut module.functions {
-        let enforce = module.is_deterministic || func.is_deterministic;
-        if !enforce {
+    for func in module.functions.iter_mut().chain(module.fns.iter_mut()) {
+        if !module.is_deterministic && !func.is_deterministic {
             continue;
         }
-        func.is_deterministic = true;
-        for bb in &mut func.blocks {
-            for stmt in &mut bb.stmts {
-                match &mut stmt.inst {
-                    Inst::BinOp { allow_fma, .. } => {
-                        *allow_fma = false;
-                    }
-                    Inst::IntrinsicMath { deterministic, .. } => {
-                        *deterministic = true;
-                    }
-                    Inst::ParForEachChunkReadonly {
-                        deterministic_order,
-                        ..
-                    } => {
-                        *deterministic_order = true;
-                    }
-                    _ => {}
-                }
+        enforce_function_determinism(func);
+    }
+}
+
+fn enforce_function_determinism(func: &mut MirFunction) {
+    func.is_deterministic = true;
+    for bb in &mut func.blocks {
+        for stmt in &mut bb.stmts {
+            match &mut stmt.inst {
+                Inst::BinOp { allow_fma, .. } => *allow_fma = false,
+                Inst::IntrinsicMath { deterministic, .. } => *deterministic = true,
+                Inst::ParForEachChunkReadonly {
+                    deterministic_order,
+                    ..
+                } => *deterministic_order = true,
+                _ => {}
             }
         }
     }
@@ -40,63 +38,54 @@ pub fn run(module: &mut MirModule) {
 mod tests {
     use super::run;
     use crate::ir::*;
+    use indexmap::IndexMap;
 
     /// Verifies `@deterministic` clears `allow_fma`, enables deterministic math intrinsics, and
-    /// locks `deterministic_order` on parallel readonly chunk iterations.
+    /// locks `deterministic_order` on parallel readonly chunk iterations across systems & helpers.
     #[test]
     fn determinism_pass_rewrites_all_nondeterministic_flags() {
-        let mut func = MirFunction {
-            name: "sys0".to_owned(),
-            is_observer: false,
-            trigger_event: None,
-            par_chunk: Some(64),
-            par_read_only: true,
-            is_deterministic: false,
-            locals: vec![MirLocal {
-                id: LocalId(0),
-                name: "x".to_owned(),
-                ty: MirType::F32,
-            }],
-            blocks: vec![BasicBlock {
-                id: BlockId(0),
-                label: "entry".to_owned(),
-                stmts: vec![
-                    MirStmt {
-                        dst: None,
-                        inst: Inst::BinOp {
-                            op: "+".to_owned(),
-                            lhs: LocalId(0),
-                            rhs: LocalId(0),
-                            allow_fma: true,
-                        },
+        let mut func = MirFunction::new("sys0", MirFnKind::System);
+        func.par_chunk = Some(64);
+        func.par_read_only = true;
+        let x = func.alloc_local("x", MirType::F32);
+        func.blocks.push(BasicBlock {
+            id: BlockId(0),
+            label: "entry".to_owned(),
+            stmts: vec![
+                MirStmt {
+                    dst: None,
+                    inst: Inst::BinOp {
+                        op: "+".to_owned(),
+                        lhs: x,
+                        rhs: x,
+                        allow_fma: true,
                     },
-                    MirStmt {
-                        dst: None,
-                        inst: Inst::IntrinsicMath {
-                            name: "sin".to_owned(),
-                            args: vec![LocalId(0)],
-                            deterministic: false,
-                        },
+                },
+                MirStmt {
+                    dst: None,
+                    inst: Inst::IntrinsicMath {
+                        name: "sin".to_owned(),
+                        args: vec![x],
+                        deterministic: false,
                     },
-                    MirStmt {
-                        dst: None,
-                        inst: Inst::ParForEachChunkReadonly {
-                            query_idx: 0,
-                            chunk_size: 64,
-                            deterministic_order: false,
-                        },
+                },
+                MirStmt {
+                    dst: None,
+                    inst: Inst::ParForEachChunkReadonly {
+                        query_idx: 0,
+                        chunk_size: 64,
+                        deterministic_order: false,
                     },
-                ],
-                terminator: Terminator::Return(None),
-            }],
-            queries: Vec::new(),
-            source_body: String::new(),
-        };
-        let _ = &mut func;
+                },
+            ],
+            terminator: Terminator::Return(None),
+        });
         let mut module = MirModule {
             module_path: "det::m".to_owned(),
             is_deterministic: true,
             layouts: Vec::new(),
+            enums: Vec::new(),
+            consts: Vec::new(),
             tables: Vec::new(),
             curves: Vec::new(),
             relations: Vec::new(),
@@ -106,9 +95,11 @@ mod tests {
             fsms: Vec::new(),
             objects: Vec::new(),
             migrations: Vec::new(),
+            fns: Vec::new(),
             functions: vec![func],
             schedules: Vec::new(),
             sim_tests: Vec::new(),
+            field_defaults: IndexMap::new(),
         };
         run(&mut module);
         let stmts = &module.functions[0].blocks[0].stmts;

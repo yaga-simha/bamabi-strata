@@ -8,9 +8,14 @@ use crate::access::{
 };
 use crate::diagnostics::{Diagnostic, FixIt, Span, codes};
 use crate::hir::{
-    AnalyzedModule, EffectsSpec, HirCallable, HirConst, HirCurve, HirFsm, HirMigration, HirObject,
-    HirRelation, HirSchedule, HirScheduleGroup, HirSimTest, HirSpatialIndex, HirTable, HirTask,
-    HirTimeline, SemVerInfo,
+    AnalyzedModule, EffectsSpec, HirBinOp, HirCallable, HirConst, HirCurve, HirExpr, HirFn, HirFsm,
+    HirMigration, HirObject, HirParamKind, HirRelation, HirSchedule, HirScheduleGroup, HirSimTest,
+    HirSpatialIndex, HirStmt, HirTable, HirTask, HirTimeline, HirUnOp, SemVerInfo,
+};
+use crate::hir_lower::{
+    LowerEnv, ScopeBinding, ScopeStack, classify_param_type, is_expr_node, is_type_node,
+    lower_block, lower_block_as_stmts, lower_comp_init_list, lower_expr, lower_field_init_list,
+    lower_fsm_details, lower_param_list, lower_proj_term, lower_stmt_node, lower_sys_param_list,
 };
 use crate::layout::{
     EnumDef, LayoutEnv, SchemaItemKind, SolvedLayout, flags_from_attr_names, solve_pod_layout,
@@ -416,10 +421,12 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
             tasks: Vec::new(),
             fsms: Vec::new(),
             callables: Vec::new(),
+            fns: Vec::new(),
             objects: Vec::new(),
             migrations: Vec::new(),
             schedules: Vec::new(),
             sim_tests: Vec::new(),
+            field_defaults: IndexMap::new(),
             concurrency_graph: build_concurrency_graph(&[]),
             diagnostics: diags,
         };
@@ -443,21 +450,35 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
         );
     }
 
+    let mut lower_env = LowerEnv {
+        module_path: &module_path,
+        layouts: &layouts,
+        field_to_stratum: &field_to_stratum,
+        enums: &enums,
+        const_tys: HashMap::new(),
+        table_fields: HashMap::new(),
+        curve_ret_tys: HashMap::new(),
+        fn_ret_tys: HashMap::new(),
+        objects: HashSet::new(),
+        sparse_components: HashSet::new(),
+    };
+    for (canon, layout) in &layouts {
+        if (layout.component_flags & bamabi_sys::BAM_COMPONENT_FLAG_SPARSE_SET) != 0 {
+            let short = canon.rsplit("::").next().unwrap_or(canon).to_owned();
+            lower_env.sparse_components.insert(short);
+            lower_env.sparse_components.insert(canon.clone());
+        }
+    }
+
     let mut tags = Vec::new();
     let mut consts = Vec::new();
     let mut tables = Vec::new();
     let mut curves = Vec::new();
     let mut relations = Vec::new();
     let mut spatial_indices = Vec::new();
-    let mut timelines = Vec::new();
-    let mut tasks = Vec::new();
-    let mut fsms = Vec::new();
-    let mut callables = Vec::new();
     let mut objects = Vec::new();
-    let mut migrations = Vec::new();
-    let mut schedules = Vec::new();
-    let mut sim_tests = Vec::new();
 
+    // Pass A: collect constants, tables, curves, tags, relations, spatial indices, objects, fn sigs.
     for item in sf.items() {
         match item {
             ast::Item::Tag(tg) => {
@@ -471,15 +492,24 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
                 }
             }
             ast::Item::Const(c) => {
-                if let Some(hc) = analyze_const(file, src, c.syntax(), &mut diags) {
+                if let Some(hc) = analyze_const(file, src, c.syntax(), &lower_env, &mut diags) {
+                    lower_env.const_tys.insert(hc.name.clone(), hc.ty.clone());
                     consts.push(hc);
                 }
             }
             ast::Item::Table(tb) => {
-                tables.push(analyze_table(file, src, tb.syntax(), &enums, &mut diags));
+                let ht = analyze_table(file, src, tb.syntax(), &enums, &lower_env, &mut diags);
+                lower_env
+                    .table_fields
+                    .insert(ht.name.clone(), ht.fields.clone());
+                tables.push(ht);
             }
             ast::Item::Curve(cv) => {
-                curves.push(analyze_curve(file, src, cv.syntax(), &mut diags));
+                let hc = analyze_curve(file, src, cv.syntax(), &lower_env, &mut diags);
+                lower_env
+                    .curve_ret_tys
+                    .insert(hc.name.clone(), hc.output_ty.clone());
+                curves.push(hc);
             }
             ast::Item::Relation(rel) => {
                 relations.push(analyze_relation(&module_path, rel.syntax(), &layouts));
@@ -490,6 +520,40 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
             ast::Item::SpatialHistory(sh) => {
                 spatial_indices.push(analyze_spatial(&module_path, sh.syntax(), true, &layouts));
             }
+            ast::Item::Object(obj) => {
+                let ho = analyze_object(obj.syntax(), &lower_env);
+                lower_env.objects.insert(ho.name.clone());
+                objects.push(ho);
+            }
+            ast::Item::Fn(f) => {
+                if let Some(fname) = ast::first_ident(f.syntax()) {
+                    let ret_ty = f
+                        .syntax()
+                        .children()
+                        .find(|c| is_type_node(c.kind()))
+                        .map_or(Ty::Unit, |t| parse_type_node(&t));
+                    lower_env.fn_ret_tys.insert(fname.text().to_owned(), ret_ty);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Collect FieldDecl default expressions for every layout (including `@soa` strata).
+    let field_defaults = collect_field_defaults(&sf, &module_path, &layouts, &lower_env);
+
+    // Pass B: lower executable items with full module symbol table in `lower_env`.
+    let mut timelines = Vec::new();
+    let mut tasks = Vec::new();
+    let mut fsms = Vec::new();
+    let mut callables = Vec::new();
+    let mut fns = Vec::new();
+    let mut migrations = Vec::new();
+    let mut schedules = Vec::new();
+    let mut sim_tests = Vec::new();
+
+    for item in sf.items() {
+        match item {
             ast::Item::Timeline(tl) => {
                 timelines.push(analyze_timeline(
                     file,
@@ -497,6 +561,7 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
                     &module_path,
                     tl.syntax(),
                     &layouts,
+                    &lower_env,
                     &mut diags,
                 ));
             }
@@ -507,7 +572,7 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
                     &module_path,
                     tk.syntax(),
                     &layouts,
-                    &field_to_stratum,
+                    &lower_env,
                     &mut diags,
                 ));
             }
@@ -518,6 +583,7 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
                     &module_path,
                     fm.syntax(),
                     &layouts,
+                    &lower_env,
                     &mut diags,
                 ));
             }
@@ -527,8 +593,7 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
                     src,
                     sy.syntax(),
                     false,
-                    &soa_strata,
-                    &field_to_stratum,
+                    &lower_env,
                     &layouts,
                     &mut diags,
                 ));
@@ -539,23 +604,22 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
                     src,
                     ob.syntax(),
                     true,
-                    &soa_strata,
-                    &field_to_stratum,
+                    &lower_env,
                     &layouts,
                     &mut diags,
                 ));
             }
-            ast::Item::Object(obj) => {
-                objects.push(analyze_object(obj.syntax()));
+            ast::Item::Fn(f) => {
+                fns.push(analyze_fn(f.syntax(), &lower_env));
             }
             ast::Item::Migrate(mg) => {
-                migrations.push(analyze_migrate(mg.syntax()));
+                migrations.push(analyze_migrate(mg.syntax(), &lower_env));
             }
             ast::Item::Schedule(sc) => {
-                schedules.push(analyze_schedule(sc.syntax()));
+                schedules.push(analyze_schedule(sc.syntax(), &lower_env));
             }
             ast::Item::SimTest(st) => {
-                sim_tests.push(analyze_sim_test(st.syntax()));
+                sim_tests.push(analyze_sim_test(st.syntax(), &lower_env));
             }
             ast::Item::AssertLayout(al) => {
                 evaluate_assert_layout(file, src, al.syntax(), &module_path, &layouts, &mut diags);
@@ -595,10 +659,12 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
         tasks,
         fsms,
         callables,
+        fns,
         objects,
         migrations,
         schedules,
         sim_tests,
+        field_defaults,
         concurrency_graph,
         diagnostics: diags,
     }
@@ -1024,10 +1090,15 @@ fn collect_task_live_vars(
     }
     // Check `let` statements inside task body for banned non-AbiPod locals.
     if let Some(body) = ast::child::<ast::Block>(task_node) {
-        let body_text = body.syntax().text().to_string();
-        let has_suspension = body_text.contains("wait")
-            || body_text.contains("yield_tick")
-            || body_text.contains("race");
+        let has_suspension = body.syntax().descendants().any(|n| {
+            matches!(
+                n.kind(),
+                SyntaxKind::WaitStmt
+                    | SyntaxKind::WaitUntilStmt
+                    | SyntaxKind::YieldTickStmt
+                    | SyntaxKind::RaceStmt
+            )
+        });
         for ls in body
             .syntax()
             .descendants()
@@ -1063,10 +1134,153 @@ fn collect_task_live_vars(
     vars
 }
 
+fn eval_const_f64(expr: &HirExpr) -> Option<f64> {
+    let val = match expr {
+        HirExpr::IntLit { value, .. } => *value as f64,
+        HirExpr::FloatLit { value, .. } => *value,
+        HirExpr::Unary {
+            op: HirUnOp::Neg,
+            expr,
+            ..
+        } => -eval_const_f64(expr)?,
+        HirExpr::Binary { op, lhs, rhs, .. } => {
+            let l = eval_const_f64(lhs)?;
+            let r = eval_const_f64(rhs)?;
+            match op {
+                HirBinOp::Add => l + r,
+                HirBinOp::Sub => l - r,
+                HirBinOp::Mul => l * r,
+                HirBinOp::Div if r != 0.0 => l / r,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    val.is_finite().then_some(val)
+}
+
+fn extract_field_defaults_list(
+    fields: &[ast::FieldDecl],
+    lower_env: &LowerEnv<'_>,
+) -> IndexMap<String, HirExpr> {
+    let mut map = IndexMap::new();
+    let mut scope = ScopeStack::new();
+    for fd in fields {
+        let Some(fname) = fd.name().map(|t| t.text().to_owned()) else {
+            continue;
+        };
+        let mut saw_eq = false;
+        for el in fd.syntax().children_with_tokens() {
+            match el {
+                NodeOrToken::Token(tok) if tok.kind() == SyntaxKind::Eq => {
+                    saw_eq = true;
+                }
+                NodeOrToken::Node(n) if saw_eq && is_expr_node(n.kind()) => {
+                    map.insert(fname.clone(), lower_expr(&n, lower_env, &mut scope, &[]));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    map
+}
+
+fn collect_field_defaults(
+    sf: &SourceFile,
+    module_path: &str,
+    _layouts: &IndexMap<String, SolvedLayout>,
+    lower_env: &LowerEnv<'_>,
+) -> IndexMap<String, IndexMap<String, HirExpr>> {
+    let mut out: IndexMap<String, IndexMap<String, HirExpr>> = IndexMap::new();
+    for item in sf.items() {
+        match item {
+            ast::Item::Struct(st) => {
+                let short = st
+                    .name()
+                    .map_or_else(|| "Struct".to_owned(), |t| t.text().to_owned());
+                let defaults = extract_field_defaults_list(&st.fields(), lower_env);
+                if !defaults.is_empty() {
+                    out.insert(format!("{module_path}::{short}"), defaults);
+                }
+            }
+            ast::Item::Component(comp) => {
+                let short = comp
+                    .name()
+                    .map_or_else(|| "Component".to_owned(), |t| t.text().to_owned());
+                let strata = comp.strata();
+                if strata.is_empty() {
+                    let defaults = extract_field_defaults_list(&comp.fields(), lower_env);
+                    if !defaults.is_empty() {
+                        out.insert(format!("{module_path}::{short}"), defaults);
+                    }
+                } else {
+                    for st in &strata {
+                        let defaults = extract_field_defaults_list(&st.fields(), lower_env);
+                        if defaults.is_empty() {
+                            continue;
+                        }
+                        let sname = st.stratum_name();
+                        if st.is_hot() {
+                            out.insert(format!("{module_path}::{short}"), defaults.clone());
+                            out.insert(format!("{module_path}::{short}::hot"), defaults);
+                        } else {
+                            out.insert(
+                                format!("{module_path}::{short}__{sname}"),
+                                defaults.clone(),
+                            );
+                            out.insert(format!("{module_path}::{short}::{sname}"), defaults);
+                        }
+                    }
+                }
+            }
+            ast::Item::Resource(r) => {
+                let short = r
+                    .name()
+                    .map_or_else(|| "Resource".to_owned(), |t| t.text().to_owned());
+                let defaults = extract_field_defaults_list(&r.fields(), lower_env);
+                if !defaults.is_empty() {
+                    out.insert(format!("{module_path}::{short}"), defaults);
+                }
+            }
+            ast::Item::Event(e) => {
+                let short = ast::first_ident(e.syntax())
+                    .map_or_else(|| "Event".to_owned(), |t| t.text().to_owned());
+                let fields: Vec<_> = ast::children::<ast::FieldDecl>(e.syntax()).collect();
+                let defaults = extract_field_defaults_list(&fields, lower_env);
+                if !defaults.is_empty() {
+                    out.insert(format!("{module_path}::{short}"), defaults);
+                }
+            }
+            ast::Item::Stream(s) => {
+                let short = ast::first_ident(s.syntax())
+                    .map_or_else(|| "Stream".to_owned(), |t| t.text().to_owned());
+                let fields: Vec<_> = ast::children::<ast::FieldDecl>(s.syntax()).collect();
+                let defaults = extract_field_defaults_list(&fields, lower_env);
+                if !defaults.is_empty() {
+                    out.insert(format!("{module_path}::{short}"), defaults);
+                }
+            }
+            ast::Item::Relation(rel) => {
+                let short = ast::first_ident(rel.syntax())
+                    .map_or_else(|| "Relation".to_owned(), |t| t.text().to_owned());
+                let fields: Vec<_> = ast::children::<ast::FieldDecl>(rel.syntax()).collect();
+                let defaults = extract_field_defaults_list(&fields, lower_env);
+                if !defaults.is_empty() {
+                    out.insert(format!("{module_path}::{short}"), defaults);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn analyze_const(
     file: &str,
     src: &str,
     node: &SyntaxNode,
+    lower_env: &LowerEnv<'_>,
     diags: &mut Vec<Diagnostic>,
 ) -> Option<HirConst> {
     let name = ast::first_ident(node)?.text().to_owned();
@@ -1079,6 +1293,20 @@ fn analyze_const(
         .split_once('=')
         .map(|(_, rhs)| rhs.trim().trim_end_matches(';').trim().to_owned())
         .unwrap_or_default();
+
+    let mut scope = ScopeStack::new();
+    let mut saw_eq = false;
+    let mut expr = None;
+    for el in node.children_with_tokens() {
+        match el {
+            NodeOrToken::Token(tok) if tok.kind() == SyntaxKind::Eq => saw_eq = true,
+            NodeOrToken::Node(n) if saw_eq && is_expr_node(n.kind()) => {
+                expr = Some(lower_expr(&n, lower_env, &mut scope, &[]));
+                break;
+            }
+            _ => {}
+        }
+    }
 
     if let Some(expected_dim) = ty.unit_dim() {
         for tok in node
@@ -1105,6 +1333,7 @@ fn analyze_const(
         name,
         ty,
         value_expr,
+        expr,
     })
 }
 
@@ -1113,6 +1342,7 @@ fn analyze_table(
     src: &str,
     node: &SyntaxNode,
     enums: &IndexMap<String, EnumDef>,
+    lower_env: &LowerEnv<'_>,
     diags: &mut Vec<Diagnostic>,
 ) -> HirTable {
     let name = ast::first_ident(node).map_or_else(|| "Table".to_owned(), |t| t.text().to_owned());
@@ -1130,15 +1360,24 @@ fn analyze_table(
         .collect();
 
     let mut rows = Vec::new();
+    let mut typed_rows = Vec::new();
     let mut seen = HashSet::new();
+    let mut scope = ScopeStack::new();
     for row in ast::children::<ast::TableRow>(node) {
         let rname =
             ast::first_ident(row.syntax()).map_or_else(|| "_".to_owned(), |t| t.text().to_owned());
         seen.insert(rname.clone());
-        let fields_src = ast::child::<ast::FieldInitList>(row.syntax())
+        let fil = ast::child::<ast::FieldInitList>(row.syntax());
+        let fields_src = fil
+            .as_ref()
             .map(|l| l.syntax().text().to_string())
             .unwrap_or_default();
-        rows.push((rname, fields_src));
+        let typed_fields = fil
+            .as_ref()
+            .map(|l| lower_field_init_list(l.syntax(), lower_env, &mut scope, &[]))
+            .unwrap_or_default();
+        rows.push((rname.clone(), fields_src));
+        typed_rows.push((rname, typed_fields));
     }
 
     if let Some(en) = enums.get(&key_enum) {
@@ -1166,6 +1405,7 @@ fn analyze_table(
         key_enum,
         fields,
         rows,
+        typed_rows,
     }
 }
 
@@ -1173,6 +1413,7 @@ fn analyze_curve(
     file: &str,
     src: &str,
     node: &SyntaxNode,
+    lower_env: &LowerEnv<'_>,
     diags: &mut Vec<Diagnostic>,
 ) -> HirCurve {
     let name = ast::first_ident(node).map_or_else(|| "Curve".to_owned(), |t| t.text().to_owned());
@@ -1186,12 +1427,18 @@ fn analyze_curve(
 
     let mut points = Vec::new();
     let mut prev_x: Option<f64> = None;
+    let mut scope = ScopeStack::new();
     for pt in ast::children::<ast::CurvePoint>(node) {
-        let text = pt.syntax().text().to_string();
-        let inner = text.trim().trim_start_matches('(').trim_end_matches(')');
-        if let Some((xs, ys)) = inner.split_once(',') {
-            let x = parse_numeric_prefix(xs.trim()).unwrap_or(0.0);
-            let y = parse_numeric_prefix(ys.trim()).unwrap_or(0.0);
+        let coords: Vec<SyntaxNode> = pt
+            .syntax()
+            .children()
+            .filter(|c| is_expr_node(c.kind()))
+            .collect();
+        if coords.len() >= 2 {
+            let hx = lower_expr(&coords[0], lower_env, &mut scope, &[]);
+            let hy = lower_expr(&coords[1], lower_env, &mut scope, &[]);
+            let x = eval_const_f64(&hx).unwrap_or(0.0);
+            let y = eval_const_f64(&hy).unwrap_or(0.0);
             if let Some(px) = prev_x
                 && x <= px
             {
@@ -1336,6 +1583,7 @@ fn analyze_timeline(
     module_path: &str,
     node: &SyntaxNode,
     layouts: &IndexMap<String, SolvedLayout>,
+    lower_env: &LowerEnv<'_>,
     diags: &mut Vec<Diagnostic>,
 ) -> HirTimeline {
     let name =
@@ -1386,18 +1634,40 @@ fn analyze_timeline(
         windows.push((wname, start, end, idx as u8));
     }
 
-    let triggers = ast::children::<ast::TimelineAt>(node)
-        .map(|at| {
-            let f = at
-                .syntax()
-                .descendants_with_tokens()
-                .filter_map(|e| e.into_token())
-                .find(|t| matches!(t.kind(), SyntaxKind::IntLit | SyntaxKind::UnitLit))
-                .and_then(|t| parse_numeric_prefix(t.text()))
-                .unwrap_or(0.0) as u32;
-            (f, at.syntax().text().to_string())
-        })
-        .collect();
+    let mut triggers = Vec::new();
+    let mut typed_triggers = Vec::new();
+    let mut scope = ScopeStack::new();
+    for at in ast::children::<ast::TimelineAt>(node) {
+        let frame = at
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| matches!(t.kind(), SyntaxKind::IntLit | SyntaxKind::UnitLit))
+            .and_then(|t| parse_numeric_prefix(t.text()))
+            .unwrap_or(0.0) as u32;
+        triggers.push((frame, at.syntax().text().to_string()));
+
+        let mut stmts = Vec::new();
+        let mut after_arrow = false;
+        for el in at.syntax().children_with_tokens() {
+            match el {
+                NodeOrToken::Token(tok) if tok.kind() == SyntaxKind::FatArrow => {
+                    after_arrow = true;
+                }
+                NodeOrToken::Node(n) if after_arrow => {
+                    if n.kind() == SyntaxKind::Block {
+                        stmts.extend(lower_block_as_stmts(&n, lower_env, &mut scope, &[], false));
+                    } else if is_expr_node(n.kind()) {
+                        stmts.push(HirStmt::Expr(lower_expr(&n, lower_env, &mut scope, &[])));
+                    } else {
+                        lower_stmt_node(&n, lower_env, &mut scope, &[], &mut stmts);
+                    }
+                }
+                _ => {}
+            }
+        }
+        typed_triggers.push((frame, stmts));
+    }
 
     let cursor_layout = layouts
         .get(&canonical_name)
@@ -1411,6 +1681,7 @@ fn analyze_timeline(
         duration_frames,
         windows,
         triggers,
+        typed_triggers,
         cursor_layout,
     }
 }
@@ -1421,7 +1692,7 @@ fn analyze_task(
     module_path: &str,
     node: &SyntaxNode,
     layouts: &IndexMap<String, SolvedLayout>,
-    field_to_stratum: &HashMap<String, String>,
+    lower_env: &LowerEnv<'_>,
     diags: &mut Vec<Diagnostic>,
 ) -> HirTask {
     let name = ast::first_ident(node).map_or_else(|| "Task".to_owned(), |t| t.text().to_owned());
@@ -1436,8 +1707,16 @@ fn analyze_task(
         ..Default::default()
     };
 
+    let mut scope = ScopeStack::new();
+    let typed_params = lower_param_list(node, lower_env, &mut scope);
+    let params: Vec<(String, Ty)> = typed_params
+        .iter()
+        .map(|p| (p.name.clone(), p.ty.clone()))
+        .collect();
+
     // `on (...)` terms become the task's primary entity query.
     let mut on_terms = Vec::new();
+    let mut typed_on_terms = Vec::new();
     if let Some(ptl) = ast::child::<ast::ProjTermList>(node) {
         let mut q = QueryAccessDesc {
             is_task_on_header: true,
@@ -1447,8 +1726,21 @@ fn analyze_task(
         };
         for pt in ast::children::<ast::ProjTerm>(ptl.syntax()) {
             on_terms.push(pt.syntax().text().to_string().trim().to_owned());
-            if let Some(qt) = parse_proj_term(pt.syntax(), field_to_stratum) {
-                q.terms.push(qt);
+            if let Some(ht) = lower_proj_term(pt.syntax(), lower_env) {
+                scope.insert(
+                    ht.alias.clone(),
+                    ScopeBinding::QueryRow {
+                        terms: vec![ht.clone()],
+                    },
+                );
+                q.terms.push(QueryTerm {
+                    storage_key: ht.storage_key.clone(),
+                    field_name: ht.field_name.clone(),
+                    mode: ht.mode,
+                    byte_start: u32::from(pt.syntax().text_range().start()),
+                    byte_end: u32::from(pt.syntax().text_range().end()),
+                });
+                typed_on_terms.push(ht);
             }
         }
         q.terms.push(QueryTerm {
@@ -1468,11 +1760,14 @@ fn analyze_task(
             record_sys_param(sp.syntax(), &mut access);
         }
     }
+    let typed_using_params = lower_sys_param_list(node, lower_env, &mut scope);
 
-    let body_source = ast::child::<ast::Block>(node)
+    let (body_source, body) = ast::child::<ast::Block>(node)
         .map(|b| {
-            collect_body_queries(b.syntax(), field_to_stratum, &mut access);
-            b.syntax().text().to_string()
+            collect_body_queries(b.syntax(), lower_env, &mut access);
+            let stmts =
+                lower_block_as_stmts(b.syntax(), lower_env, &mut scope, &access.queries, false);
+            (b.syntax().text().to_string(), stmts)
         })
         .unwrap_or_default();
 
@@ -1490,17 +1785,22 @@ fn analyze_task(
         .get(&canonical)
         .cloned()
         .expect("task layout synthesized");
+    let live_across_wait = collect_task_live_vars(file, src, node, &mut Vec::new());
 
     HirTask {
         name,
         is_sparse,
-        params: Vec::new(),
+        params,
+        typed_params,
         on_terms,
+        typed_on_terms,
         using_params,
-        live_across_wait: Vec::new(),
+        typed_using_params,
+        live_across_wait,
         state_layout,
         access,
         body_source,
+        body,
     }
 }
 
@@ -1510,6 +1810,7 @@ fn analyze_fsm(
     module_path: &str,
     node: &SyntaxNode,
     layouts: &IndexMap<String, SolvedLayout>,
+    lower_env: &LowerEnv<'_>,
     diags: &mut Vec<Diagnostic>,
 ) -> HirFsm {
     let name = ast::first_ident(node).map_or_else(|| "Fsm".to_owned(), |t| t.text().to_owned());
@@ -1528,6 +1829,8 @@ fn analyze_fsm(
             record_sys_param(sp.syntax(), &mut access);
         }
     }
+    let mut scope = ScopeStack::new();
+    let params = lower_sys_param_list(node, lower_env, &mut scope);
 
     // Extract `initial <State>;`
     let tokens: Vec<_> = node
@@ -1546,6 +1849,9 @@ fn analyze_fsm(
         let sname = ast::first_ident(st.syntax())
             .map_or_else(|| "State".to_owned(), |t| t.text().to_owned());
         states.push(sname.clone());
+        for blk in ast::children::<ast::Block>(st.syntax()) {
+            collect_body_queries(blk.syntax(), lower_env, &mut access);
+        }
         for tr in ast::children::<ast::TransitionDecl>(st.syntax()) {
             let target =
                 ast::first_ident(tr.syntax()).map_or_else(String::new, |t| t.text().to_owned());
@@ -1563,6 +1869,8 @@ fn analyze_fsm(
             transitions.push((sname.clone(), target, tr.syntax().text().to_string(), prio));
         }
     }
+
+    let (typed_transitions, state_hooks) = lower_fsm_details(node, lower_env, &mut scope);
 
     let state_set: HashSet<&str> = states.iter().map(|s| s.as_str()).collect();
     if !initial_state.is_empty() && !state_set.contains(initial_state.as_str()) {
@@ -1597,6 +1905,9 @@ fn analyze_fsm(
         initial_state,
         states,
         transitions,
+        params,
+        typed_transitions,
+        state_hooks,
         state_layout,
         access,
     }
@@ -1608,8 +1919,7 @@ fn analyze_callable(
     src: &str,
     node: &SyntaxNode,
     is_observer: bool,
-    _soa_strata: &IndexMap<String, Vec<String>>,
-    field_to_stratum: &HashMap<String, String>,
+    lower_env: &LowerEnv<'_>,
     layouts: &IndexMap<String, SolvedLayout>,
     diags: &mut Vec<Diagnostic>,
 ) -> HirCallable {
@@ -1645,15 +1955,29 @@ fn analyze_callable(
         ..Default::default()
     };
 
+    let mut scope = ScopeStack::new();
+    let params = lower_sys_param_list(node, lower_env, &mut scope);
+
     let mut trigger_event = None;
+    let mut trigger_target_comp = None;
     if let Some(spl) = ast::child::<ast::SysParamList>(node) {
         for (idx, sp) in ast::children::<ast::SysParam>(spl.syntax()).enumerate() {
             if is_observer && idx == 0 {
-                trigger_event = sp
-                    .syntax()
-                    .descendants()
-                    .find(|n| n.kind() == SyntaxKind::GenericArgs)
-                    .map(|g| g.text().to_string());
+                if let Some(p) = params.get(idx)
+                    && p.kind == HirParamKind::Trigger
+                {
+                    if let Ty::Named(ref ev) = p.ty {
+                        trigger_event = Some(ev.clone());
+                    }
+                    trigger_target_comp = p.trigger_target.clone();
+                }
+                if trigger_event.is_none() {
+                    trigger_event = sp
+                        .syntax()
+                        .descendants()
+                        .find(|n| n.kind() == SyntaxKind::GenericArgs)
+                        .map(|g| g.text().to_string());
+                }
             } else {
                 record_sys_param(sp.syntax(), &mut access);
             }
@@ -1664,24 +1988,16 @@ fn analyze_callable(
         ast::child::<ast::EffectsClause>(node).map(|ec| parse_effects(ec.syntax()));
 
     let body_node = ast::child::<ast::Block>(node);
-    let body_source = if let Some(ref body) = body_node {
-        collect_body_queries(body.syntax(), field_to_stratum, &mut access);
-        check_body_lints(file, src, &name, body.syntax(), diags);
+    let (body_source, body) = if let Some(ref b) = body_node {
+        collect_body_queries(b.syntax(), lower_env, &mut access);
+        check_body_lints(file, src, &name, b.syntax(), diags);
         if let Some(ref eff) = declared_effects {
-            verify_effects(
-                file,
-                src,
-                &name,
-                eff,
-                &access,
-                body.syntax(),
-                layouts,
-                diags,
-            );
+            verify_effects(file, src, &name, eff, &access, b.syntax(), layouts, diags);
         }
-        body.syntax().text().to_string()
+        let stmts = lower_block_as_stmts(b.syntax(), lower_env, &mut scope, &access.queries, false);
+        (b.syntax().text().to_string(), stmts)
     } else {
-        String::new()
+        (String::new(), Vec::new())
     };
 
     let byte_range = (
@@ -1694,43 +2010,91 @@ fn analyze_callable(
         name,
         is_observer,
         trigger_event,
+        trigger_target_comp,
         par_chunk,
         par_read_only,
         declared_effects,
         access,
+        params,
+        body,
         body_source,
         byte_range,
     }
 }
 
+fn analyze_fn(node: &SyntaxNode, lower_env: &LowerEnv<'_>) -> HirFn {
+    let name = ast::first_ident(node).map_or_else(|| "fn".to_owned(), |t| t.text().to_owned());
+    let generic_params = node
+        .children()
+        .find(|c| c.kind() == SyntaxKind::GenericParams)
+        .map(|gp| {
+            gp.children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| t.kind() == SyntaxKind::Ident)
+                .map(|t| t.text().to_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut scope = ScopeStack::new();
+    let params = lower_param_list(node, lower_env, &mut scope);
+    let ret_ty = node
+        .children()
+        .find(|c| is_type_node(c.kind()))
+        .map_or(Ty::Unit, |t| parse_type_node(&t));
+    let (body, tail) = ast::child::<ast::Block>(node)
+        .map(|b| lower_block(b.syntax(), lower_env, &mut scope, &[]))
+        .unwrap_or_default();
+
+    HirFn {
+        name,
+        generic_params,
+        params,
+        ret_ty,
+        body,
+        tail,
+        byte_range: (
+            u32::from(node.text_range().start()),
+            u32::from(node.text_range().end()),
+        ),
+    }
+}
+
 fn record_sys_param(param: &SyntaxNode, access: &mut FilteredAccessSet) {
-    let text = param.text().to_string();
-    if let Some(tr) = param
-        .descendants()
-        .find(|n| n.kind() == SyntaxKind::TypeRef)
-    {
-        let target = tr
-            .children()
-            .find(|c| c.kind() == SyntaxKind::Path)
-            .map(|p| ast::path_text(&ast::Path::cast(p).expect("path")))
-            .unwrap_or_else(|| tr.text().to_string().trim().to_owned());
-        if text.contains("stream_in") {
-            let inner = tr
-                .children()
-                .find(|c| c.kind() == SyntaxKind::GenericArgs)
-                .map(|g| {
-                    g.text()
-                        .to_string()
-                        .trim_matches(&['<', '>'][..])
-                        .trim()
-                        .to_owned()
-                })
-                .unwrap_or(target);
-            access.stream_reads.insert(inner);
-        } else if text.contains("&mut") {
+    let Some(type_node) = param.children().find(|c| is_type_node(c.kind())) else {
+        return;
+    };
+    let (kind, ty, _) = classify_param_type(&type_node);
+    let target = match ty {
+        Ty::Named(n) => n,
+        _ => type_node
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::Path)
+            .and_then(ast::Path::cast)
+            .map(|p| ast::path_text(&p))
+            .unwrap_or_else(|| type_node.text().to_string().trim().to_owned()),
+    };
+    match kind {
+        crate::hir::HirParamKind::StreamIn => {
+            access.stream_reads.insert(target);
+        }
+        crate::hir::HirParamKind::ResWrite => {
             access.res_writes.insert(target);
-        } else {
+        }
+        crate::hir::HirParamKind::ResRead => {
             access.res_reads.insert(target);
+        }
+        _ => {
+            // Check direct Mut token fallback
+            if type_node.kind() == SyntaxKind::RefType
+                && type_node.children_with_tokens().any(|e| {
+                    e.into_token()
+                        .is_some_and(|t| t.kind() == SyntaxKind::KwMut)
+                })
+            {
+                access.res_writes.insert(target);
+            } else {
+                access.res_reads.insert(target);
+            }
         }
     }
 }
@@ -1835,7 +2199,7 @@ fn verify_effects(
 
 fn collect_body_queries(
     body: &SyntaxNode,
-    field_to_stratum: &HashMap<String, String>,
+    lower_env: &LowerEnv<'_>,
     access: &mut FilteredAccessSet,
 ) {
     // Find every PostfixCallExpr whose callee is `query` or `query_one`, plus chained `.with`/`.without`.
@@ -1872,29 +2236,46 @@ fn collect_body_queries(
                     .find(|n| n.kind() == SyntaxKind::ProjTermList)
                 {
                     for pt in ast::children::<ast::ProjTerm>(&ptl) {
-                        if let Some(qt) = parse_proj_term(pt.syntax(), field_to_stratum) {
+                        if let Some(qt) = parse_proj_term(pt.syntax(), lower_env) {
                             q.terms.push(qt);
                         }
                     }
                 }
-                // Walk outer PostfixCallExpr chain for `.with<T>()` and `.without<T>()`.
+                // Walk outer PostfixCallExpr chain checking direct `.method<T>()` tokens.
                 let mut cur = node.parent();
                 while let Some(p) = cur {
                     if p.kind() == SyntaxKind::PostfixCallExpr {
-                        let txt = p.text().to_string();
+                        let method_name = p
+                            .children_with_tokens()
+                            .filter_map(|e| e.into_token())
+                            .skip_while(|t| t.kind() != SyntaxKind::Dot)
+                            .skip(1)
+                            .find(|t| !t.kind().is_trivia())
+                            .filter(|t| t.kind() == SyntaxKind::Ident)
+                            .map(|t| t.text().to_owned());
                         if let Some(args) =
                             p.children().find(|c| c.kind() == SyntaxKind::GenericArgs)
                         {
-                            let inner = args
-                                .text()
-                                .to_string()
-                                .trim_matches(&['<', '>'][..])
-                                .trim()
-                                .to_owned();
-                            if txt.contains(".with<") {
-                                q.with_filters.insert(inner);
-                            } else if txt.contains(".without<") {
-                                q.without_filters.insert(inner);
+                            let types: Vec<String> = args
+                                .children()
+                                .filter(|c| is_type_node(c.kind()))
+                                .map(|t| t.text().to_string().trim().to_owned())
+                                .collect();
+                            let filters = if types.is_empty() {
+                                vec![
+                                    args.text()
+                                        .to_string()
+                                        .trim_matches(&['<', '>'][..])
+                                        .trim()
+                                        .to_owned(),
+                                ]
+                            } else {
+                                types
+                            };
+                            match method_name.as_deref() {
+                                Some("with") => q.with_filters.extend(filters),
+                                Some("without") => q.without_filters.extend(filters),
+                                _ => {}
                             }
                         }
                         cur = p.parent();
@@ -1908,45 +2289,12 @@ fn collect_body_queries(
     }
 }
 
-fn parse_proj_term(
-    pt: &SyntaxNode,
-    field_to_stratum: &HashMap<String, String>,
-) -> Option<QueryTerm> {
-    let text = pt.text().to_string();
-    let trimmed = text.trim();
-    let rhs = trimmed.split_once(':').map_or(trimmed, |(_, r)| r).trim();
-
-    let (mode, rest) = if let Some(r) = rhs.strip_prefix("?&mut") {
-        (TermAccessMode::OptionalWrite, r.trim())
-    } else if let Some(r) = rhs.strip_prefix("?&") {
-        (TermAccessMode::OptionalRead, r.trim())
-    } else if let Some(r) = rhs.strip_prefix("&mut?") {
-        (TermAccessMode::SelectiveWrite, r.trim())
-    } else if let Some(r) = rhs.strip_prefix("&mut") {
-        (TermAccessMode::Write, r.trim())
-    } else if let Some(r) = rhs.strip_prefix('&') {
-        (TermAccessMode::Read, r.trim())
-    } else {
-        (TermAccessMode::Read, rhs)
-    };
-
-    let (storage_key, field_name) = if let Some((comp, field)) = rest.split_once('.') {
-        let comp = comp.trim();
-        let field = field.trim();
-        let lookup = format!("{comp}.{field}");
-        let resolved_storage = field_to_stratum
-            .get(&lookup)
-            .cloned()
-            .unwrap_or_else(|| comp.to_owned());
-        (resolved_storage, Some(field.to_owned()))
-    } else {
-        (rest.to_owned(), None)
-    };
-
+fn parse_proj_term(pt: &SyntaxNode, lower_env: &LowerEnv<'_>) -> Option<QueryTerm> {
+    let ht = lower_proj_term(pt, lower_env)?;
     Some(QueryTerm {
-        storage_key,
-        field_name,
-        mode,
+        storage_key: ht.storage_key,
+        field_name: ht.field_name,
+        mode: ht.mode,
         byte_start: u32::from(pt.text_range().start()),
         byte_end: u32::from(pt.text_range().end()),
     })
@@ -2174,59 +2522,114 @@ fn evaluate_assert_par(
     }
 }
 
-fn analyze_object(node: &SyntaxNode) -> HirObject {
+fn analyze_object(node: &SyntaxNode, lower_env: &LowerEnv<'_>) -> HirObject {
     let name = ast::first_ident(node).map_or_else(|| "Object".to_owned(), |t| t.text().to_owned());
     let is_persist = ast::attrs(node)
         .iter()
         .filter_map(ast::attr_name)
         .any(|a| a == "persist");
-    let components = ast::child::<ast::CompInitList>(node)
-        .map(|cil| {
-            ast::children::<ast::CompInit>(cil.syntax())
-                .filter_map(|ci| ast::child::<ast::Path>(ci.syntax()).map(|p| ast::path_text(&p)))
-                .collect()
-        })
+    let mut scope = ScopeStack::new();
+    let inits = ast::child::<ast::CompInitList>(node)
+        .map(|cil| lower_comp_init_list(cil.syntax(), lower_env, &mut scope, &[]))
         .unwrap_or_default();
+    let components = inits.iter().map(|c| c.component.clone()).collect();
     HirObject {
         name,
         is_persist,
         components,
+        inits,
     }
 }
 
-fn analyze_migrate(node: &SyntaxNode) -> HirMigration {
-    let component = ast::child::<ast::Path>(node)
+fn analyze_migrate(node: &SyntaxNode, lower_env: &LowerEnv<'_>) -> HirMigration {
+    let paths: Vec<String> = ast::children::<ast::Path>(node)
         .map(|p| ast::path_text(&p))
-        .unwrap_or_default();
+        .collect();
+    let component = paths.first().cloned().unwrap_or_default();
     let semvers: Vec<String> = ast::children::<ast::SemVer>(node)
         .map(|s| s.syntax().text().to_string())
         .collect();
     let from_ver = semvers.first().cloned().unwrap_or_default();
     let to_ver = semvers.get(1).cloned().unwrap_or_default();
-    let body_source = ast::child::<ast::Block>(node)
+
+    let mut saw_lparen = false;
+    let mut param_name = "old".to_owned();
+    for tok in node
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia())
+    {
+        if tok.kind() == SyntaxKind::LParen {
+            saw_lparen = true;
+        } else if saw_lparen && tok.kind() == SyntaxKind::Colon {
+            break;
+        } else if saw_lparen {
+            param_name = tok.text().to_owned();
+            break;
+        }
+    }
+
+    let from_type = node
+        .children()
+        .find(|c| is_type_node(c.kind()))
+        .map_or(Ty::Unknown, |n| parse_type_node(&n));
+    let to_type = paths
+        .get(1)
+        .cloned()
+        .map(Ty::Named)
+        .unwrap_or_else(|| Ty::Named(component.clone()));
+
+    let mut scope = ScopeStack::new();
+    scope.insert(param_name.clone(), ScopeBinding::Var(from_type.clone()));
+
+    let block = ast::child::<ast::Block>(node);
+    let body_source = block
+        .as_ref()
         .map(|b| b.syntax().text().to_string())
         .unwrap_or_default();
+    let (body, tail) = block
+        .as_ref()
+        .map(|b| lower_block(b.syntax(), lower_env, &mut scope, &[]))
+        .unwrap_or_default();
+
     HirMigration {
         component,
         from_ver,
         to_ver,
+        param_name,
+        from_type,
+        to_type,
+        body,
+        tail,
         body_source,
     }
 }
 
-fn analyze_schedule(node: &SyntaxNode) -> HirSchedule {
+fn analyze_schedule(node: &SyntaxNode, lower_env: &LowerEnv<'_>) -> HirSchedule {
     let label = ast::child::<ast::Path>(node)
         .map(|p| ast::path_text(&p))
         .unwrap_or_else(|| "Update".to_owned());
-    let run_if = ast::children::<ast::ScheduleMod>(node)
-        .find(|m| m.syntax().text().to_string().starts_with("run_if"))
-        .map(|m| m.syntax().text().to_string());
+    let run_if_mod = ast::children::<ast::ScheduleMod>(node).find(|m| {
+        m.syntax()
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| t.kind() == SyntaxKind::KwRunIf)
+    });
+    let run_if = run_if_mod.as_ref().map(|m| m.syntax().text().to_string());
+    let mut scope = ScopeStack::new();
+    let run_if_expr = run_if_mod.and_then(|m| {
+        m.syntax()
+            .children()
+            .find(|c| is_expr_node(c.kind()))
+            .map(|e| lower_expr(&e, lower_env, &mut scope, &[]))
+    });
     let nodes = ast::children::<ast::ScheduleNode>(node)
         .map(|sn| parse_schedule_group(sn.syntax()))
         .collect();
     HirSchedule {
         label,
         run_if,
+        run_if_expr,
         nodes,
     }
 }
@@ -2261,7 +2664,7 @@ fn parse_schedule_group(node: &SyntaxNode) -> HirScheduleGroup {
     }
 }
 
-fn analyze_sim_test(node: &SyntaxNode) -> HirSimTest {
+fn analyze_sim_test(node: &SyntaxNode, lower_env: &LowerEnv<'_>) -> HirSimTest {
     let name = node
         .children_with_tokens()
         .filter_map(|e| e.into_token())
@@ -2270,8 +2673,19 @@ fn analyze_sim_test(node: &SyntaxNode) -> HirSimTest {
             || "sim_test".to_owned(),
             |t| t.text().trim_matches('"').to_owned(),
         );
-    let body_source = ast::child::<ast::Block>(node)
+    let block = ast::child::<ast::Block>(node);
+    let body_source = block
+        .as_ref()
         .map(|b| b.syntax().text().to_string())
         .unwrap_or_default();
-    HirSimTest { name, body_source }
+    let mut scope = ScopeStack::new();
+    let body = block
+        .as_ref()
+        .map(|b| lower_block_as_stmts(b.syntax(), lower_env, &mut scope, &[], false))
+        .unwrap_or_default();
+    HirSimTest {
+        name,
+        body,
+        body_source,
+    }
 }

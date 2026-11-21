@@ -14,7 +14,8 @@ pub mod passes;
 pub mod verify;
 
 pub use ir::{
-    BasicBlock, BlockId, Inst, LocalId, MirFunction, MirLocal, MirModule, MirStmt, MirType,
+    BasicBlock, BlockId, Inst, LocalId, MirConstVal, MirFnKind, MirFunction, MirLocal, MirModule,
+    MirParam, MirQueryBinding, MirQueryTermBinding, MirResourceBinding, MirStmt, MirType,
     Terminator,
 };
 pub use lower::lower_to_mir;
