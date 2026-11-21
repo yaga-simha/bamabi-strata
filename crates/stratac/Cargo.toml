@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = ["sim-runner"]
-sim-runner = ["dep:bamabi_host", "dep:bamabi_native_rt", "dep:bevy_app", "dep:bevy_ecs"]
+sim-runner = ["dep:bamabi_host", "dep:bamabi_native_rt", "dep:bevy_app", "dep:bevy_ecs", "dep:stats_alloc"]
 
 [dependencies]
 bamabi_host = { workspace = true, features = ["signature-verification"], optional = true }
@@ -27,6 +27,7 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+stats_alloc = { workspace = true, optional = true }
 strata_codegen.workspace = true
 strata_jit.workspace = true
 strata_mir.workspace = true

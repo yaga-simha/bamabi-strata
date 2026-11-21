@@ -156,17 +156,51 @@ fn verify_function(func: &MirFunction, mod_det: bool, errors: &mut Vec<MirVerify
                 check_local(used, blk, errors);
             }
 
-            if let Inst::CmdRollback { checkpoint } = stmt.inst
-                && (checkpoint.0 as usize) < func.locals.len()
-                && func.locals[checkpoint.0 as usize].ty != MirType::Checkpoint
-            {
-                errors.push(MirVerifyError::InvalidCfgInvariant {
-                    function: func.name.clone(),
-                    detail: format!(
-                        "CmdRollback checkpoint LocalId({}) must have MirType::Checkpoint",
-                        checkpoint.0
-                    ),
-                });
+            let check_local_ty =
+                |local: LocalId, expected: MirType, desc: &str, errs: &mut Vec<MirVerifyError>| {
+                    if let Some(loc) = func.locals.get(local.0 as usize)
+                        && loc.ty != expected
+                    {
+                        errs.push(MirVerifyError::InvalidCfgInvariant {
+                            function: func.name.clone(),
+                            detail: format!(
+                                "{desc} LocalId({}) must have MirType::{expected:?}",
+                                local.0
+                            ),
+                        });
+                    }
+                };
+
+            match &stmt.inst {
+                Inst::CmdRollback { checkpoint } => {
+                    check_local_ty(
+                        *checkpoint,
+                        MirType::Checkpoint,
+                        "CmdRollback checkpoint",
+                        errors,
+                    );
+                }
+                Inst::SpawnBatchBegin { count, .. } => {
+                    if let Some(d) = stmt.dst {
+                        check_local_ty(d, MirType::U64, "SpawnBatchBegin dst", errors);
+                    } else {
+                        errors.push(MirVerifyError::InvalidCfgInvariant {
+                            function: func.name.clone(),
+                            detail:
+                                "SpawnBatchBegin requires a destination LocalId of MirType::U64"
+                                    .to_owned(),
+                        });
+                    }
+                    check_local_ty(*count, MirType::U32, "SpawnBatchBegin count", errors);
+                }
+                Inst::SpawnBatchPush { batch, index, .. } => {
+                    check_local_ty(*batch, MirType::U64, "SpawnBatchPush batch", errors);
+                    check_local_ty(*index, MirType::U32, "SpawnBatchPush index", errors);
+                }
+                Inst::SpawnBatchCommit { batch } => {
+                    check_local_ty(*batch, MirType::U64, "SpawnBatchCommit batch", errors);
+                }
+                _ => {}
             }
 
             if enforce_det {
@@ -323,6 +357,8 @@ fn inst_locals(inst: &Inst) -> Vec<LocalId> {
         | Inst::GraceIsActive { ptr: val }
         | Inst::GraceClear { ptr: val }
         | Inst::TimelineInWindow { ptr: val, .. }
+        | Inst::SpawnBatchBegin { count: val, .. }
+        | Inst::SpawnBatchCommit { batch: val }
         | Inst::CmdDespawn { entity: val }
         | Inst::CmdRemove { entity: val, .. }
         | Inst::StreamEmit { payload: val, .. }
@@ -468,6 +504,16 @@ fn inst_locals(inst: &Inst) -> Vec<LocalId> {
             out
         }
 
+        Inst::SpawnBatchPush {
+            batch,
+            index,
+            components,
+        } => {
+            let mut out = vec![*batch, *index];
+            out.extend(components.iter().map(|(_, l)| *l));
+            out
+        }
+
         Inst::CmdInsert { entity, data, .. } => {
             let mut out = vec![*entity];
             if let Some(d) = data {
@@ -599,5 +645,56 @@ mod tests {
             errs.iter()
                 .any(|e| matches!(e, MirVerifyError::NonDeterministicOp { .. }))
         );
+    }
+
+    /// Verifies `SpawnBatch*` instructions require `MirType::U64` handle and `MirType::U32` counts/indices.
+    #[test]
+    fn verify_rejects_mismatched_spawn_batch_types() {
+        let mut func = MirFunction::new("bad_batch", MirFnKind::System);
+        let cnt_bad = func.alloc_local("cnt", MirType::I32);
+        let batch_bad = func.alloc_local("batch", MirType::U32);
+        let idx_bad = func.alloc_local("idx", MirType::I32);
+        func.blocks.push(BasicBlock {
+            id: BlockId(0),
+            label: "entry".to_owned(),
+            stmts: vec![
+                MirStmt {
+                    dst: Some(batch_bad),
+                    inst: Inst::SpawnBatchBegin {
+                        count: cnt_bad,
+                        components: vec!["Pos".to_owned()],
+                    },
+                },
+                MirStmt {
+                    dst: None,
+                    inst: Inst::SpawnBatchPush {
+                        batch: batch_bad,
+                        index: idx_bad,
+                        components: Vec::new(),
+                    },
+                },
+                MirStmt {
+                    dst: None,
+                    inst: Inst::SpawnBatchCommit { batch: batch_bad },
+                },
+            ],
+            terminator: Terminator::Return(None),
+        });
+        let errs = verify_mir(&base_module(func)).unwrap_err();
+        assert!(errs.iter().any(|e| {
+            matches!(e, MirVerifyError::InvalidCfgInvariant { detail, .. } if detail.contains("SpawnBatchBegin dst"))
+        }));
+        assert!(errs.iter().any(|e| {
+            matches!(e, MirVerifyError::InvalidCfgInvariant { detail, .. } if detail.contains("SpawnBatchBegin count"))
+        }));
+        assert!(errs.iter().any(|e| {
+            matches!(e, MirVerifyError::InvalidCfgInvariant { detail, .. } if detail.contains("SpawnBatchPush batch"))
+        }));
+        assert!(errs.iter().any(|e| {
+            matches!(e, MirVerifyError::InvalidCfgInvariant { detail, .. } if detail.contains("SpawnBatchPush index"))
+        }));
+        assert!(errs.iter().any(|e| {
+            matches!(e, MirVerifyError::InvalidCfgInvariant { detail, .. } if detail.contains("SpawnBatchCommit batch"))
+        }));
     }
 }

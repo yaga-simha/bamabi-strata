@@ -340,6 +340,11 @@ impl<'a> EmitCtx<'a> {
                 {
                     continue;
                 }
+                if let Some((prefix, _)) = tag.split_once('.')
+                    && self.find_comp_idx(prefix).is_some()
+                {
+                    continue;
+                }
                 let canon = canonicalize(&self.mir.module_path, &tag);
                 let short = short_name(&canon).to_string();
                 let uuid = ComponentUuid::from_parts(&canon, 0, 1, 0);
@@ -369,7 +374,10 @@ impl<'a> EmitCtx<'a> {
             if let Some(l_idx) = c.layout_idx {
                 let mut reqs = Vec::new();
                 for req_name in &self.layouts[l_idx].required_components {
-                    if let Some(r_idx) = self.find_comp_idx(req_name) {
+                    if let Some(r_idx) = self.find_comp_idx(req_name)
+                        && r_idx != c.idx
+                        && !reqs.contains(&r_idx)
+                    {
                         reqs.push(r_idx);
                     }
                 }
@@ -508,7 +516,7 @@ impl<'a> EmitCtx<'a> {
         let mut timer_tick_reg_name: Option<String> = None;
         for f in &fns_snapshot {
             if matches!(f.kind, MirFnKind::SynthesizedTimerTick) {
-                timer_tick_reg_name = Some(format!("{}::{}", self.mir.module_path, f.name));
+                timer_tick_reg_name = Some(short_name(&f.name).to_string());
                 break;
             }
         }
@@ -519,7 +527,7 @@ impl<'a> EmitCtx<'a> {
                 idx,
                 mir_fn_idx: None,
                 c_fn_name: "strata_sys_startup_objects".to_string(),
-                reg_name: format!("{}::__strata_startup_objects", self.mir.module_path),
+                reg_name: "__strata_startup_objects".to_string(),
                 schedule: "BAM_SCHEDULE_STARTUP",
                 flags_expr: "BAM_SYSTEM_FLAG_MAIN_THREAD".to_string(),
                 after_names: Vec::new(),
@@ -545,9 +553,12 @@ impl<'a> EmitCtx<'a> {
                         system_schedule_label(self.mir, &f.name)
                     };
                     let sched_c = c_schedule_const(sched_label);
-                    let reg_name = format!("{}::{}", self.mir.module_path, f.name);
+                    let reg_name = short_name(&f.name).to_string();
                     let c_fn_name = format!("strata_sys_{}", sanitize_ident(&f.name));
-                    let mut after_names = sys_after.remove(&f.name).unwrap_or_default();
+                    let mut after_names = sys_after
+                        .remove(&reg_name)
+                        .or_else(|| sys_after.remove(&f.name))
+                        .unwrap_or_default();
                     if !is_timer_tick
                         && sched_c == "BAM_SCHEDULE_FIXED_UPDATE"
                         && let Some(ref tt_name) = timer_tick_reg_name
@@ -555,7 +566,10 @@ impl<'a> EmitCtx<'a> {
                     {
                         after_names.push(tt_name.clone());
                     }
-                    let in_sets = sys_sets.remove(&f.name).unwrap_or_default();
+                    let in_sets = sys_sets
+                        .remove(&reg_name)
+                        .or_else(|| sys_sets.remove(&f.name))
+                        .unwrap_or_default();
                     let run_if_fn = self.schedule_run_if_for(sched_label, fn_idx);
                     let run_if_resources = run_if_fn
                         .as_ref()
@@ -586,7 +600,7 @@ impl<'a> EmitCtx<'a> {
                             })?;
                     self.observers.push(RegObserver {
                         c_fn_name: format!("strata_obs_{}", sanitize_ident(&f.name)),
-                        reg_name: format!("{}::{}", self.mir.module_path, f.name),
+                        reg_name: short_name(&f.name).to_string(),
                         event_comp_idx,
                     });
                 }
@@ -699,24 +713,25 @@ impl<'a> EmitCtx<'a> {
     ) {
         match node.kind.as_str() {
             "leaf" => {
+                let leaf_name = short_name(&node.name).to_string();
                 if let Some(pset) = parent_set {
                     sys_sets
-                        .entry(node.name.clone())
+                        .entry(leaf_name.clone())
                         .or_default()
                         .push(pset.to_string());
                 }
                 if let Some(prev) = prev_sibling {
                     sys_after
-                        .entry(node.name.clone())
+                        .entry(leaf_name)
                         .or_default()
-                        .push(format!("{}::{}", self.mir.module_path, prev));
+                        .push(short_name(prev).to_string());
                 }
             }
             kind @ ("seq" | "seq_weak" | "par" | "set") => {
                 let set_name = if node.name.is_empty() {
-                    format!("{}::set_{}", self.mir.module_path, self.sets.len())
+                    format!("set_{}", self.sets.len())
                 } else {
-                    format!("{}::{}", self.mir.module_path, node.name)
+                    short_name(&node.name).to_string()
                 };
                 let flags_expr = match kind {
                     "seq" => "BAM_SCHEDULE_SET_FLAG_SEQUENCE",
@@ -1143,7 +1158,7 @@ static BAM_UNUSED inline void strata_input_tick(void* ptr, uint32_t cap, float d
     for (uint32_t i = 0u; i < cap; ++i) {
         StrataInputEntry e;
         memcpy(&e, bytes + (size_t)i * sizeof(StrataInputEntry), sizeof(e));
-        if (e.action_id != 0xFFFFu) {
+        if (e.action_id != 0xFFFFu && e.remaining_sec > 0.0f) {
             e.remaining_sec -= dt;
             if (e.remaining_sec <= 0.0f) {
                 e.action_id = 0xFFFFu;
@@ -1213,6 +1228,126 @@ static BAM_UNUSED inline StrataSpatialHits strata_spatial_query_segment_at(
     (void)radius;
     (void)tick_offset;
     return hits;
+}
+
+typedef struct StrataSpawnBatch {
+    uint32_t count;
+    uint32_t comp_count;
+    BamComponent* comps;
+    size_t* elem_sizes;
+    uint8_t** mut_cols;
+    const uint8_t** ro_cols;
+} StrataSpawnBatch;
+
+static BAM_UNUSED inline StrataSpawnBatch* strata_spawn_batch_alloc_header(
+    uint32_t count,
+    uint32_t comp_count)
+{
+    StrataSpawnBatch* b = (StrataSpawnBatch*)calloc(1u, sizeof(StrataSpawnBatch));
+    if (b == NULL) {
+        return NULL;
+    }
+    b->count = count;
+    b->comp_count = comp_count;
+    if (comp_count > 0u) {
+        b->comps = (BamComponent*)calloc((size_t)comp_count, sizeof(BamComponent));
+        b->elem_sizes = (size_t*)calloc((size_t)comp_count, sizeof(size_t));
+        b->mut_cols = (uint8_t**)calloc((size_t)comp_count, sizeof(uint8_t*));
+        b->ro_cols = (const uint8_t**)calloc((size_t)comp_count, sizeof(const uint8_t*));
+        if (b->comps == NULL || b->elem_sizes == NULL || b->mut_cols == NULL || b->ro_cols == NULL) {
+            free(b->comps);
+            free(b->elem_sizes);
+            free(b->mut_cols);
+            free(b->ro_cols);
+            free(b);
+            return NULL;
+        }
+    }
+    return b;
+}
+
+static BAM_UNUSED inline void strata_spawn_batch_init_col(
+    StrataSpawnBatch* b,
+    uint32_t col,
+    BamComponent comp,
+    size_t elem_size)
+{
+    if (b == NULL || col >= b->comp_count) {
+        return;
+    }
+    b->comps[col] = comp;
+    b->elem_sizes[col] = elem_size;
+    if (elem_size > 0u && b->count > 0u) {
+        uint8_t* mem = (uint8_t*)calloc((size_t)b->count, elem_size);
+        b->mut_cols[col] = mem;
+        b->ro_cols[col] = mem;
+    }
+}
+
+static BAM_UNUSED inline void strata_spawn_batch_push(
+    StrataSpawnBatch* b,
+    BamComponent comp,
+    uint32_t col_hint,
+    uint32_t row_idx,
+    const void* src,
+    size_t elem_size)
+{
+    if (b == NULL || src == NULL || elem_size == 0u || row_idx >= b->count) {
+        return;
+    }
+    uint32_t col = col_hint;
+    if (col >= b->comp_count || b->comps[col] != comp) {
+        col = b->comp_count;
+        for (uint32_t k = 0u; k < b->comp_count; ++k) {
+            if (b->comps[k] == comp) {
+                col = k;
+                break;
+            }
+        }
+    }
+    if (col < b->comp_count && b->mut_cols != NULL && b->mut_cols[col] != NULL
+        && b->elem_sizes[col] == elem_size)
+    {
+        memcpy(b->mut_cols[col] + (size_t)row_idx * elem_size, src, elem_size);
+    }
+}
+
+static BAM_UNUSED inline void strata_spawn_batch_commit(
+    StrataSpawnBatch* b,
+    const BamHostApi* api,
+    BamCommands* cmds)
+{
+    if (b == NULL) {
+        return;
+    }
+    if (b->count > 0u && cmds != NULL && api != NULL && api->cmd_spawn_batch != NULL) {
+        int ready = 1;
+        for (uint32_t i = 0u; i < b->comp_count; ++i) {
+            if (b->elem_sizes[i] > 0u && (b->mut_cols == NULL || b->mut_cols[i] == NULL)) {
+                ready = 0;
+                break;
+            }
+        }
+        if (ready) {
+            (void)api->cmd_spawn_batch(
+                cmds,
+                b->comps,
+                b->ro_cols,
+                (size_t)b->comp_count,
+                (size_t)b->count,
+                NULL);
+        }
+    }
+    if (b->mut_cols != NULL) {
+        for (uint32_t i = 0u; i < b->comp_count; ++i) {
+            free(b->mut_cols[i]);
+        }
+        free(b->mut_cols);
+    }
+    free(b->ro_cols);
+    free(b->comps);
+    free(b->elem_sizes);
+    free(b);
 }
 
 ",
@@ -1401,9 +1536,6 @@ static BAM_UNUSED inline StrataSpatialHits strata_spatial_query_segment_at(
                     continue;
                 }
                 let fc = sanitize_c_field(&f.name);
-                if let Ty::InputBuffer { cap, .. } = &f.ty {
-                    let _ = writeln!(self.out, "    strata_input_init(&out.{fc}, {cap}u);");
-                }
                 if let Some(defs) = defs_opt
                     && let Some(val) = defs.get(&f.name)
                 {
@@ -1782,6 +1914,11 @@ typedef struct StrataModState {{
                     Inst::CmdSpawn { .. } | Inst::TriggerTarget | Inst::EntityAtRow { .. } => {
                         if let Some(d) = dst {
                             local_types.insert(d, MirType::Entity);
+                        }
+                    }
+                    Inst::SpawnBatchBegin { .. } => {
+                        if let Some(d) = dst {
+                            local_types.insert(d, MirType::U64);
                         }
                     }
                     Inst::SpatialQueryDisc { .. } | Inst::SpatialQuerySegmentAt { .. } => {
@@ -2372,6 +2509,47 @@ typedef struct StrataModState {{
         out
     }
 
+    fn compute_component_reg_order(&self) -> Vec<usize> {
+        fn visit(idx: usize, comps: &[RegComponent], state: &mut [u8], order: &mut Vec<usize>) {
+            if state[idx] != 0 {
+                return;
+            }
+            state[idx] = 1;
+            for &req in &comps[idx].required_indices {
+                if req < comps.len() {
+                    visit(req, comps, state, order);
+                }
+            }
+            state[idx] = 2;
+            order.push(idx);
+        }
+
+        let n = self.components.len();
+        let mut state = vec![0u8; n];
+        let mut order = Vec::with_capacity(n);
+        for idx in 0..n {
+            visit(idx, &self.components, &mut state, &mut order);
+        }
+        order
+    }
+
+    fn layout_has_nonzero_default(&self, l_idx: usize) -> bool {
+        let layout = &self.layouts[l_idx];
+        if layout.size == 0 {
+            return false;
+        }
+        let short = short_name(&layout.canonical_name);
+        let defs_opt = self
+            .mir
+            .field_defaults
+            .get(&layout.canonical_name)
+            .or_else(|| self.mir.field_defaults.get(short));
+        if let Some(defs) = defs_opt {
+            return defs.values().any(|v| !mir_const_is_all_zero(v));
+        }
+        false
+    }
+
     fn emit_manifest_init_shutdown(&mut self) -> Result<(), CodegenError> {
         let mod_name = c_escape(&self.mir.module_path);
 
@@ -2419,6 +2597,7 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
         );
 
         let comps = self.components.clone();
+        let reg_order = self.compute_component_reg_order();
         for comp in &comps {
             if comp.has_mod_res
                 && let Some(l_idx) = comp.layout_idx
@@ -2428,7 +2607,8 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
                 let _ = writeln!(self.out, "    state->mod_res_{} = {def_fn}();", comp.idx);
             }
         }
-        for comp in &comps {
+        for comp_idx in reg_order {
+            let comp = &comps[comp_idx];
             let idx = comp.idx;
             let canon_esc = c_escape(&comp.canonical);
             let fp = comp.fingerprint;
@@ -2481,6 +2661,86 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
             if field_count > 0 {
                 let _ = writeln!(self.out, "        cdesc.fields = fields_{idx};");
                 let _ = writeln!(self.out, "        cdesc.field_count = {field_count}u;");
+            }
+            if !comp.required_indices.is_empty() {
+                let req_n = comp.required_indices.len();
+                let _ = writeln!(self.out, "        BamComponent reqs_{idx}[{req_n}u];");
+                for (ri, &r_idx) in comp.required_indices.iter().enumerate() {
+                    let _ = writeln!(
+                        self.out,
+                        "        reqs_{idx}[{ri}u] = state->components[{r_idx}u];"
+                    );
+                }
+                let _ = writeln!(self.out, "        cdesc.required_components = reqs_{idx};");
+                let _ = writeln!(
+                    self.out,
+                    "        cdesc.required_component_count = {req_n}u;"
+                );
+
+                let nonzero_reqs: Vec<(usize, usize)> = comp
+                    .required_indices
+                    .iter()
+                    .copied()
+                    .filter_map(|r_idx| {
+                        let rl_idx = comps[r_idx].layout_idx?;
+                        if is_ecs_component_kind(self.layouts[rl_idx].item_kind)
+                            && self.layout_has_nonzero_default(rl_idx)
+                        {
+                            Some((r_idx, rl_idx))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !nonzero_reqs.is_empty() {
+                    let init_n = nonzero_reqs.len();
+                    for (ki, &(_, rl_idx)) in nonzero_reqs.iter().enumerate() {
+                        let r_cty = &self.layout_c_names[rl_idx];
+                        let r_short = short_name(&self.layouts[rl_idx].canonical_name);
+                        let def_fn = format!("strata_default_{rl_idx}_{}", sanitize_ident(r_short));
+                        let _ =
+                            writeln!(self.out, "        {r_cty} req_def_{idx}_{ki} = {def_fn}();");
+                    }
+                    let _ = writeln!(
+                        self.out,
+                        "        BamRequiredComponent req_inits_{idx}[{init_n}u];"
+                    );
+                    let _ = writeln!(
+                        self.out,
+                        "        memset(req_inits_{idx}, 0, sizeof(req_inits_{idx}));"
+                    );
+                    for (ki, &(r_idx, rl_idx)) in nonzero_reqs.iter().enumerate() {
+                        let r_size = self.layouts[rl_idx].size;
+                        let _ = writeln!(
+                            self.out,
+                            "        req_inits_{idx}[{ki}u].struct_size = (uint32_t)sizeof(BamRequiredComponent);"
+                        );
+                        let _ = writeln!(
+                            self.out,
+                            "        req_inits_{idx}[{ki}u].flags = BAM_REQUIRED_FLAG_CUSTOM_BYTES;"
+                        );
+                        let _ = writeln!(
+                            self.out,
+                            "        req_inits_{idx}[{ki}u].component = state->components[{r_idx}u];"
+                        );
+                        let _ = writeln!(
+                            self.out,
+                            "        req_inits_{idx}[{ki}u].init_bytes = (const uint8_t*)&req_def_{idx}_{ki};"
+                        );
+                        let _ = writeln!(
+                            self.out,
+                            "        req_inits_{idx}[{ki}u].init_size = {r_size}u;"
+                        );
+                    }
+                    let _ = writeln!(
+                        self.out,
+                        "        cdesc.required_init_descs = req_inits_{idx};"
+                    );
+                    let _ = writeln!(
+                        self.out,
+                        "        cdesc.required_init_desc_count = {init_n}u;"
+                    );
+                }
             }
             let size = comp.size;
             let align = comp.align;
@@ -4314,6 +4574,19 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             Inst::CmdSpawnBatch { count, components } => {
                 self.emit_cmd_spawn_batch(*count, components, s);
             }
+            Inst::SpawnBatchBegin { count, components } => {
+                self.emit_spawn_batch_begin(dst, *count, components, s);
+            }
+            Inst::SpawnBatchPush {
+                batch,
+                index,
+                components,
+            } => {
+                self.emit_spawn_batch_push(*batch, *index, components, s);
+            }
+            Inst::SpawnBatchCommit { batch } => {
+                self.emit_spawn_batch_commit(*batch, s);
+            }
             Inst::CmdDespawn { entity } => {
                 let e = self.local_expr(*entity);
                 self.ensure_cmds_snippet(s);
@@ -5209,16 +5482,28 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
         offset_bytes: u32,
         target_ty: Option<&MirType>,
     ) -> Option<(usize, String, String)> {
+        let (l_idx, ptr_cast, path, _, _) =
+            self.resolve_member_with_ty(layout_key, field_name, offset_bytes, target_ty)?;
+        Some((l_idx, ptr_cast, path))
+    }
+
+    fn resolve_member_with_ty(
+        &self,
+        layout_key: &str,
+        field_name: &str,
+        offset_bytes: u32,
+        target_ty: Option<&MirType>,
+    ) -> Option<(usize, String, String, Ty, usize)> {
         let l_idx = self.parent.find_layout_idx(layout_key)?;
         let layout = &self.parent.layouts[l_idx];
-        let path = self.resolve_path_in_fields(
+        let (path, fty, fsz) = self.resolve_path_in_fields(
             &layout.fields,
             field_name,
             offset_bytes as usize,
             target_ty,
         )?;
         let ptr_cast = format!("const {}", self.parent.layout_c_names[l_idx]);
-        Some((l_idx, ptr_cast, path))
+        Some((l_idx, ptr_cast, path, fty, fsz))
     }
 
     fn resolve_path_in_fields(
@@ -5227,7 +5512,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
         field_name: &str,
         rel_offset: usize,
         target_ty: Option<&MirType>,
-    ) -> Option<String> {
+    ) -> Option<(String, Ty, usize)> {
         // Prefer exact offset match when type also aligns in C99 representation.
         for f in fields {
             if f.is_padding {
@@ -5237,7 +5522,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 && (field_name.is_empty() || f.name == field_name)
                 && target_ty.is_none_or(|tt| ty_matches_sema(&f.ty, tt))
             {
-                return Some(sanitize_c_field(&f.name));
+                return Some((sanitize_c_field(&f.name), f.ty.clone(), f.size));
             }
         }
         // Try nested subfield traversal.
@@ -5250,10 +5535,14 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 let sub_field = field_name
                     .strip_prefix(&format!("{}.", f.name))
                     .unwrap_or(field_name);
-                if let Some(sub_path) =
+                if let Some((sub_path, sub_ty, sub_sz)) =
                     self.resolve_path_in_sema_ty(&f.ty, sub_field, sub_off, target_ty)
                 {
-                    return Some(format!("{}.{sub_path}", sanitize_c_field(&f.name)));
+                    return Some((
+                        format!("{}.{sub_path}", sanitize_c_field(&f.name)),
+                        sub_ty,
+                        sub_sz,
+                    ));
                 }
             }
         }
@@ -5266,35 +5555,48 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
         field_name: &str,
         rel_offset: usize,
         target_ty: Option<&MirType>,
-    ) -> Option<String> {
+    ) -> Option<(String, Ty, usize)> {
         match ty {
             Ty::Vec2 => match (rel_offset, target_ty) {
-                (0, None | Some(MirType::F32)) => Some("x".to_string()),
-                (4, None | Some(MirType::F32)) => Some("y".to_string()),
+                (0, None | Some(MirType::F32)) => Some(("x".to_string(), Ty::F32, 4)),
+                (4, None | Some(MirType::F32)) => Some(("y".to_string(), Ty::F32, 4)),
                 _ => None,
             },
             Ty::Vec3 => match (rel_offset, target_ty) {
-                (0, None | Some(MirType::F32)) => Some("x".to_string()),
-                (4, None | Some(MirType::F32)) => Some("y".to_string()),
-                (8, None | Some(MirType::F32)) => Some("z".to_string()),
+                (0, None | Some(MirType::F32)) => Some(("x".to_string(), Ty::F32, 4)),
+                (4, None | Some(MirType::F32)) => Some(("y".to_string(), Ty::F32, 4)),
+                (8, None | Some(MirType::F32)) => Some(("z".to_string(), Ty::F32, 4)),
                 _ => None,
             },
             Ty::Vec4 | Ty::Quat | Ty::Rgba | Ty::Vec3a => match (rel_offset, target_ty) {
-                (0, None | Some(MirType::F32)) => Some("x".to_string()),
-                (4, None | Some(MirType::F32)) => Some("y".to_string()),
-                (8, None | Some(MirType::F32)) => Some("z".to_string()),
-                (12, None | Some(MirType::F32)) => Some("w".to_string()),
+                (0, None | Some(MirType::F32)) => Some(("x".to_string(), Ty::F32, 4)),
+                (4, None | Some(MirType::F32)) => Some(("y".to_string(), Ty::F32, 4)),
+                (8, None | Some(MirType::F32)) => Some(("z".to_string(), Ty::F32, 4)),
+                (12, None | Some(MirType::F32)) => Some(("w".to_string(), Ty::F32, 4)),
                 _ => None,
             },
-            Ty::IVec2 | Ty::UVec2 => match (rel_offset, target_ty) {
-                (0, None | Some(MirType::I32 | MirType::U32)) => Some("x".to_string()),
-                (4, None | Some(MirType::I32 | MirType::U32)) => Some("y".to_string()),
+            Ty::IVec2 => match (rel_offset, target_ty) {
+                (0, None | Some(MirType::I32 | MirType::U32)) => {
+                    Some(("x".to_string(), Ty::I32, 4))
+                }
+                (4, None | Some(MirType::I32 | MirType::U32)) => {
+                    Some(("y".to_string(), Ty::I32, 4))
+                }
+                _ => None,
+            },
+            Ty::UVec2 => match (rel_offset, target_ty) {
+                (0, None | Some(MirType::I32 | MirType::U32)) => {
+                    Some(("x".to_string(), Ty::U32, 4))
+                }
+                (4, None | Some(MirType::I32 | MirType::U32)) => {
+                    Some(("y".to_string(), Ty::U32, 4))
+                }
                 _ => None,
             },
             Ty::IVec3 => match (rel_offset, target_ty) {
-                (0, None | Some(MirType::I32)) => Some("x".to_string()),
-                (4, None | Some(MirType::I32)) => Some("y".to_string()),
-                (8, None | Some(MirType::I32)) => Some("z".to_string()),
+                (0, None | Some(MirType::I32)) => Some(("x".to_string(), Ty::I32, 4)),
+                (4, None | Some(MirType::I32)) => Some(("y".to_string(), Ty::I32, 4)),
+                (8, None | Some(MirType::I32)) => Some(("z".to_string(), Ty::I32, 4)),
                 _ => None,
             },
             Ty::Named(key) => {
@@ -5307,6 +5609,65 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 )
             }
             _ => None,
+        }
+    }
+
+    fn is_c_scalar_field(&self, ty: &Ty, byte_size: usize) -> bool {
+        match ty {
+            Ty::Bool
+            | Ty::U8
+            | Ty::I8
+            | Ty::I16
+            | Ty::U16
+            | Ty::I32
+            | Ty::Fix32
+            | Ty::U32
+            | Ty::Sym
+            | Ty::Rgba8
+            | Ty::I64
+            | Ty::Fix64
+            | Ty::U64
+            | Ty::F32
+            | Ty::UnitScalar { .. }
+            | Ty::F64 => true,
+            Ty::Ref(_) => byte_size == 8,
+            Ty::Named(key) => {
+                !self
+                    .parent
+                    .find_layout_idx(key)
+                    .is_some_and(|l_idx| self.parent.layouts[l_idx].size == byte_size)
+                    && matches!(byte_size, 1 | 2 | 4 | 8)
+            }
+            _ => false,
+        }
+    }
+
+    fn c_field_scalar_ty(&self, ty: &Ty, byte_size: usize) -> &'static str {
+        match ty {
+            Ty::Bool | Ty::U8 => "uint8_t",
+            Ty::I8 => "int8_t",
+            Ty::I16 => "int16_t",
+            Ty::U16 => "uint16_t",
+            Ty::U32 | Ty::Sym | Ty::Rgba8 => "uint32_t",
+            Ty::I64 | Ty::Fix64 => "int64_t",
+            Ty::U64 => "uint64_t",
+            Ty::F32 | Ty::UnitScalar { .. } => {
+                if byte_size == 8 {
+                    "double"
+                } else {
+                    "float"
+                }
+            }
+            Ty::F64 => "double",
+            Ty::Ref(_) => "BamEntity",
+            Ty::Named(_) => match byte_size {
+                1 => "uint8_t",
+                2 => "uint16_t",
+                4 => "int32_t",
+                _ => "int64_t",
+            },
+            // Covers `Ty::I32`, `Ty::Fix32`, and remaining 32-bit integer scalars.
+            _ => "int32_t",
         }
     }
 
@@ -5410,16 +5771,32 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             } else {
                 None
             };
-            if let Some(ref lk) = effective_key
-                && let Some((_, _, path)) =
+            if let Some(ref lk) = effective_key {
+                if let Some((_, _, path)) =
                     self.resolve_member_in_layout(lk, field, offset_bytes, Some(field_ty))
-            {
-                if matches!(field_ty, MirType::Bool) {
-                    let _ = writeln!(s, "    {d} = ({p}.{path}) ? BAM_TRUE : BAM_FALSE;");
-                } else {
-                    let _ = writeln!(s, "    {d} = {p}.{path};");
+                {
+                    if matches!(field_ty, MirType::Bool) {
+                        let _ = writeln!(s, "    {d} = ({p}.{path}) ? BAM_TRUE : BAM_FALSE;");
+                    } else {
+                        let _ = writeln!(s, "    {d} = {p}.{path};");
+                    }
+                    return;
                 }
-                return;
+                if !self.parent.is_aggregate_mir_ty(field_ty)
+                    && let Some((_, _, path, fty, fsz)) =
+                        self.resolve_member_with_ty(lk, field, offset_bytes, None)
+                    && self.is_c_scalar_field(&fty, fsz)
+                    && matches!(field_ty, MirType::F32 | MirType::F64)
+                        == matches!(fty, Ty::F32 | Ty::F64 | Ty::UnitScalar { .. })
+                {
+                    if matches!(field_ty, MirType::Bool) {
+                        let _ = writeln!(s, "    {d} = ({p}.{path}) ? BAM_TRUE : BAM_FALSE;");
+                    } else {
+                        let dst_c = self.parent.c_ty(field_ty);
+                        let _ = writeln!(s, "    {d} = ({dst_c})({p}.{path});");
+                    }
+                    return;
+                }
             }
             let _ = writeln!(
                 s,
@@ -5435,29 +5812,58 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
         } else {
             None
         };
-        if let Some(ref lk) = effective_key
-            && let Some((l_idx, _, path)) =
+        if let Some(ref lk) = effective_key {
+            if let Some((l_idx, _, path)) =
                 self.resolve_member_in_layout(lk, field, offset_bytes, Some(field_ty))
-        {
-            let same_ptr = matches!(
-                self.ptr_meta.get(&base_ptr),
-                Some(PtrKind::LayoutPtr { layout_idx, .. }) if *layout_idx == l_idx
-            );
-            let access = if same_ptr {
-                format!("{p}->{path}")
-            } else {
-                let cty = &self.parent.layout_c_names[l_idx];
-                format!("((const {cty}* BAM_RESTRICT){p})->{path}")
-            };
-            if matches!(field_ty, MirType::Bool) {
-                let _ = writeln!(
-                    s,
-                    "    if ({p} != NULL) {{ {d} = ({access}) ? BAM_TRUE : BAM_FALSE; }}"
+            {
+                let same_ptr = matches!(
+                    self.ptr_meta.get(&base_ptr),
+                    Some(PtrKind::LayoutPtr { layout_idx, .. }) if *layout_idx == l_idx
                 );
-            } else {
-                let _ = writeln!(s, "    if ({p} != NULL) {{ {d} = {access}; }}");
+                let access = if same_ptr {
+                    format!("{p}->{path}")
+                } else {
+                    let cty = &self.parent.layout_c_names[l_idx];
+                    format!("((const {cty}* BAM_RESTRICT){p})->{path}")
+                };
+                if matches!(field_ty, MirType::Bool) {
+                    let _ = writeln!(
+                        s,
+                        "    if ({p} != NULL) {{ {d} = ({access}) ? BAM_TRUE : BAM_FALSE; }}"
+                    );
+                } else {
+                    let _ = writeln!(s, "    if ({p} != NULL) {{ {d} = {access}; }}");
+                }
+                return;
             }
-            return;
+            if !self.parent.is_aggregate_mir_ty(field_ty)
+                && let Some((l_idx, _, path, fty, fsz)) =
+                    self.resolve_member_with_ty(lk, field, offset_bytes, None)
+                && self.is_c_scalar_field(&fty, fsz)
+                && matches!(field_ty, MirType::F32 | MirType::F64)
+                    == matches!(fty, Ty::F32 | Ty::F64 | Ty::UnitScalar { .. })
+            {
+                let same_ptr = matches!(
+                    self.ptr_meta.get(&base_ptr),
+                    Some(PtrKind::LayoutPtr { layout_idx, .. }) if *layout_idx == l_idx
+                );
+                let access = if same_ptr {
+                    format!("{p}->{path}")
+                } else {
+                    let cty = &self.parent.layout_c_names[l_idx];
+                    format!("((const {cty}* BAM_RESTRICT){p})->{path}")
+                };
+                if matches!(field_ty, MirType::Bool) {
+                    let _ = writeln!(
+                        s,
+                        "    if ({p} != NULL) {{ {d} = ({access}) ? BAM_TRUE : BAM_FALSE; }}"
+                    );
+                } else {
+                    let dst_c = self.parent.c_ty(field_ty);
+                    let _ = writeln!(s, "    if ({p} != NULL) {{ {d} = ({dst_c})({access}); }}");
+                }
+                return;
+            }
         }
         let _ = writeln!(
             s,
@@ -5492,12 +5898,32 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             } else {
                 None
             };
-            if let Some(ref lk) = effective_key
-                && let Some((_, _, path)) =
+            if let Some(ref lk) = effective_key {
+                if let Some((_, _, path)) =
                     self.resolve_member_in_layout(lk, field, offset_bytes, Some(&vty))
-            {
-                let _ = writeln!(s, "    {p}.{path} = {v};");
-                return;
+                {
+                    let _ = writeln!(s, "    {p}.{path} = {v};");
+                    return;
+                }
+                if !self.parent.is_aggregate_mir_ty(&vty)
+                    && let Some((_, _, path, fty, fsz)) =
+                        self.resolve_member_with_ty(lk, field, offset_bytes, None)
+                {
+                    if self.is_c_scalar_field(&fty, fsz) {
+                        if matches!(fty, Ty::Bool) {
+                            let _ = writeln!(s, "    {p}.{path} = ({v}) ? BAM_TRUE : BAM_FALSE;");
+                        } else {
+                            let fcty = self.c_field_scalar_ty(&fty, fsz);
+                            let _ = writeln!(s, "    {p}.{path} = ({fcty})({v});");
+                        }
+                        return;
+                    }
+                    let _ = writeln!(
+                        s,
+                        "    memcpy(&({p}.{path}), &{v}, sizeof({p}.{path}) < sizeof({v}) ? sizeof({p}.{path}) : sizeof({v}));"
+                    );
+                    return;
+                }
             }
             let _ = writeln!(
                 s,
@@ -5513,22 +5939,55 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
         } else {
             None
         };
-        if let Some(ref lk) = effective_key
-            && let Some((l_idx, _, path)) =
+        if let Some(ref lk) = effective_key {
+            if let Some((l_idx, _, path)) =
                 self.resolve_member_in_layout(lk, field, offset_bytes, Some(&vty))
-        {
-            let same_ptr = matches!(
-                self.ptr_meta.get(&base_ptr),
-                Some(PtrKind::LayoutPtr { layout_idx, is_mut: true }) if *layout_idx == l_idx
-            );
-            let access = if same_ptr {
-                format!("{p}->{path}")
-            } else {
-                let cty = &self.parent.layout_c_names[l_idx];
-                format!("(({cty}* BAM_RESTRICT){p})->{path}")
-            };
-            let _ = writeln!(s, "    if ({p} != NULL) {{ {access} = {v}; }}");
-            return;
+            {
+                let same_ptr = matches!(
+                    self.ptr_meta.get(&base_ptr),
+                    Some(PtrKind::LayoutPtr { layout_idx, is_mut: true }) if *layout_idx == l_idx
+                );
+                let access = if same_ptr {
+                    format!("{p}->{path}")
+                } else {
+                    let cty = &self.parent.layout_c_names[l_idx];
+                    format!("(({cty}* BAM_RESTRICT){p})->{path}")
+                };
+                let _ = writeln!(s, "    if ({p} != NULL) {{ {access} = {v}; }}");
+                return;
+            }
+            if !self.parent.is_aggregate_mir_ty(&vty)
+                && let Some((l_idx, _, path, fty, fsz)) =
+                    self.resolve_member_with_ty(lk, field, offset_bytes, None)
+            {
+                let same_ptr = matches!(
+                    self.ptr_meta.get(&base_ptr),
+                    Some(PtrKind::LayoutPtr { layout_idx, is_mut: true }) if *layout_idx == l_idx
+                );
+                let access = if same_ptr {
+                    format!("{p}->{path}")
+                } else {
+                    let cty = &self.parent.layout_c_names[l_idx];
+                    format!("(({cty}* BAM_RESTRICT){p})->{path}")
+                };
+                if self.is_c_scalar_field(&fty, fsz) {
+                    if matches!(fty, Ty::Bool) {
+                        let _ = writeln!(
+                            s,
+                            "    if ({p} != NULL) {{ {access} = ({v}) ? BAM_TRUE : BAM_FALSE; }}"
+                        );
+                    } else {
+                        let fcty = self.c_field_scalar_ty(&fty, fsz);
+                        let _ = writeln!(s, "    if ({p} != NULL) {{ {access} = ({fcty})({v}); }}");
+                    }
+                    return;
+                }
+                let _ = writeln!(
+                    s,
+                    "    if ({p} != NULL) {{ memcpy(&({access}), &{v}, sizeof({access}) < sizeof({v}) ? sizeof({access}) : sizeof({v})); }}"
+                );
+                return;
+            }
         }
         let _ = writeln!(
             s,
@@ -5727,6 +6186,81 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             let _ = writeln!(s, "        free(sp_allocs[{i}u]);");
         }
         let _ = writeln!(s, "    }}");
+    }
+
+    fn emit_spawn_batch_begin(
+        &self,
+        dst: Option<LocalId>,
+        count: LocalId,
+        components: &[String],
+        s: &mut String,
+    ) {
+        let Some(d) = dst else {
+            return;
+        };
+        let de = self.local_expr(d);
+        let cnt = self.local_expr(count);
+        let comp_count = components.len();
+        let _ = writeln!(s, "    {{");
+        let _ = writeln!(
+            s,
+            "        StrataSpawnBatch* sb = strata_spawn_batch_alloc_header((uint32_t)({cnt}), {comp_count}u);"
+        );
+        for (i, cname) in components.iter().enumerate() {
+            let c_idx = self.parent.find_comp_idx(cname).unwrap_or(0);
+            let sz = self.parent.components.get(c_idx).map_or(0, |c| c.size);
+            let _ = writeln!(
+                s,
+                "        strata_spawn_batch_init_col(sb, {i}u, state->components[{c_idx}u], {sz}u);"
+            );
+        }
+        let _ = writeln!(s, "        {de} = (uint64_t)(uintptr_t)sb;");
+        let _ = writeln!(s, "    }}");
+    }
+
+    fn emit_spawn_batch_push(
+        &self,
+        batch: LocalId,
+        index: LocalId,
+        components: &[(String, LocalId)],
+        s: &mut String,
+    ) {
+        let be = self.local_expr(batch);
+        let ie = self.local_expr(index);
+        let _ = writeln!(s, "    {{");
+        let _ = writeln!(
+            s,
+            "        StrataSpawnBatch* sb = (StrataSpawnBatch*)(uintptr_t)({be});"
+        );
+        let _ = writeln!(s, "        uint32_t row_i = (uint32_t)({ie});");
+        let _ = writeln!(s, "        (void)row_i;");
+        for (i, (cname, lid)) in components.iter().enumerate() {
+            let c_idx = self.parent.find_comp_idx(cname).unwrap_or(0);
+            let sz = self.parent.components.get(c_idx).map_or(0, |c| c.size);
+            if sz > 0 {
+                let is_ptr = self.is_ptr_local(*lid);
+                let le = self.local_expr(*lid);
+                let src_p = if is_ptr {
+                    format!("(const void*){le}")
+                } else {
+                    format!("(const void*)&{le}")
+                };
+                let _ = writeln!(
+                    s,
+                    "        strata_spawn_batch_push(sb, state->components[{c_idx}u], {i}u, row_i, {src_p}, {sz}u);"
+                );
+            }
+        }
+        let _ = writeln!(s, "    }}");
+    }
+
+    fn emit_spawn_batch_commit(&self, batch: LocalId, s: &mut String) {
+        self.ensure_cmds_snippet(s);
+        let be = self.local_expr(batch);
+        let _ = writeln!(
+            s,
+            "    strata_spawn_batch_commit((StrataSpawnBatch*)(uintptr_t)({be}), state->api, cmds_cache);"
+        );
     }
 
     fn emit_cmd_despawn_all(&self, filter: &str, s: &mut String) {
@@ -5989,8 +6523,15 @@ fn collect_inst_components(inst: &Inst, out: &mut BTreeSet<String>) {
         Inst::CmdInsert { component, .. } | Inst::CmdRemove { component, .. } => {
             out.insert(component.clone());
         }
-        Inst::CmdSpawn { components, .. } | Inst::CmdSpawnBatch { components, .. } => {
+        Inst::CmdSpawn { components, .. }
+        | Inst::CmdSpawnBatch { components, .. }
+        | Inst::SpawnBatchPush { components, .. } => {
             for (c, _) in components {
+                out.insert(c.clone());
+            }
+        }
+        Inst::SpawnBatchBegin { components, .. } => {
+            for c in components {
                 out.insert(c.clone());
             }
         }
@@ -6014,6 +6555,23 @@ fn collect_inst_components(inst: &Inst, out: &mut BTreeSet<String>) {
             out.insert(stream.clone());
         }
         _ => {}
+    }
+}
+
+fn mir_const_is_all_zero(v: &MirConstVal) -> bool {
+    match v {
+        MirConstVal::Unit => true,
+        MirConstVal::Bool(b) => !*b,
+        MirConstVal::Int(n) => *n == 0,
+        MirConstVal::Float(f) => *f == 0.0 && f.is_sign_positive(),
+        MirConstVal::Vec2(arr) => arr.iter().all(|f| *f == 0.0 && f.is_sign_positive()),
+        MirConstVal::Vec3(arr) => arr.iter().all(|f| *f == 0.0 && f.is_sign_positive()),
+        MirConstVal::Vec4(arr) => arr.iter().all(|f| *f == 0.0 && f.is_sign_positive()),
+        MirConstVal::Array(elems) => elems.iter().all(mir_const_is_all_zero),
+        MirConstVal::Struct { fields, .. } => {
+            fields.iter().all(|(_, fv)| mir_const_is_all_zero(fv))
+        }
+        MirConstVal::String(_) => false,
     }
 }
 
@@ -6332,5 +6890,102 @@ schedule Update { heal }
             "migration fixture must emit migrate_component_column wiring"
         );
         verify_strict_c99_syntax(&artifact, "migration_fixture");
+    }
+
+    #[test]
+    fn indexed_spawn_batch_require_deps_and_bare_schedule_names_compile_c99() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("cookbooks");
+
+        // 1. 01_rain_swarm: indexed spawn_batch + @require(Pos3D, Vel3D)
+        let rain_src = std::fs::read_to_string(root.join("01_rain_swarm.strata")).unwrap();
+        let rain_mir = compile_strata_to_mir("01_rain_swarm.strata", &rain_src);
+        let rain_art = emit(&rain_mir).expect("emit 01_rain_swarm");
+        let rain_c = &rain_art
+            .files
+            .iter()
+            .find(|f| f.path.ends_with(".c"))
+            .unwrap()
+            .content;
+        assert!(rain_c.contains("strata_spawn_batch_alloc_header"));
+        assert!(rain_c.contains("strata_spawn_batch_push"));
+        assert!(rain_c.contains("strata_spawn_batch_commit"));
+        assert!(rain_c.contains("cdesc.required_components = reqs_"));
+        assert!(rain_c.contains("cdesc.required_component_count = 2u;"));
+        verify_strict_c99_syntax(&rain_art, "01_rain_swarm_indexed_require");
+
+        // 2. 03_metroidvania_core: bare set/system/observer names + required_init_descs for Facing
+        let mv_src = std::fs::read_to_string(root.join("03_metroidvania_core.strata")).unwrap();
+        let mv_mir = compile_strata_to_mir("03_metroidvania_core.strata", &mv_src);
+        let mv_art = emit(&mv_mir).expect("emit 03_metroidvania_core");
+        let mv_c = &mv_art
+            .files
+            .iter()
+            .find(|f| f.path.ends_with(".c"))
+            .unwrap()
+            .content;
+        assert!(mv_c.contains("set_desc.name = \"MetroidvaniaFrame\";"));
+        assert!(mv_c.contains("set_desc.name = \"InputAndTasks\";"));
+        assert!(mv_c.contains("set_desc.name = \"RoomStreaming\";"));
+        assert!(mv_c.contains("sdesc.name = \"sample_platformer_inputs\";"));
+        assert!(mv_c.contains("sdesc.name = \"strata_timer_tick\";"));
+        assert!(mv_c.contains("odesc.name = \"on_slash_active\";"));
+        assert!(
+            !mv_c.contains("set_desc.name = \"genres::metroidvania::"),
+            "schedule set names must be bare without module::prefix"
+        );
+        assert!(
+            !mv_c.contains("sdesc.name = \"genres::metroidvania::"),
+            "system names must be bare without module::prefix"
+        );
+        assert!(
+            !mv_c.contains("\"genres::metroidvania::strata_timer_tick\""),
+            "after targets must be bare without module::prefix"
+        );
+        assert!(mv_c.contains("BAM_REQUIRED_FLAG_CUSTOM_BYTES"));
+        assert!(mv_c.contains("cdesc.required_init_descs = req_inits_"));
+        assert!(
+            mv_c.contains("->air_dashes_left = (uint8_t)("),
+            "sub-word u8 FieldStore must narrow via struct field assignment"
+        );
+        verify_strict_c99_syntax(&mv_art, "03_metroidvania_core_bare_names");
+
+        // 3. Reverse-order @require (dependent declared before dependency)
+        let rev_src = r#"
+module demo::rev_req @version(1.0.0);
+
+component Dependent @require(DepWithDefault) { val: f32 = 2.0 }
+component DepWithDefault { speed: f32 = 42.0 }
+
+sys seed() {
+    spawn_batch(4) |i| {
+        { Dependent { val: (i as f32) } }
+    };
+}
+
+schedule Startup { seed }
+"#;
+        let rev_mir = compile_strata_to_mir("rev_req.strata", rev_src);
+        let rev_art = emit(&rev_mir).expect("emit rev_req");
+        let rev_c = &rev_art
+            .files
+            .iter()
+            .find(|f| f.path.ends_with(".c"))
+            .unwrap()
+            .content;
+        let dep_pos = rev_c
+            .find("Component [1]: demo::rev_req::DepWithDefault")
+            .expect("DepWithDefault registration");
+        let main_pos = rev_c
+            .find("Component [0]: demo::rev_req::Dependent")
+            .expect("Dependent registration");
+        assert!(
+            dep_pos < main_pos,
+            "dependency must register before dependent in bamabi_init"
+        );
+        verify_strict_c99_syntax(&rev_art, "rev_req");
     }
 }

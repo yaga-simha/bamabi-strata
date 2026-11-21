@@ -246,8 +246,14 @@ impl<'a> NativeCtx<'a> {
                 for st in &bb.stmts {
                     match &st.inst {
                         Inst::CmdSpawn { components, .. }
-                        | Inst::CmdSpawnBatch { components, .. } => {
+                        | Inst::CmdSpawnBatch { components, .. }
+                        | Inst::SpawnBatchPush { components, .. } => {
                             for (cname, _) in components {
+                                candidate_names.insert(cname.clone());
+                            }
+                        }
+                        Inst::SpawnBatchBegin { components, .. } => {
+                            for cname in components {
                                 candidate_names.insert(cname.clone());
                             }
                         }
@@ -2242,6 +2248,22 @@ fn terminator_succs(term: &Terminator) -> Vec<BlockId> {
     }
 }
 
+#[derive(Clone)]
+struct SpawnBatchCompSlot {
+    struct_name: String,
+    is_zst: bool,
+}
+
+#[derive(Clone)]
+struct SpawnBatchPlan {
+    id: usize,
+    dst_local: LocalId,
+    slots: Vec<SpawnBatchCompSlot>,
+    bundle_ty: String,
+    var_name: String,
+    only_chunk_loop: Option<usize>,
+}
+
 struct FnAnalysis {
     val_tys: Vec<ValTy>,
     slot_tys: HashMap<LocalId, ValTy>,
@@ -2259,6 +2281,8 @@ struct FnAnalysis {
     has_checkpoint: bool,
     sp_lim_clamp: HashMap<LocalId, LocalId>, // sp_lim ConstInt(64) -> query_iter LocalId
     csr_pos_captures: HashMap<(usize, usize), String>, // (bb_idx, stmt_idx) -> index_name
+    spawn_batches: Vec<SpawnBatchPlan>,
+    batch_sources: HashMap<LocalId, BTreeSet<usize>>,
 }
 
 fn analyze_function(
@@ -2274,6 +2298,9 @@ fn analyze_function(
         .collect();
     let mut slot_tys: HashMap<LocalId, ValTy> = HashMap::new();
     let mut ptr_targets: HashMap<LocalId, PtrTarget> = HashMap::new();
+    let reachable_blocks = compute_reachable_blocks(func);
+    let mut spawn_batches: Vec<SpawnBatchPlan> = Vec::new();
+    let mut batch_sources: HashMap<LocalId, BTreeSet<usize>> = HashMap::new();
 
     // Pre-populate resources, params, streams, commands.
     let mut res_map: BTreeMap<String, (String, bool, String)> = BTreeMap::new();
@@ -2405,12 +2432,43 @@ fn analyze_function(
                 }
                 Inst::CmdSpawn { .. }
                 | Inst::CmdSpawnBatch { .. }
+                | Inst::SpawnBatchCommit { .. }
                 | Inst::CmdDespawn { .. }
                 | Inst::CmdDespawnAll { .. }
                 | Inst::CmdInsert { .. }
                 | Inst::CmdRemove { .. }
                 | Inst::CmdTrigger { .. } => {
                     needs_commands = true;
+                }
+                Inst::SpawnBatchBegin { components, .. } => {
+                    if reachable_blocks.contains(&bb.id)
+                        && let Some(d) = st.dst
+                    {
+                        let mut slots: Vec<SpawnBatchCompSlot> = Vec::new();
+                        for cname in components {
+                            if let Some(sname) = ctx.resolve_ecs_struct_name(cname)
+                                && !slots.iter().any(|s| s.struct_name == sname)
+                            {
+                                slots.push(SpawnBatchCompSlot {
+                                    struct_name: sname,
+                                    is_zst: ctx.is_zst_component(cname),
+                                });
+                            }
+                        }
+                        let ty_parts: Vec<String> =
+                            slots.iter().map(|s| s.struct_name.clone()).collect();
+                        let bundle_ty = format_bundle_tuple(&ty_parts);
+                        let id = spawn_batches.len();
+                        spawn_batches.push(SpawnBatchPlan {
+                            id,
+                            dst_local: d,
+                            slots,
+                            bundle_ty,
+                            var_name: format!("__batch_buf_{id}"),
+                            only_chunk_loop: None,
+                        });
+                        batch_sources.entry(d).or_default().insert(id);
+                    }
                 }
                 Inst::CmdCheckpoint => {
                     has_checkpoint = true;
@@ -2465,6 +2523,9 @@ fn analyze_function(
                             if let Some(pt) = ptr_targets.get(val).cloned() {
                                 ptr_targets.insert(d, pt);
                             }
+                            if let Some(srcs) = batch_sources.get(val).cloned() {
+                                batch_sources.entry(d).or_default().extend(srcs);
+                            }
                         }
                     }
                     Inst::VecInsert { vec, .. } => {
@@ -2473,6 +2534,9 @@ fn analyze_function(
                         }
                     }
                     Inst::SlotStore { slot, val } => {
+                        if let Some(srcs) = batch_sources.get(val).cloned() {
+                            batch_sources.entry(*slot).or_default().extend(srcs);
+                        }
                         let vt = &val_tys[val.0 as usize];
                         let is_rich = matches!(
                             vt,
@@ -2500,12 +2564,16 @@ fn analyze_function(
                         }
                     }
                     Inst::SlotLoad { slot } => {
-                        if let Some(d) = st.dst
-                            && let Some(st_ty) = slot_tys.get(slot)
-                            && *st_ty != ValTy::Unit
-                            && *st_ty != ValTy::PtrMarker
-                        {
-                            val_tys[d.0 as usize] = st_ty.clone();
+                        if let Some(d) = st.dst {
+                            if let Some(srcs) = batch_sources.get(slot).cloned() {
+                                batch_sources.entry(d).or_default().extend(srcs);
+                            }
+                            if let Some(st_ty) = slot_tys.get(slot)
+                                && *st_ty != ValTy::Unit
+                                && *st_ty != ValTy::PtrMarker
+                            {
+                                val_tys[d.0 as usize] = st_ty.clone();
+                            }
                         }
                     }
                     Inst::IterEntities { query_idx } => {
@@ -2776,6 +2844,44 @@ fn analyze_function(
         }
     }
 
+    let mut block_to_loop: HashMap<BlockId, usize> = HashMap::new();
+    for (li, cl) in chunk_loops.iter().enumerate() {
+        for &bid in &cl.loop_blocks {
+            block_to_loop.insert(bid, li);
+        }
+    }
+    for bp in &mut spawn_batches {
+        let mut seen_outside = false;
+        let mut loops_used: HashSet<usize> = HashSet::new();
+        for bb in &func.blocks {
+            if !reachable_blocks.contains(&bb.id) {
+                continue;
+            }
+            let loop_opt = block_to_loop.get(&bb.id).copied();
+            for st in &bb.stmts {
+                let touches_batch = match &st.inst {
+                    Inst::SpawnBatchBegin { .. } => st.dst == Some(bp.dst_local),
+                    Inst::SpawnBatchPush { batch, .. } | Inst::SpawnBatchCommit { batch } => {
+                        batch_sources
+                            .get(batch)
+                            .is_some_and(|srcs| srcs.contains(&bp.id))
+                    }
+                    _ => false,
+                };
+                if touches_batch {
+                    if let Some(li) = loop_opt {
+                        loops_used.insert(li);
+                    } else {
+                        seen_outside = true;
+                    }
+                }
+            }
+        }
+        if !seen_outside && loops_used.len() == 1 {
+            bp.only_chunk_loop = loops_used.into_iter().next();
+        }
+    }
+
     let needs_par_commands = needs_commands && has_par_loop;
     FnAnalysis {
         val_tys,
@@ -2794,6 +2900,8 @@ fn analyze_function(
         has_checkpoint,
         sp_lim_clamp,
         csr_pos_captures,
+        spawn_batches,
+        batch_sources,
     }
 }
 
@@ -3104,6 +3212,17 @@ fn emit_single_function(
                 )
                 .ok();
             }
+        }
+    }
+
+    for bp in &analysis.spawn_batches {
+        if bp.only_chunk_loop.is_none() {
+            writeln!(
+                out,
+                "    let mut {}: Vec<{}> = Vec::new();",
+                bp.var_name, bp.bundle_ty
+            )
+            .ok();
         }
     }
 
@@ -3536,6 +3655,17 @@ fn emit_chunk_loop(
                 )
                 .ok();
             }
+        }
+    }
+
+    for bp in &analysis.spawn_batches {
+        if bp.only_chunk_loop == Some(cl_idx) {
+            writeln!(
+                out,
+                "{indent}let mut {}: Vec<{}> = Vec::new();",
+                bp.var_name, bp.bundle_ty
+            )
+            .ok();
         }
     }
 
@@ -4743,11 +4873,7 @@ fn emit_stmt(
                     }
                 })
                 .collect();
-            let bundle_expr = if bundle_parts.is_empty() {
-                "()".to_owned()
-            } else {
-                format!("({},)", bundle_parts.join(", "))
-            };
+            let bundle_expr = format_bundle_tuple(&bundle_parts);
             emit_cmd_block(out, analysis, indent, |cmds| {
                 if let Some(d) = st.dst
                     && analysis.val_tys[d.0 as usize] == ValTy::Entity
@@ -4762,22 +4888,6 @@ fn emit_stmt(
             });
         }
         Inst::CmdSpawnBatch { count, components } => {
-            // Check if there is a batch index local in the current block before this statement.
-            let cur_bb = &func.blocks[bb_idx];
-            let batch_idx_local = cur_bb.stmts[..stmt_idx].iter().find_map(|s| {
-                if let Inst::ConstInt { value: 0 } = s.inst
-                    && let Some(dl) = s.dst
-                    && let Some(loc) = func.locals.get(dl.0 as usize)
-                    && loc.name != "r0"
-                    && loc.name != "z"
-                    && loc.name != "cnt"
-                {
-                    Some(dl)
-                } else {
-                    None
-                }
-            });
-
             let bundle_parts: Vec<String> = components
                 .iter()
                 .filter_map(|(cname, l)| {
@@ -4788,103 +4898,123 @@ fn emit_stmt(
                     }
                 })
                 .collect();
-            let bundle_expr = if bundle_parts.is_empty() {
-                "()".to_owned()
-            } else {
-                format!("({},)", bundle_parts.join(", "))
-            };
-
-            if let Some(idx_l) = batch_idx_local {
-                let idx_pos = cur_bb.stmts[..stmt_idx]
-                    .iter()
-                    .position(|s| s.dst == Some(idx_l))
-                    .unwrap_or(0);
-                // Re-evaluate pure statements between idx_l and CmdSpawnBatch inside the batch iterator.
-                let slice_stmts = &cur_bb.stmts[idx_pos + 1..stmt_idx];
-                let can_replay = slice_stmts.iter().all(|s| {
-                    matches!(
-                        s.inst,
-                        Inst::ConstInt { .. }
-                            | Inst::ConstFloat { .. }
-                            | Inst::ConstBool { .. }
-                            | Inst::ConstVec { .. }
-                            | Inst::Copy { .. }
-                            | Inst::SlotAlloc { .. }
-                            | Inst::SlotLoad { .. }
-                            | Inst::SlotStore { .. }
-                            | Inst::BinOp { .. }
-                            | Inst::UnOp { .. }
-                            | Inst::Cast { .. }
-                            | Inst::VecExtract { .. }
-                            | Inst::VecInsert { .. }
-                            | Inst::VecSwizzle { .. }
-                            | Inst::IntrinsicMath { .. }
-                            | Inst::StructInit { .. }
-                    )
-                });
-                if can_replay && !slice_stmts.is_empty() {
-                    let mut inner = String::new();
-                    let idx_ty = analysis.val_tys[idx_l.0 as usize].rust_type();
-                    writeln!(inner, "let mut __loc_{} = __batch_i as {idx_ty};", idx_l.0).ok();
-                    // Declare local temporaries inside closure for statements in slice_stmts
-                    let mut declared = HashSet::new();
-                    declared.insert(idx_l);
-                    for rs in slice_stmts {
-                        if let Some(d) = rs.dst
-                            && declared.insert(d)
-                        {
-                            if let Some(svt) = analysis.slot_tys.get(&d) {
-                                writeln!(
-                                    inner,
-                                    "let mut __slot_{}: {} = {};",
-                                    d.0,
-                                    svt.rust_type(),
-                                    svt.default_expr()
-                                )
-                                .ok();
-                            } else {
-                                let vt = &analysis.val_tys[d.0 as usize];
-                                if *vt != ValTy::Unit && *vt != ValTy::PtrMarker {
-                                    writeln!(
-                                        inner,
-                                        "let mut __loc_{}: {} = {};",
-                                        d.0,
-                                        vt.rust_type(),
-                                        vt.default_expr()
-                                    )
-                                    .ok();
-                                }
-                            }
-                        }
-                    }
-                    for (ri, rs) in slice_stmts.iter().enumerate() {
-                        emit_stmt(
-                            &mut inner,
-                            func,
-                            ctx,
-                            query_plans,
-                            analysis,
-                            bb_idx,
-                            idx_pos + 1 + ri,
-                            rs,
-                            "",
-                            in_chunk,
-                            slot_remap,
-                        )?;
-                    }
-                    let cnt_e = format!("(__loc_{} as usize)", count.0);
-                    emit_cmd_block(out, analysis, indent, |cmds| {
-                        format!(
-                            "{cmds}.spawn_batch((0..{cnt_e}).map(move |__batch_i| {{\n{inner}{bundle_expr}\n}}));"
-                        )
-                    });
-                    return Ok(());
-                }
-            }
+            let bundle_expr = format_bundle_tuple(&bundle_parts);
             let cnt_e = format!("(__loc_{} as usize)", count.0);
             emit_cmd_block(out, analysis, indent, |cmds| {
                 format!("{cmds}.spawn_batch((0..{cnt_e}).map(move |_| {bundle_expr}));")
             });
+        }
+        Inst::SpawnBatchBegin { count, .. } => {
+            if let Some(d) = st.dst
+                && let Some(bp) = analysis.spawn_batches.iter().find(|b| b.dst_local == d)
+            {
+                writeln!(
+                    out,
+                    "{indent}{} = Vec::with_capacity(__loc_{} as usize);\n\
+                     {indent}__loc_{} = {}u64;",
+                    bp.var_name, count.0, d.0, bp.id
+                )
+                .ok();
+            }
+        }
+        Inst::SpawnBatchPush {
+            batch,
+            index,
+            components,
+        } => {
+            if let Some(srcs) = analysis.batch_sources.get(batch) {
+                let emit_push_for = |out: &mut String, bp: &SpawnBatchPlan, arm_indent: &str| {
+                    let row_parts: Vec<String> = bp
+                        .slots
+                        .iter()
+                        .map(|slot| {
+                            if slot.is_zst {
+                                slot.struct_name.clone()
+                            } else if let Some((_, val_l)) = components.iter().rfind(|(cn, _)| {
+                                ctx.resolve_ecs_struct_name(cn).as_deref()
+                                    == Some(slot.struct_name.as_str())
+                            }) {
+                                format!("__loc_{}", val_l.0)
+                            } else {
+                                format!("{}::default()", slot.struct_name)
+                            }
+                        })
+                        .collect();
+                    let row_expr = format_bundle_tuple(&row_parts);
+                    let var = &bp.var_name;
+                    writeln!(
+                        out,
+                        "{arm_indent}{{\n\
+                         {arm_indent}    let __batch_row = {row_expr};\n\
+                         {arm_indent}    let __batch_idx = __loc_{} as usize;\n\
+                         {arm_indent}    if __batch_idx == {var}.len() {{\n\
+                         {arm_indent}        {var}.push(__batch_row);\n\
+                         {arm_indent}    }} else if __batch_idx < {var}.len() {{\n\
+                         {arm_indent}        {var}[__batch_idx] = __batch_row;\n\
+                         {arm_indent}    }} else {{\n\
+                         {arm_indent}        {var}.resize_with(__batch_idx + 1, Default::default);\n\
+                         {arm_indent}        {var}[__batch_idx] = __batch_row;\n\
+                         {arm_indent}    }}\n\
+                         {arm_indent}}}",
+                        index.0
+                    )
+                    .ok();
+                };
+                if srcs.len() == 1 {
+                    if let Some(&id) = srcs.iter().next()
+                        && let Some(bp) = analysis.spawn_batches.get(id)
+                    {
+                        emit_push_for(out, bp, indent);
+                    }
+                } else if !srcs.is_empty() {
+                    writeln!(out, "{indent}match __loc_{} {{", batch.0).ok();
+                    let arm_ind = format!("{indent}        ");
+                    for &id in srcs {
+                        if let Some(bp) = analysis.spawn_batches.get(id) {
+                            writeln!(out, "{indent}    {id}u64 => {{").ok();
+                            emit_push_for(out, bp, &arm_ind);
+                            writeln!(out, "{indent}    }}").ok();
+                        }
+                    }
+                    writeln!(out, "{indent}    _ => {{}}\n{indent}}}").ok();
+                }
+            }
+        }
+        Inst::SpawnBatchCommit { batch } => {
+            if let Some(srcs) = analysis.batch_sources.get(batch) {
+                let emit_commit_for = |out: &mut String, bp: &SpawnBatchPlan, arm_indent: &str| {
+                    writeln!(
+                        out,
+                        "{arm_indent}{{\n\
+                         {arm_indent}    let __batch_rows = core::mem::take(&mut {});",
+                        bp.var_name
+                    )
+                    .ok();
+                    let inner_ind = format!("{arm_indent}    ");
+                    emit_cmd_block(out, analysis, &inner_ind, |cmds| {
+                        format!("{cmds}.spawn_batch(__batch_rows);")
+                    });
+                    writeln!(out, "{arm_indent}}}").ok();
+                };
+                if srcs.len() == 1 {
+                    if let Some(&id) = srcs.iter().next()
+                        && let Some(bp) = analysis.spawn_batches.get(id)
+                    {
+                        emit_commit_for(out, bp, indent);
+                    }
+                } else if !srcs.is_empty() {
+                    writeln!(out, "{indent}match __loc_{} {{", batch.0).ok();
+                    let arm_ind = format!("{indent}        ");
+                    for &id in srcs {
+                        if let Some(bp) = analysis.spawn_batches.get(id) {
+                            writeln!(out, "{indent}    {id}u64 => {{").ok();
+                            emit_commit_for(out, bp, &arm_ind);
+                            writeln!(out, "{indent}    }}").ok();
+                        }
+                    }
+                    writeln!(out, "{indent}    _ => {{}}\n{indent}}}").ok();
+                }
+            }
         }
         Inst::CmdDespawn { entity } => {
             let ent = format!("__loc_{}", entity.0);
@@ -5100,6 +5230,17 @@ fn emit_stmt(
     }
     let _ = dst_s;
     Ok(())
+}
+
+fn format_bundle_tuple(parts: &[String]) -> String {
+    if parts.is_empty() {
+        return "()".to_owned();
+    }
+    if parts.len() <= 12 {
+        return format!("({},)", parts.join(", "));
+    }
+    let chunks: Vec<String> = parts.chunks(12).map(format_bundle_tuple).collect();
+    format_bundle_tuple(&chunks)
 }
 
 fn emit_cmd_block(
@@ -6359,7 +6500,9 @@ fn inst_used_locals(inst: &Inst) -> Vec<LocalId> {
             shadow_slot: val, ..
         }
         | Inst::RequireTrue { cond: val }
-        | Inst::ReduceInit { identity: val, .. } => vec![*val],
+        | Inst::ReduceInit { identity: val, .. }
+        | Inst::SpawnBatchBegin { count: val, .. }
+        | Inst::SpawnBatchCommit { batch: val } => vec![*val],
 
         Inst::SlotStore { slot, val }
         | Inst::VecInsert { vec: slot, val, .. }
@@ -6481,6 +6624,15 @@ fn inst_used_locals(inst: &Inst) -> Vec<LocalId> {
         Inst::CmdSpawn { components, .. } => components.iter().map(|(_, l)| *l).collect(),
         Inst::CmdSpawnBatch { count, components } => {
             let mut out = vec![*count];
+            out.extend(components.iter().map(|(_, l)| *l));
+            out
+        }
+        Inst::SpawnBatchPush {
+            batch,
+            index,
+            components,
+        } => {
+            let mut out = vec![*batch, *index];
             out.extend(components.iter().map(|(_, l)| *l));
             out
         }
@@ -7372,5 +7524,85 @@ task ProcessOrder(target: Ref<Actor>)
         assert!(code.contains(".get()"));
         assert!(code.contains("if __d > *"));
         assert!(code.contains("strata_input_buf_push"));
+    }
+
+    #[test]
+    fn bevy_native_emits_indexed_and_unindexed_spawn_batch_and_require() {
+        let src = r#"
+module bn::sb @version(1.0.0);
+
+resource Cfg { count: u32 = 8 }
+component Pos3D { xyz: vec3 = vec3::ZERO }
+component Vel3D { dxyz: vec3 = vec3::ZERO }
+component Raindrop @require(Pos3D, Vel3D) { elasticity: f32 = 0.65 }
+component Item { val: i32 = 0 }
+tag Fresh;
+
+sys spawn_indexed(cfg: &res Cfg) effects(spawns: [Raindrop, Pos3D]) {
+    let n = cfg.count;
+    spawn_batch(n) |i| {
+        let mut e = 0.60;
+        if i % 2 == 0 {
+            e = 0.75;
+        }
+        {
+            Raindrop { elasticity: e },
+            Pos3D { xyz: vec3((i as f32), 2.0, 0.0) },
+        }
+    };
+}
+
+sys spawn_unindexed() effects(spawns: [Item, Fresh]) {
+    spawn_batch(4) |_| {
+        let base = 0;
+        { Item { val: base + 7 }, Fresh }
+    };
+}
+"#;
+        let sema = analyze_source("sb.strata", src);
+        assert!(sema.ok(), "{:?}", sema.diagnostics);
+        let mir = lower_to_mir(&sema);
+        verify_mir(&mir).expect("MIR must verify");
+        let art = emit(&mir, &BevyNativeOptions::default()).expect("emit bevy native");
+        let code = &art.files[1].content;
+
+        assert!(code.contains("#[require("));
+        assert!(code.contains("Vec::with_capacity("));
+        assert!(code.contains(".push(__batch_row);"));
+        assert!(code.contains(".resize_with(__batch_idx + 1, Default::default);"));
+        assert!(code.contains("core::mem::take(&mut __batch_buf_0);"));
+        assert!(code.contains("commands.spawn_batch(__batch_rows);"));
+        assert!(code.contains("commands.spawn_batch((0..(__loc_"));
+        assert!(code.contains(".map(move |_| "));
+        assert!(!code.contains("move |__batch_i|"));
+    }
+
+    #[test]
+    fn bevy_native_emits_rain_swarm_and_metroidvania_cookbooks_cleanly() {
+        let rain_src = include_str!("../../../fixtures/cookbooks/01_rain_swarm.strata");
+        let rain_sema = analyze_source("01_rain_swarm.strata", rain_src);
+        assert!(rain_sema.ok(), "{:?}", rain_sema.diagnostics);
+        let rain_mir = lower_to_mir(&rain_sema);
+        verify_mir(&rain_mir).expect("01_rain_swarm MIR must verify");
+        let rain_art = emit(&rain_mir, &BevyNativeOptions::default()).expect("emit rain_swarm");
+        let rain_code = &rain_art.files[1].content;
+        assert!(rain_code.contains("#[require("));
+        assert!(rain_code.contains("Vec::with_capacity("));
+        assert!(rain_code.contains(".push(__batch_row);"));
+        assert!(rain_code.contains("commands.spawn_batch(__batch_rows);"));
+        assert!(rain_code.contains("strata_contiguous_par_iter_mut()"));
+
+        let mv_src = include_str!("../../../fixtures/cookbooks/03_metroidvania_core.strata");
+        let mv_sema = analyze_source("03_metroidvania_core.strata", mv_src);
+        assert!(mv_sema.ok(), "{:?}", mv_sema.diagnostics);
+        let mv_mir = lower_to_mir(&mv_sema);
+        verify_mir(&mv_mir).expect("03_metroidvania_core MIR must verify");
+        let mv_art = emit(&mv_mir, &BevyNativeOptions::default()).expect("emit metroidvania");
+        let mv_code = &mv_art.files[1].content;
+        assert!(mv_code.contains("#[require("));
+        assert!(mv_code.contains("strata_run_if_"));
+        assert!(mv_code.contains("StrataLeafSet_strata_timer_tick.before("));
+        assert!(mv_code.contains("StrataSet_InputAndTasks"));
+        assert!(mv_code.contains(".chain()"));
     }
 }

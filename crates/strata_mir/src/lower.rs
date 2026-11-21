@@ -13,9 +13,10 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use strata_sema::access::{QueryAccessDesc, QueryTerm, TermAccessMode};
 use strata_sema::hir::{
-    AnalyzedModule, HirAssignOp, HirBinOp, HirCall, HirCallable, HirCurve, HirExpr, HirFn, HirFor,
-    HirForIter, HirLValue, HirMatch, HirMigration, HirParam, HirParamKind, HirPattern, HirQuery,
-    HirReduceEntry, HirSchedule, HirScheduleGroup, HirStmt, HirTable, HirTimeline, HirUnOp,
+    AnalyzedModule, HirAssignOp, HirBinOp, HirCall, HirCallable, HirCompInit, HirCurve, HirExpr,
+    HirFn, HirFor, HirForIter, HirLValue, HirMatch, HirMigration, HirParam, HirParamKind,
+    HirPattern, HirQuery, HirReduceEntry, HirSchedule, HirScheduleGroup, HirSpawn, HirStmt,
+    HirTable, HirTimeline, HirUnOp,
 };
 use strata_sema::layout::{EnumDef, SchemaItemKind, SolvedLayout};
 use strata_sema::types::Ty;
@@ -1329,72 +1330,7 @@ impl<'a> CfgBuilder<'a> {
                 }
             }
             HirExpr::Query(hq) => self.lower_query_expr(hq),
-            HirExpr::Spawn(sp) => {
-                if sp.is_batch {
-                    let cnt_l = if let Some(ref cnt_expr) = sp.count {
-                        self.lower_expr(cnt_expr).0
-                    } else {
-                        self.alloc_and_emit("cnt", MirType::U32, Inst::ConstInt { value: 1 })
-                    };
-                    if let Some(ref bv) = sp.batch_var {
-                        let idx_l =
-                            self.alloc_and_emit(bv, MirType::U32, Inst::ConstInt { value: 0 });
-                        self.vars.insert(
-                            bv.clone(),
-                            VarSlot::Imm {
-                                local: idx_l,
-                                ty: MirType::U32,
-                            },
-                        );
-                    }
-                    self.lower_stmts(&sp.preamble);
-                    let mut comps = Vec::with_capacity(sp.components.len());
-                    for ci in &sp.components {
-                        let fl = self.build_comp_fields(&ci.component, &ci.fields);
-                        let sl = self.alloc_and_emit(
-                            &format!("comp_{}", ci.component),
-                            MirType::Named(ci.component.clone()),
-                            Inst::StructInit {
-                                type_name: ci.component.clone(),
-                                fields: fl,
-                            },
-                        );
-                        comps.push((ci.component.clone(), sl));
-                    }
-                    let id = self.alloc_and_emit(
-                        "batch_spawn",
-                        MirType::Unit,
-                        Inst::CmdSpawnBatch {
-                            count: cnt_l,
-                            components: comps,
-                        },
-                    );
-                    (id, MirType::Unit)
-                } else {
-                    let mut comps = Vec::with_capacity(sp.components.len());
-                    for ci in &sp.components {
-                        let fl = self.build_comp_fields(&ci.component, &ci.fields);
-                        let sl = self.alloc_and_emit(
-                            &format!("comp_{}", ci.component),
-                            MirType::Named(ci.component.clone()),
-                            Inst::StructInit {
-                                type_name: ci.component.clone(),
-                                fields: fl,
-                            },
-                        );
-                        comps.push((ci.component.clone(), sl));
-                    }
-                    let id = self.alloc_and_emit(
-                        "spawned",
-                        MirType::Entity,
-                        Inst::CmdSpawn {
-                            persistent: sp.is_persistent,
-                            components: comps,
-                        },
-                    );
-                    (id, MirType::Entity)
-                }
-            }
+            HirExpr::Spawn(sp) => self.lower_spawn(sp),
             HirExpr::DespawnAll { filters } => {
                 let id = self.alloc_and_emit(
                     "despawn_all",
@@ -1770,6 +1706,228 @@ impl<'a> CfgBuilder<'a> {
                 )
             }
         }
+    }
+
+    fn lower_spawn(&mut self, sp: &HirSpawn) -> (LocalId, MirType) {
+        if !sp.is_batch {
+            let comps = self.build_spawn_components(&sp.components);
+            let id = self.alloc_and_emit(
+                "spawned",
+                MirType::Entity,
+                Inst::CmdSpawn {
+                    persistent: sp.is_persistent,
+                    components: comps,
+                },
+            );
+            return (id, MirType::Entity);
+        }
+
+        let Some(ref bv) = sp.batch_var else {
+            let cnt_l = if let Some(ref cnt_expr) = sp.count {
+                self.lower_expr(cnt_expr).0
+            } else {
+                self.alloc_and_emit("cnt", MirType::U32, Inst::ConstInt { value: 1 })
+            };
+            let saved_vars = self.vars.clone();
+            self.lower_stmts(&sp.preamble);
+            let comps = self.build_spawn_components(&sp.components);
+            self.vars = saved_vars;
+            let id = self.alloc_and_emit(
+                "batch_spawn",
+                MirType::Unit,
+                Inst::CmdSpawnBatch {
+                    count: cnt_l,
+                    components: comps,
+                },
+            );
+            return (id, MirType::Unit);
+        };
+
+        let cnt_l = self.lower_spawn_batch_count(sp.count.as_deref());
+        let comp_names: Vec<String> = sp
+            .components
+            .iter()
+            .map(|ci| ci.component.clone())
+            .collect();
+        let batch_l = self.alloc_and_emit(
+            "spawn_batch",
+            MirType::U64,
+            Inst::SpawnBatchBegin {
+                count: cnt_l,
+                components: comp_names,
+            },
+        );
+        let idx_slot = self.alloc_and_emit(
+            "batch_idx_slot",
+            MirType::MutPtr,
+            Inst::SlotAlloc { ty: MirType::U32 },
+        );
+        let zero = self.alloc_and_emit("batch_zero", MirType::U32, Inst::ConstInt { value: 0 });
+        self.emit_void(Inst::SlotStore {
+            slot: idx_slot,
+            val: zero,
+        });
+
+        let hdr_bb = self.new_block("spawn_batch_hdr");
+        let body_bb = self.new_block("spawn_batch_body");
+        let exit_bb = self.new_block("spawn_batch_exit");
+        self.terminate(Terminator::Goto(hdr_bb));
+
+        self.switch_to(hdr_bb);
+        let i_val = self.alloc_and_emit("batch_i", MirType::U32, Inst::SlotLoad { slot: idx_slot });
+        let cond = self.alloc_and_emit(
+            "batch_cond",
+            MirType::Bool,
+            Inst::BinOp {
+                op: "<".to_owned(),
+                lhs: i_val,
+                rhs: cnt_l,
+                allow_fma: false,
+            },
+        );
+        self.terminate(Terminator::Branch {
+            cond,
+            then_bb: body_bb,
+            else_bb: exit_bb,
+        });
+
+        self.switch_to(body_bb);
+        let saved_vars = self.vars.clone();
+        self.vars.insert(
+            bv.clone(),
+            VarSlot::Imm {
+                local: i_val,
+                ty: MirType::U32,
+            },
+        );
+        self.lower_stmts(&sp.preamble);
+        if !self.cur_terminated {
+            let comps = self.build_spawn_components(&sp.components);
+            self.emit_void(Inst::SpawnBatchPush {
+                batch: batch_l,
+                index: i_val,
+                components: comps,
+            });
+            let one = self.alloc_and_emit("batch_one", MirType::U32, Inst::ConstInt { value: 1 });
+            let next_i = self.alloc_and_emit(
+                "batch_next_i",
+                MirType::U32,
+                Inst::BinOp {
+                    op: "+".to_owned(),
+                    lhs: i_val,
+                    rhs: one,
+                    allow_fma: false,
+                },
+            );
+            self.emit_void(Inst::SlotStore {
+                slot: idx_slot,
+                val: next_i,
+            });
+            self.terminate(Terminator::Goto(hdr_bb));
+        }
+        self.vars = saved_vars;
+
+        self.switch_to(exit_bb);
+        self.emit_void(Inst::SpawnBatchCommit { batch: batch_l });
+        let u = self.alloc_and_emit("unit", MirType::Unit, Inst::ConstBool { value: false });
+        (u, MirType::Unit)
+    }
+
+    fn lower_spawn_batch_count(&mut self, count: Option<&HirExpr>) -> LocalId {
+        let Some(cnt_expr) = count else {
+            return self.alloc_and_emit("batch_cnt", MirType::U32, Inst::ConstInt { value: 1 });
+        };
+        if let HirExpr::IntLit { value, .. } = cnt_expr {
+            let clamped = (*value).clamp(0, i64::from(u32::MAX));
+            return self.alloc_and_emit(
+                "batch_cnt",
+                MirType::U32,
+                Inst::ConstInt { value: clamped },
+            );
+        }
+        let (raw_cnt, raw_ty) = self.lower_expr(cnt_expr);
+        if raw_ty == MirType::U32 {
+            return raw_cnt;
+        }
+        if matches!(
+            raw_ty,
+            MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64
+        ) {
+            let cnt_slot = self.alloc_and_emit(
+                "batch_cnt_slot",
+                MirType::MutPtr,
+                Inst::SlotAlloc { ty: MirType::U32 },
+            );
+            let z_cnt =
+                self.alloc_and_emit("batch_cnt_z", MirType::U32, Inst::ConstInt { value: 0 });
+            self.emit_void(Inst::SlotStore {
+                slot: cnt_slot,
+                val: z_cnt,
+            });
+            let z_raw = self.alloc_and_emit("raw_zero", raw_ty, Inst::ConstInt { value: 0 });
+            let pos = self.alloc_and_emit(
+                "batch_cnt_pos",
+                MirType::Bool,
+                Inst::BinOp {
+                    op: ">".to_owned(),
+                    lhs: raw_cnt,
+                    rhs: z_raw,
+                    allow_fma: false,
+                },
+            );
+            let pos_bb = self.new_block("batch_cnt_pos");
+            let cont_bb = self.new_block("batch_cnt_cont");
+            self.terminate(Terminator::Branch {
+                cond: pos,
+                then_bb: pos_bb,
+                else_bb: cont_bb,
+            });
+            self.switch_to(pos_bb);
+            let cast_cnt = self.alloc_and_emit(
+                "batch_cnt_cast",
+                MirType::U32,
+                Inst::Cast {
+                    val: raw_cnt,
+                    target_ty: MirType::U32,
+                },
+            );
+            self.emit_void(Inst::SlotStore {
+                slot: cnt_slot,
+                val: cast_cnt,
+            });
+            self.terminate(Terminator::Goto(cont_bb));
+            self.switch_to(cont_bb);
+            return self.alloc_and_emit(
+                "batch_cnt",
+                MirType::U32,
+                Inst::SlotLoad { slot: cnt_slot },
+            );
+        }
+        self.alloc_and_emit(
+            "batch_cnt",
+            MirType::U32,
+            Inst::Cast {
+                val: raw_cnt,
+                target_ty: MirType::U32,
+            },
+        )
+    }
+
+    fn build_spawn_components(&mut self, components: &[HirCompInit]) -> Vec<(String, LocalId)> {
+        let mut comps = Vec::with_capacity(components.len());
+        for ci in components {
+            let fl = self.build_comp_fields(&ci.component, &ci.fields);
+            let sl = self.alloc_and_emit(
+                &format!("comp_{}", ci.component),
+                MirType::Named(ci.component.clone()),
+                Inst::StructInit {
+                    type_name: ci.component.clone(),
+                    fields: fl,
+                },
+            );
+            comps.push((ci.component.clone(), sl));
+        }
+        comps
     }
 
     fn build_comp_fields(

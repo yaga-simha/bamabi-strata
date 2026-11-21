@@ -514,3 +514,196 @@ sys heal() {
             .any(|e| matches!(e, MirVerifyError::InvalidLocalRef { local: 999, .. }))
     );
 }
+
+#[test]
+fn indexed_spawn_batch_lowers_to_multi_block_loop() {
+    use strata_mir::MirType;
+
+    let sema = analyze_source("01_rain_swarm.strata", COOKBOOKS[0].1);
+    assert!(sema.ok(), "{:?}", sema.diagnostics);
+    let mir = lower_to_mir(&sema);
+    verify_mir(&mir).expect("01_rain_swarm MIR must verify");
+
+    let seed = mir
+        .functions
+        .iter()
+        .find(|f| f.name == "seed_rainstorm")
+        .expect("seed_rainstorm");
+
+    assert!(
+        !seed
+            .blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .any(|s| matches!(s.inst, Inst::CmdSpawnBatch { .. })),
+        "indexed spawn_batch must NOT lower to single-shot CmdSpawnBatch"
+    );
+    assert!(
+        !seed.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+            matches!(s.inst, Inst::ConstInt { value: 0 })
+                && s.dst.is_some_and(|d| seed.locals[d.0 as usize].name == "i")
+        }),
+        "batch induction var `i` must NOT be bound once to ConstInt(0)"
+    );
+
+    let (begin_dst, begin_cnt, begin_comps) = seed.blocks[0]
+        .stmts
+        .iter()
+        .find_map(|s| match &s.inst {
+            Inst::SpawnBatchBegin { count, components } => Some((
+                s.dst.expect("SpawnBatchBegin dst"),
+                *count,
+                components.clone(),
+            )),
+            _ => None,
+        })
+        .expect("SpawnBatchBegin in entry block");
+    assert_eq!(seed.locals[begin_dst.0 as usize].ty, MirType::U64);
+    assert_eq!(seed.locals[begin_cnt.0 as usize].ty, MirType::U32);
+    assert_eq!(begin_comps, vec!["Raindrop".to_owned(), "Pos3D".to_owned()]);
+
+    let hdr_bb = seed
+        .blocks
+        .iter()
+        .find(|b| b.label == "spawn_batch_hdr")
+        .expect("spawn_batch_hdr block");
+    let body_bb = seed
+        .blocks
+        .iter()
+        .find(|b| b.label == "spawn_batch_body")
+        .expect("spawn_batch_body block");
+    let exit_bb = seed
+        .blocks
+        .iter()
+        .find(|b| b.label == "spawn_batch_exit")
+        .expect("spawn_batch_exit block");
+
+    assert_eq!(
+        hdr_bb.terminator,
+        Terminator::Branch {
+            cond: hdr_bb
+                .stmts
+                .last()
+                .and_then(|s| s.dst)
+                .expect("loop comparison cond"),
+            then_bb: body_bb.id,
+            else_bb: exit_bb.id,
+        }
+    );
+    let i_val = hdr_bb
+        .stmts
+        .iter()
+        .find_map(|s| {
+            if matches!(s.inst, Inst::SlotLoad { .. }) {
+                s.dst
+            } else {
+                None
+            }
+        })
+        .expect("SlotLoad for induction counter i");
+    assert_eq!(seed.locals[i_val.0 as usize].ty, MirType::U32);
+
+    let (push_batch, push_idx, push_comps) = body_bb
+        .stmts
+        .iter()
+        .find_map(|s| match &s.inst {
+            Inst::SpawnBatchPush {
+                batch,
+                index,
+                components,
+            } => Some((*batch, *index, components.clone())),
+            _ => None,
+        })
+        .expect("SpawnBatchPush in spawn_batch_body");
+    assert_eq!(push_batch, begin_dst);
+    assert_eq!(push_idx, i_val);
+    assert_eq!(push_comps.len(), 2);
+    assert_eq!(push_comps[0].0, "Raindrop");
+    assert_eq!(push_comps[1].0, "Pos3D");
+    assert_eq!(body_bb.terminator, Terminator::Goto(hdr_bb.id));
+
+    assert!(
+        exit_bb
+            .stmts
+            .iter()
+            .any(|s| { matches!(s.inst, Inst::SpawnBatchCommit { batch } if batch == begin_dst) }),
+        "expected SpawnBatchCommit in spawn_batch_exit"
+    );
+}
+
+#[test]
+fn spawn_batch_unindexed_wildcard_and_variable_scoping() {
+    let src = r#"
+module test::spawn_batch_cases @version(1.0.0);
+
+component Item { val: i32 = 0 }
+
+sys unindexed_batch() effects(spawns: [Item]) {
+    spawn_batch(16) |_| {
+        { Item { val: 7 } }
+    };
+}
+
+sys scoped_batch() effects(spawns: [Item]) {
+    let i = 42;
+    let n: i32 = 4;
+    spawn_batch(n) |i| {
+        let local_tmp = i + 1;
+        { Item { val: local_tmp } }
+    };
+    let after = i;
+    let _ = after;
+}
+"#;
+    let sema = analyze_source("spawn_batch_cases.strata", src);
+    assert!(sema.ok(), "{:?}", sema.diagnostics);
+    let mir = lower_to_mir(&sema);
+    verify_mir(&mir).expect("spawn_batch_cases MIR must verify");
+
+    let unindexed = mir
+        .functions
+        .iter()
+        .find(|f| f.name == "unindexed_batch")
+        .expect("unindexed_batch");
+    assert!(
+        unindexed
+            .blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .any(|s| matches!(s.inst, Inst::CmdSpawnBatch { .. })),
+        "wildcard `|_|` spawn_batch should keep CmdSpawnBatch"
+    );
+
+    let scoped = mir
+        .functions
+        .iter()
+        .find(|f| f.name == "scoped_batch")
+        .expect("scoped_batch");
+    let exit_bb = scoped
+        .blocks
+        .iter()
+        .find(|b| b.label == "spawn_batch_exit")
+        .expect("spawn_batch_exit");
+    // `let after = i;` after the loop must load from the outer `slot_i` (not `batch_i`)
+    let outer_i_slot = scoped.blocks[0]
+        .stmts
+        .iter()
+        .find_map(|s| {
+            if matches!(s.inst, Inst::SlotAlloc { .. })
+                && s.dst
+                    .is_some_and(|d| scoped.locals[d.0 as usize].name == "slot_i")
+            {
+                s.dst
+            } else {
+                None
+            }
+        })
+        .expect("outer slot_i");
+    assert!(
+        exit_bb
+            .stmts
+            .iter()
+            .any(|s| { matches!(s.inst, Inst::SlotLoad { slot } if slot == outer_i_slot) }),
+        "outer `i` binding must be restored after spawn_batch loop"
+    );
+}

@@ -508,10 +508,28 @@ pub enum Inst {
         persistent: bool,
         components: Vec<(String, LocalId)>,
     },
-    /// SoA bulk spawn (`BamHostApi::cmd_spawn_batch`, Slot 39).
+    /// SoA bulk spawn (`BamHostApi::cmd_spawn_batch`, Slot 39) for unindexed `spawn_batch(count) { ... }`.
     CmdSpawnBatch {
         count: LocalId,
         components: Vec<(String, LocalId)>,
+    },
+    /// Allocates an SoA batch spawn buffer of `count` (`MirType::U32`) entities for
+    /// `components` and produces an opaque batch handle of type `MirType::U64`.
+    SpawnBatchBegin {
+        count: LocalId,
+        components: Vec<String>,
+    },
+    /// Writes entity `index` (`MirType::U32`) initialized `components` (`(component_name, value_local)`)
+    /// into the batch buffer `batch` (`MirType::U64`), producing `MirType::Unit` (`dst: None`).
+    SpawnBatchPush {
+        batch: LocalId,
+        index: LocalId,
+        components: Vec<(String, LocalId)>,
+    },
+    /// Commits the accumulated batch `batch` (`MirType::U64`) via ABI Slot 39 (`cmd_spawn_batch`)
+    /// and frees any temporary buffers, producing `MirType::Unit` (`dst: None`).
+    SpawnBatchCommit {
+        batch: LocalId,
     },
     /// Deferred entity despawn (`BamHostApi::cmd_despawn`, Slot 23).
     CmdDespawn {

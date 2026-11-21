@@ -19,7 +19,10 @@ use crate::abi_offsets::{
     api_slots, structs,
 };
 use crate::{JitCompileOptions, JitError, JitOptLevel};
-use bamabi_sys::{AccessMode, ComponentUuid, ScheduleId, fnv1a_64_str};
+use bamabi_sys::{
+    AccessMode, BAM_REQUIRED_FLAG_CUSTOM_BYTES, BamRequiredComponent, ComponentDesc, ComponentUuid,
+    ScheduleId, fnv1a_64_str,
+};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Signature, StackSlot, StackSlotData,
@@ -47,6 +50,18 @@ use target_lexicon::Triple;
 const STORAGE_FLAG_RESOURCE: u32 = bamabi_sys::BAM_STORAGE_FLAG_RESOURCE;
 /// `BAM_STORAGE_FLAG_MESSAGE` bit matching `bamabi_sys::iter`.
 const STORAGE_FLAG_MESSAGE: u32 = bamabi_sys::BAM_STORAGE_FLAG_MESSAGE;
+
+/// Programmatic `ComponentDesc` / `BamRequiredComponent` field offsets from `bamabi_sys`.
+const COMP_REQUIRED_INIT_DESCS_OFF: usize =
+    core::mem::offset_of!(ComponentDesc, required_init_descs);
+const COMP_REQUIRED_INIT_DESC_COUNT_OFF: usize =
+    core::mem::offset_of!(ComponentDesc, required_init_desc_count);
+const REQ_COMP_DESC_SIZE: usize = core::mem::size_of::<BamRequiredComponent>();
+const REQ_COMP_STRUCT_SIZE_OFF: usize = core::mem::offset_of!(BamRequiredComponent, struct_size);
+const REQ_COMP_FLAGS_OFF: usize = core::mem::offset_of!(BamRequiredComponent, flags);
+const REQ_COMP_COMPONENT_OFF: usize = core::mem::offset_of!(BamRequiredComponent, component);
+const REQ_COMP_INIT_BYTES_OFF: usize = core::mem::offset_of!(BamRequiredComponent, init_bytes);
+const REQ_COMP_INIT_SIZE_OFF: usize = core::mem::offset_of!(BamRequiredComponent, init_size);
 
 /// Maximum spatial broadphase candidate entities returned on stack per query.
 const MAX_SPATIAL_CANDIDATES: usize = 64;
@@ -277,7 +292,9 @@ struct SystemRegistrationEntry {
     after_names: Vec<DataId>,
     after_weak_names: Vec<DataId>,
     before_names: Vec<DataId>,
+    in_set_names: Vec<DataId>,
     mount_set_indices: Vec<usize>,
+    sched_order: usize,
     run_if_guard: Option<(HirExpr, usize)>,
 }
 
@@ -496,20 +513,32 @@ fn merge_access_mode(a: TermAccessMode, b: TermAccessMode) -> TermAccessMode {
     }
 }
 
-fn lookup_name_in_map(map: &HashMap<String, usize>, key: &str) -> Option<usize> {
-    if let Some(&idx) = map.get(key) {
-        return Some(idx);
+fn bare_schedule_target(name: &str) -> &str {
+    if name.starts_with("host::") {
+        name
+    } else {
+        name.rsplit("::").next().unwrap_or(name)
+    }
+}
+
+fn lookup_name_ref<'a, T>(map: &'a HashMap<String, T>, key: &str) -> Option<&'a T> {
+    if let Some(val) = map.get(key) {
+        return Some(val);
     }
     let normalized = key.replace("::", "__");
-    if let Some(&idx) = map.get(&normalized) {
-        return Some(idx);
+    if let Some(val) = map.get(&normalized) {
+        return Some(val);
     }
     if let Some(short) = key.rsplit("::").next()
-        && let Some(&idx) = map.get(short)
+        && let Some(val) = map.get(short)
     {
-        return Some(idx);
+        return Some(val);
     }
     None
+}
+
+fn lookup_name_in_map(map: &HashMap<String, usize>, key: &str) -> Option<usize> {
+    lookup_name_ref(map, key).copied()
 }
 
 fn register_layout_aliases(map: &mut HashMap<String, usize>, canonical: &str, idx: usize) {
@@ -561,8 +590,15 @@ fn collect_inst_referenced_comps(inst: &Inst, out: &mut BTreeSet<String>) {
         Inst::CmdInsert { component, .. } | Inst::CmdRemove { component, .. } => {
             out.insert(component.clone());
         }
-        Inst::CmdSpawn { components, .. } | Inst::CmdSpawnBatch { components, .. } => {
+        Inst::CmdSpawn { components, .. }
+        | Inst::CmdSpawnBatch { components, .. }
+        | Inst::SpawnBatchPush { components, .. } => {
             for (c, _) in components {
+                out.insert(c.clone());
+            }
+        }
+        Inst::SpawnBatchBegin { components, .. } => {
+            for c in components {
                 out.insert(c.clone());
             }
         }
@@ -922,7 +958,7 @@ fn build_module_context<'a>(
                     .obj_mod
                     .declare_function(&sym, Linkage::Local, &sig)
                     .map_err(|e| JitError::Codegen(e.to_string()))?;
-                let name_data_id = ctx.intern_cstr(&f.name)?;
+                let name_data_id = ctx.intern_cstr(bare_schedule_target(&f.name))?;
                 let (event_kind, event_layout_idx) =
                     classify_observer_event(&ctx.layout_map, event);
                 let watched_layout_idx = target_comp
@@ -975,7 +1011,7 @@ fn classify_observer_event(
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct SysSchedTopology {
     schedule_id: u32,
     after: Vec<String>,
@@ -983,7 +1019,23 @@ struct SysSchedTopology {
     before: Vec<String>,
     in_sets: Vec<String>,
     mount_set_indices: Vec<usize>,
+    sched_order: usize,
     run_if_expr: Option<HirExpr>,
+}
+
+impl Default for SysSchedTopology {
+    fn default() -> Self {
+        Self {
+            schedule_id: 0,
+            after: Vec::new(),
+            after_weak: Vec::new(),
+            before: Vec::new(),
+            in_sets: Vec::new(),
+            mount_set_indices: Vec::new(),
+            sched_order: usize::MAX,
+            run_if_expr: None,
+        }
+    }
 }
 
 fn extract_schedule_topology(
@@ -991,42 +1043,44 @@ fn extract_schedule_topology(
     mir: &MirModule,
 ) -> Result<(Vec<ScheduleSetEntry>, HashMap<String, SysSchedTopology>), JitError> {
     let mut sets: Vec<ScheduleSetEntry> = Vec::new();
-    let mut set_index_map: HashMap<String, usize> = HashMap::new();
+    let mut set_index_map: HashMap<(u32, String), usize> = HashMap::new();
     let mut sys_map: HashMap<String, SysSchedTopology> = HashMap::new();
 
-    let mod_prefix = if mir.module_path.is_empty() {
-        "strata_mod".to_owned()
-    } else {
-        mir.module_path.clone()
-    };
-
+    #[allow(clippy::too_many_arguments)]
     fn walk_group(
         obj_mod: &mut ObjectModule,
-        mod_prefix: &str,
         sched_id: u32,
         run_if_expr: Option<&HirExpr>,
         group: &HirScheduleGroup,
         parent_sets: &[(usize, String)],
         sets: &mut Vec<ScheduleSetEntry>,
-        set_index_map: &mut HashMap<String, usize>,
+        set_index_map: &mut HashMap<(u32, String), usize>,
         sys_map: &mut HashMap<String, SysSchedTopology>,
         seq_counter: &mut usize,
-    ) -> Result<Vec<String>, JitError> {
+        leaf_order: &mut usize,
+    ) -> Result<(Vec<String>, Option<usize>), JitError> {
         if group.kind == "leaf" && !group.name.is_empty() {
-            let entry = sys_map.entry(group.name.clone()).or_default();
+            let bare_leaf = bare_schedule_target(&group.name).to_owned();
+            let entry = sys_map.entry(bare_leaf.clone()).or_default();
             entry.schedule_id = sched_id;
+            if entry.sched_order == usize::MAX {
+                entry.sched_order = *leaf_order;
+                *leaf_order += 1;
+            }
             if entry.run_if_expr.is_none() {
                 entry.run_if_expr = run_if_expr.cloned();
             }
-            for (set_idx, qual_name) in parent_sets {
-                if !entry.in_sets.contains(qual_name) {
-                    entry.in_sets.push(qual_name.clone());
-                }
-                if !entry.mount_set_indices.contains(set_idx) {
-                    entry.mount_set_indices.push(*set_idx);
+            for (_, bare_set_name) in parent_sets {
+                if !entry.in_sets.contains(bare_set_name) {
+                    entry.in_sets.push(bare_set_name.clone());
                 }
             }
-            return Ok(vec![group.name.clone()]);
+            if let Some(&(set_idx, _)) = parent_sets.last()
+                && !entry.mount_set_indices.contains(&set_idx)
+            {
+                entry.mount_set_indices.push(set_idx);
+            }
+            return Ok((vec![bare_leaf], None));
         }
 
         let mut next_parent_sets = parent_sets.to_vec();
@@ -1038,8 +1092,9 @@ fn extract_schedule_topology(
             } else {
                 group.name.clone()
             };
-            let qual = format!("{mod_prefix}::{raw_name}");
-            let idx = if let Some(&existing) = set_index_map.get(&qual) {
+            let bare = bare_schedule_target(&raw_name).to_owned();
+            let key = (sched_id, bare.clone());
+            let idx = if let Some(&existing) = set_index_map.get(&key) {
                 existing
             } else {
                 let flags = match group.kind.as_str() {
@@ -1048,7 +1103,7 @@ fn extract_schedule_topology(
                     _ => SCHEDULE_SET_FLAG_PARALLEL,
                 };
                 let cstr =
-                    define_cstring_on(obj_mod, &format!("strata_sset_{}", sets.len()), &qual)?;
+                    define_cstring_on(obj_mod, &format!("strata_sset_{}", sets.len()), &bare)?;
                 let idx = sets.len();
                 sets.push(ScheduleSetEntry {
                     qualified_name_cstr: cstr,
@@ -1057,12 +1112,12 @@ fn extract_schedule_topology(
                     before_set_indices: Vec::new(),
                     after_set_indices: Vec::new(),
                 });
-                set_index_map.insert(qual.clone(), idx);
+                set_index_map.insert(key, idx);
                 idx
             };
             // Nested parent set relationship; ordering between siblings happens below.
             own_set_idx = Some(idx);
-            next_parent_sets.push((idx, qual));
+            next_parent_sets.push((idx, bare));
         }
 
         let is_seq = group.kind == "seq";
@@ -1072,14 +1127,8 @@ fn extract_schedule_topology(
         let mut all_leaves: Vec<String> = Vec::new();
 
         for ch in &group.children {
-            let child_set_key = if ch.kind != "leaf" && !ch.name.is_empty() {
-                Some(format!("{mod_prefix}::{}", ch.name))
-            } else {
-                None
-            };
-            let leaves = walk_group(
+            let (leaves, cur_set_idx) = walk_group(
                 obj_mod,
-                mod_prefix,
                 sched_id,
                 run_if_expr,
                 ch,
@@ -1088,8 +1137,8 @@ fn extract_schedule_topology(
                 set_index_map,
                 sys_map,
                 seq_counter,
+                leaf_order,
             )?;
-            let cur_set_idx = child_set_key.and_then(|k| set_index_map.get(&k).copied());
             if is_seq || is_seq_weak {
                 if let (Some(p_s), Some(c_s)) = (prev_set_idx, cur_set_idx)
                     && p_s != c_s
@@ -1115,20 +1164,26 @@ fn extract_schedule_topology(
                     }
                 }
             }
-            prev_leaves = leaves.clone();
-            prev_set_idx = cur_set_idx.or(own_set_idx);
+            if !leaves.is_empty() {
+                prev_leaves = leaves.clone();
+            }
+            if cur_set_idx.is_some() {
+                prev_set_idx = cur_set_idx;
+            } else if !leaves.is_empty() {
+                prev_set_idx = None;
+            }
             all_leaves.extend(leaves);
         }
-        Ok(all_leaves)
+        Ok((all_leaves, own_set_idx))
     }
 
     let mut seq_counter = 0usize;
+    let mut leaf_order = 0usize;
     for sched in &mir.schedules {
         let sched_id = schedule_id_for(&sched.label);
         for node in &sched.nodes {
             walk_group(
                 obj_mod,
-                &mod_prefix,
                 sched_id,
                 sched.run_if_expr.as_ref(),
                 node,
@@ -1137,33 +1192,63 @@ fn extract_schedule_topology(
                 &mut set_index_map,
                 &mut sys_map,
                 &mut seq_counter,
+                &mut leaf_order,
             )?;
         }
     }
 
     // Also inherit default schedule for any synthesized system not listed explicitly.
-    for sched in &mir.schedules {
-        if sched.label == "FixedUpdate"
-            && let Some(ref expr) = sched.run_if_expr
-        {
-            for f in &mir.functions {
-                if matches!(
-                    f.kind,
-                    MirFnKind::SynthesizedTimeline
-                        | MirFnKind::SynthesizedTask
-                        | MirFnKind::SynthesizedFsm
-                        | MirFnKind::SynthesizedSpatialCsr
-                        | MirFnKind::SynthesizedTimerTick
-                ) {
-                    let e = sys_map
-                        .entry(f.name.clone())
-                        .or_insert_with(|| SysSchedTopology {
-                            schedule_id: ScheduleId::FIXED_UPDATE.0,
-                            ..Default::default()
-                        });
-                    if e.run_if_expr.is_none() {
-                        e.run_if_expr = Some(expr.clone());
-                    }
+    let fixed_run_if = mir
+        .schedules
+        .iter()
+        .find(|s| s.label == "FixedUpdate")
+        .and_then(|s| s.run_if_expr.as_ref());
+    for f in &mir.functions {
+        if matches!(
+            f.kind,
+            MirFnKind::SynthesizedTimeline
+                | MirFnKind::SynthesizedTask
+                | MirFnKind::SynthesizedFsm
+                | MirFnKind::SynthesizedSpatialCsr
+                | MirFnKind::SynthesizedTimerTick
+        ) {
+            let sys_bare = bare_schedule_target(&f.name).to_owned();
+            let e = sys_map.entry(sys_bare).or_insert_with(|| SysSchedTopology {
+                schedule_id: ScheduleId::FIXED_UPDATE.0,
+                ..Default::default()
+            });
+            if e.run_if_expr.is_none()
+                && e.schedule_id == ScheduleId::FIXED_UPDATE.0
+                && let Some(expr) = fixed_run_if
+            {
+                e.run_if_expr = Some(expr.clone());
+            }
+        }
+    }
+
+    // Ensure synthesized `strata_timer_tick` executes before all other `FixedUpdate` systems.
+    let timer_tick_name = mir
+        .functions
+        .iter()
+        .find(|f| matches!(f.kind, MirFnKind::SynthesizedTimerTick))
+        .map(|f| bare_schedule_target(&f.name).to_owned());
+    if let Some(ref tt_name) = timer_tick_name {
+        for f in &mir.functions {
+            if matches!(
+                f.kind,
+                MirFnKind::System
+                    | MirFnKind::SynthesizedTimeline
+                    | MirFnKind::SynthesizedTask
+                    | MirFnKind::SynthesizedFsm
+                    | MirFnKind::SynthesizedSpatialCsr
+            ) {
+                let sys_bare = bare_schedule_target(&f.name);
+                if sys_bare != tt_name
+                    && let Some(ent) = sys_map.get_mut(sys_bare)
+                    && ent.schedule_id == ScheduleId::FIXED_UPDATE.0
+                    && !ent.after.contains(tt_name)
+                {
+                    ent.after.push(tt_name.clone());
                 }
             }
         }
@@ -1179,21 +1264,26 @@ fn build_system_registration_entry(
     func_id: FuncId,
     sched_info: &HashMap<String, SysSchedTopology>,
 ) -> Result<SystemRegistrationEntry, JitError> {
-    let name_data_id = ctx.intern_cstr(&f.name)?;
-    let topo = sched_info.get(&f.name).cloned().unwrap_or_else(|| {
-        let default_sched = match f.kind {
-            MirFnKind::SynthesizedTimerTick
-            | MirFnKind::SynthesizedTimeline
-            | MirFnKind::SynthesizedTask
-            | MirFnKind::SynthesizedFsm
-            | MirFnKind::SynthesizedSpatialCsr => ScheduleId::FIXED_UPDATE.0,
-            _ => ScheduleId::UPDATE.0,
-        };
-        SysSchedTopology {
-            schedule_id: default_sched,
-            ..Default::default()
-        }
-    });
+    let bare_sys_name = bare_schedule_target(&f.name);
+    let name_data_id = ctx.intern_cstr(bare_sys_name)?;
+    let topo = sched_info
+        .get(&f.name)
+        .or_else(|| sched_info.get(bare_sys_name))
+        .cloned()
+        .unwrap_or_else(|| {
+            let default_sched = match f.kind {
+                MirFnKind::SynthesizedTimerTick
+                | MirFnKind::SynthesizedTimeline
+                | MirFnKind::SynthesizedTask
+                | MirFnKind::SynthesizedFsm
+                | MirFnKind::SynthesizedSpatialCsr => ScheduleId::FIXED_UPDATE.0,
+                _ => ScheduleId::UPDATE.0,
+            };
+            SysSchedTopology {
+                schedule_id: default_sched,
+                ..Default::default()
+            }
+        });
 
     // Build deduplicated ECS queries from `f.query_bindings`.
     let mut wire_queries = Vec::with_capacity(f.query_bindings.len());
@@ -1340,15 +1430,19 @@ fn build_system_registration_entry(
 
     let mut after_names = Vec::with_capacity(topo.after.len());
     for a in &topo.after {
-        after_names.push(ctx.intern_cstr(a)?);
+        after_names.push(ctx.intern_cstr(bare_schedule_target(a))?);
     }
     let mut after_weak_names = Vec::with_capacity(topo.after_weak.len());
     for a in &topo.after_weak {
-        after_weak_names.push(ctx.intern_cstr(a)?);
+        after_weak_names.push(ctx.intern_cstr(bare_schedule_target(a))?);
     }
     let mut before_names = Vec::with_capacity(topo.before.len());
     for b in &topo.before {
-        before_names.push(ctx.intern_cstr(b)?);
+        before_names.push(ctx.intern_cstr(bare_schedule_target(b))?);
+    }
+    let mut in_set_names = Vec::with_capacity(topo.in_sets.len());
+    for s in &topo.in_sets {
+        in_set_names.push(ctx.intern_cstr(bare_schedule_target(s))?);
     }
     Ok(SystemRegistrationEntry {
         fn_idx,
@@ -1362,7 +1456,9 @@ fn build_system_registration_entry(
         after_names,
         after_weak_names,
         before_names,
+        in_set_names,
         mount_set_indices: topo.mount_set_indices,
+        sched_order: topo.sched_order,
         run_if_guard,
     })
 }
@@ -1373,11 +1469,37 @@ fn find_reusable_obj_query(
     obj_idx: usize,
 ) -> Option<usize> {
     let obj = ctx.mir.objects.get(obj_idx)?;
-    let obj_comps: HashSet<usize> = obj
-        .components
-        .iter()
-        .filter_map(|c| lookup_name_in_map(&ctx.layout_map, c))
-        .collect();
+    let mut obj_comps: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<usize> = Vec::new();
+    for c in &obj.components {
+        if let Some(lidx) = lookup_name_in_map(&ctx.layout_map, c) {
+            stack.push(lidx);
+        }
+    }
+    for ci in &obj.inits {
+        if let Some(lidx) = ci
+            .canonical_component
+            .as_deref()
+            .and_then(|c| lookup_name_in_map(&ctx.layout_map, c))
+            .or_else(|| lookup_name_in_map(&ctx.layout_map, &ci.component))
+        {
+            stack.push(lidx);
+        }
+    }
+    while let Some(lidx) = stack.pop() {
+        if obj_comps.insert(lidx) {
+            if let Some(meta) = ctx.layouts.get(lidx) {
+                stack.extend_from_slice(&meta.required_indices);
+            }
+            if let Some(layout) = ctx.mir_layouts_sorted.get(lidx) {
+                for req in &layout.required_components {
+                    if let Some(req_idx) = lookup_name_in_map(&ctx.layout_map, req) {
+                        stack.push(req_idx);
+                    }
+                }
+            }
+        }
+    }
     if obj_comps.is_empty() {
         return None;
     }
@@ -1387,6 +1509,13 @@ fn find_reusable_obj_query(
                 lookup_name_in_map(&ctx.layout_map, &t.canonical_component)
                     .or_else(|| lookup_name_in_map(&ctx.layout_map, &t.storage_key))
                     .is_some_and(|lidx| obj_comps.contains(&lidx))
+            })
+            && qb.with_filters.iter().all(|w| {
+                lookup_name_in_map(&ctx.layout_map, w).is_some_and(|lidx| obj_comps.contains(&lidx))
+            })
+            && qb.without_filters.iter().all(|wo| {
+                lookup_name_in_map(&ctx.layout_map, wo)
+                    .is_none_or(|lidx| !obj_comps.contains(&lidx))
             })
         {
             return Some(qi);
@@ -1400,16 +1529,33 @@ fn find_res_access_in_hir(expr: &HirExpr) -> Option<(String, String)> {
         HirExpr::Field { base, field, .. } => {
             find_res_access_in_hir(base).map(|(r, _)| (r, field.clone()))
         }
-        HirExpr::Call(HirCall { callee, .. }) => {
+        HirExpr::Call(HirCall {
+            callee,
+            generic_args,
+            receiver,
+            ..
+        }) => {
             let trimmed = callee.trim();
-            trimmed
+            if matches!(trimmed, "res" | "res_mut")
+                && let Some(res_name) = generic_args.first()
+            {
+                return Some((res_name.trim().to_owned(), String::new()));
+            }
+            if let Some(inner) = trimmed
                 .strip_prefix("res<")
+                .or_else(|| trimmed.strip_prefix("res_mut<"))
+                .or_else(|| trimmed.strip_prefix("res::<"))
+                .or_else(|| trimmed.strip_prefix("res_mut::<"))
                 .and_then(|s| s.strip_suffix('>'))
-                .map(|inner| (inner.trim().to_owned(), String::new()))
+            {
+                return Some((inner.trim().to_owned(), String::new()));
+            }
+            receiver.as_deref().and_then(find_res_access_in_hir)
         }
         HirExpr::Path { name, .. } => name
             .trim()
             .strip_prefix("res<")
+            .or_else(|| name.trim().strip_prefix("res_mut<"))
             .and_then(|s| s.strip_suffix('>'))
             .map(|inner| (inner.trim().to_owned(), String::new())),
         HirExpr::Unary { expr: inner, .. } | HirExpr::Cast { expr: inner, .. } => {
@@ -1465,7 +1611,8 @@ fn eval_hir_run_if(
             },
             HirExpr::Field { base: _, field, ty } => {
                 let f = res_layout.fields.iter().find(|f| f.name == *field)?;
-                let mty = mir_type_from_ty(ty);
+                let eff_ty = if matches!(ty, Ty::Unknown) { &f.ty } else { ty };
+                let mty = mir_type_from_ty(eff_ty);
                 let cl_ty = scalar_cl_type(&mty, b.func.signature.call_conv);
                 let val = b
                     .ins()
@@ -1485,6 +1632,14 @@ fn eval_hir_run_if(
                     Some(RunVal::I64(i64v))
                 }
             }
+            HirExpr::Call(HirCall {
+                receiver: Some(recv),
+                callee,
+                ..
+            }) if matches!(callee.trim(), "raw" | "as_secs") => {
+                eval_val(res_layout, consts, b, res_ptr, recv)
+            }
+            HirExpr::Cast { expr: inner, .. } => eval_val(res_layout, consts, b, res_ptr, inner),
             HirExpr::Binary { op, lhs, rhs, .. } => {
                 let lv = eval_val(res_layout, consts, b, res_ptr, lhs)?;
                 let rv = eval_val(res_layout, consts, b, res_ptr, rhs)?;
@@ -1578,7 +1733,7 @@ fn mir_type_from_ty(ty: &Ty) -> MirType {
         Ty::I16 => MirType::I16,
         Ty::I32 => MirType::I32,
         Ty::I64 => MirType::I64,
-        Ty::F32 | Ty::UnitScalar { .. } => MirType::F32,
+        Ty::F32 | Ty::UnitScalar { .. } | Ty::GraceWindow => MirType::F32,
         Ty::F64 => MirType::F64,
         Ty::Fix32 => MirType::Fix32,
         Ty::Fix64 => MirType::Fix64,
@@ -1689,24 +1844,109 @@ impl<'a> ModuleContext<'a> {
         }
     }
 
+    fn cl_type_for_mir_val(&self, mty: &MirType) -> Type {
+        match mty {
+            MirType::Ptr
+            | MirType::MutPtr
+            | MirType::QueryIter
+            | MirType::Checkpoint
+            | MirType::Named(_)
+            | MirType::Array { .. }
+            | MirType::Tuple(_) => self.ptr_ty,
+            MirType::Vec2 | MirType::Vec3 | MirType::Vec4 => types::F32,
+            _ => scalar_cl_type(mty, self.call_conv),
+        }
+    }
+
+    fn sema_ty_to_field_mir_ty(&self, ty: &Ty) -> Option<MirType> {
+        match ty {
+            Ty::Unit
+            | Ty::Unknown
+            | Ty::BannedWire(_)
+            | Ty::Asset(_)
+            | Ty::Mat3
+            | Ty::Mat4
+            | Ty::BitSet(_)
+            | Ty::InlineStr(_)
+            | Ty::InputBuffer { .. }
+            | Ty::SmallVec { .. }
+            | Ty::IVec2
+            | Ty::IVec3
+            | Ty::UVec2 => None,
+            Ty::Named(n) if n == "GraceWindow" => Some(MirType::F32),
+            Ty::Named(n) => {
+                let enum_bytes = lookup_name_ref(&self.enums_by_name, n)
+                    .map(|ed| ed.repr_bytes)
+                    .or_else(|| {
+                        lookup_name_in_map(&self.layout_map, n)
+                            .map(|idx| &self.mir_layouts_sorted[idx])
+                            .filter(|l| l.item_kind == SchemaItemKind::Enum)
+                            .map(|l| l.size)
+                    });
+                if let Some(sz) = enum_bytes {
+                    return Some(match sz {
+                        1 => MirType::U8,
+                        2 => MirType::U16,
+                        4 => MirType::U32,
+                        _ => MirType::U64,
+                    });
+                }
+                Some(mir_type_from_ty(ty))
+            }
+            _ => Some(mir_type_from_ty(ty)),
+        }
+    }
+
     fn resolve_field_offset_and_ty(
         &self,
         layout_key: &str,
         field: &str,
     ) -> (usize, Option<MirType>) {
-        if let Some(lidx) = lookup_name_in_map(&self.layout_map, layout_key) {
-            let l = &self.mir_layouts_sorted[lidx];
-            if let Some(sf) = l.fields.iter().find(|f| f.name == field) {
-                return (sf.offset, Some(mir_type_from_ty(&sf.ty)));
+        let mut cur_layout = lookup_name_in_map(&self.layout_map, layout_key)
+            .map(|lidx| &self.mir_layouts_sorted[lidx])
+            .or_else(|| {
+                self.mir
+                    .relations
+                    .iter()
+                    .find(|r| r.canonical_name == layout_key || r.name == layout_key)
+                    .and_then(|r| r.payload_layout.as_ref())
+            });
+        let Some(mut layout) = cur_layout.take() else {
+            return (0, None);
+        };
+        let parts: Vec<&str> = field.split('.').collect();
+        let mut offset = 0usize;
+        for (i, part) in parts.iter().enumerate() {
+            let Some(sf) = layout.fields.iter().find(|f| f.name == *part) else {
+                return (0, None);
+            };
+            offset += sf.offset;
+            if i + 1 < parts.len() {
+                if let Ty::Named(ref inner_name) = sf.ty
+                    && let Some(inner_idx) = lookup_name_in_map(&self.layout_map, inner_name)
+                {
+                    layout = &self.mir_layouts_sorted[inner_idx];
+                    continue;
+                }
+                let lane = match parts[i + 1] {
+                    "x" | "r" | "0" => Some(0usize),
+                    "y" | "g" | "1" => Some(1),
+                    "z" | "b" | "2" => Some(2),
+                    "w" | "a" | "3" => Some(3),
+                    _ => None,
+                };
+                if let Some(lane_idx) = lane {
+                    offset += lane_idx * 4;
+                    let lane_mty = match sf.ty {
+                        Ty::IVec2 | Ty::IVec3 => MirType::I32,
+                        Ty::UVec2 => MirType::U32,
+                        _ => MirType::F32,
+                    };
+                    return (offset, Some(lane_mty));
+                }
+                return (0, None);
             }
-        }
-        for r in &self.mir.relations {
-            if (r.canonical_name == layout_key || r.name == layout_key)
-                && let Some(ref pl) = r.payload_layout
-                && let Some(sf) = pl.fields.iter().find(|f| f.name == field)
-            {
-                return (sf.offset, Some(mir_type_from_ty(&sf.ty)));
-            }
+            return (offset, self.sema_ty_to_field_mir_ty(&sf.ty));
         }
         (0, None)
     }
@@ -2685,6 +2925,9 @@ fn find_par_subcfg_info(
             match &s.inst {
                 Inst::CmdSpawn { .. }
                 | Inst::CmdSpawnBatch { .. }
+                | Inst::SpawnBatchBegin { .. }
+                | Inst::SpawnBatchPush { .. }
+                | Inst::SpawnBatchCommit { .. }
                 | Inst::CmdDespawn { .. }
                 | Inst::CmdDespawnAll { .. }
                 | Inst::CmdInsert { .. }
@@ -2878,6 +3121,23 @@ fn inst_read_locals(inst: &Inst) -> Vec<u32> {
                 out.push(v.0);
             }
         }
+        Inst::SpawnBatchBegin { count, .. } => {
+            out.push(count.0);
+        }
+        Inst::SpawnBatchPush {
+            batch,
+            index,
+            components,
+        } => {
+            out.push(batch.0);
+            out.push(index.0);
+            for (_, v) in components {
+                out.push(v.0);
+            }
+        }
+        Inst::SpawnBatchCommit { batch } => {
+            out.push(batch.0);
+        }
         _ => {}
     }
     out
@@ -2909,6 +3169,24 @@ fn define_fn_checked(
     Ok(())
 }
 
+fn collect_slot_elem_tys(mir_fn: &MirFunction) -> HashMap<u32, MirType> {
+    let mut slot_elem_tys = HashMap::new();
+    for bb in &mir_fn.blocks {
+        for s in &bb.stmts {
+            if let Some(d) = s.dst
+                && let Inst::SlotAlloc { ty } = &s.inst
+                && !matches!(
+                    ty,
+                    MirType::Named(_) | MirType::Array { .. } | MirType::Tuple(_)
+                )
+            {
+                slot_elem_tys.insert(d.0, ty.clone());
+            }
+        }
+    }
+    slot_elem_tys
+}
+
 fn emit_mir_function_body(
     ctx: &mut ModuleContext<'_>,
     mir_fn: &MirFunction,
@@ -2917,6 +3195,7 @@ fn emit_mir_function_body(
     sys_entry: Option<&SystemRegistrationEntry>,
 ) -> Result<(), JitError> {
     // Check if any `@par` sub-CFG can be outlined to `BamChunkTaskFn`.
+    let slot_elem_tys = collect_slot_elem_tys(mir_fn);
     let mut par_tasks: HashMap<usize, (ParSubCfgInfo, FuncId, Vec<usize>)> = HashMap::new();
     let mut skip_blocks: HashSet<usize> = HashSet::new();
     for (bi, bb) in mir_fn.blocks.iter().enumerate() {
@@ -2939,7 +3218,9 @@ fn emit_mir_function_body(
                 for &lid in &info.live_in_locals {
                     off = align_up(off, 8);
                     offsets.push(off);
-                    let mty = &mir_fn.locals[lid as usize].ty;
+                    let mty = slot_elem_tys
+                        .get(&lid)
+                        .unwrap_or(&mir_fn.locals[lid as usize].ty);
                     off += match mty {
                         MirType::Vec2 | MirType::Vec3 | MirType::Vec4 => 16,
                         _ => 8,
@@ -3262,7 +3543,7 @@ fn emit_par_task_function(
 
         // Load captured live-in locals from `par_frame`.
         for (&lid, &off) in info.live_in_locals.iter().zip(offsets.iter()) {
-            let mty = mir_fn.locals[lid as usize].ty.clone();
+            let mty = lowerer.effective_local_mir_ty(LocalId(lid)).clone();
             lowerer.load_local_from_mem(LocalId(lid), &mty, par_frame, off as i32);
         }
 
@@ -3464,6 +3745,7 @@ struct FnLowerer<'a, 'b, 'f> {
     sr_plan: StrengthPlan,
     ptr_vec_hints: HashMap<u32, (i32, u8)>,
     const_strings: HashMap<u32, (DataId, usize)>,
+    batch_schemas: HashMap<u32, Vec<usize>>,
 }
 
 impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
@@ -3507,23 +3789,20 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let zero_ptr = b.ins().iconst(ptr_ty, 0);
         let zero_f32 = b.ins().f32const(0.0);
         let zero_f64 = b.ins().f64const(0.0);
-        let mut slot_elem_tys: HashMap<u32, MirType> = HashMap::new();
+        let slot_elem_tys = collect_slot_elem_tys(mir_fn);
         let mut agg_slots = HashMap::new();
         for bb in &mir_fn.blocks {
             for s in &bb.stmts {
                 if let Some(d) = s.dst
                     && let Inst::SlotAlloc { ty } = &s.inst
-                {
-                    if matches!(
+                    && matches!(
                         ty,
                         MirType::Named(_) | MirType::Array { .. } | MirType::Tuple(_)
-                    ) {
-                        let sz = ctx.layout_size_of_mir_ty(ty).max(8);
-                        let slot = alloc_zero_slot(b, sz, ptr_ty);
-                        agg_slots.insert(d.0, slot);
-                    } else {
-                        slot_elem_tys.insert(d.0, ty.clone());
-                    }
+                    )
+                {
+                    let sz = ctx.layout_size_of_mir_ty(ty).max(8);
+                    let slot = alloc_zero_slot(b, sz, ptr_ty);
+                    agg_slots.insert(d.0, slot);
                 }
             }
         }
@@ -3632,6 +3911,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             sr_plan,
             ptr_vec_hints,
             const_strings: HashMap::new(),
+            batch_schemas: HashMap::new(),
         }
     }
 
@@ -3746,18 +4026,8 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
     }
 
     fn expected_cl_ty(&self, lid: LocalId) -> Type {
-        let loc_ty = self.effective_local_mir_ty(lid);
-        match loc_ty {
-            MirType::Ptr
-            | MirType::MutPtr
-            | MirType::QueryIter
-            | MirType::Checkpoint
-            | MirType::Named(_)
-            | MirType::Array { .. }
-            | MirType::Tuple(_) => self.ctx.ptr_ty,
-            MirType::Vec2 | MirType::Vec3 | MirType::Vec4 => types::F32,
-            _ => scalar_cl_type(loc_ty, self.ctx.call_conv),
-        }
+        self.ctx
+            .cl_type_for_mir_val(self.effective_local_mir_ty(lid))
     }
 
     fn def_scalar_typed(&mut self, dst: LocalId, val: Value) {
@@ -3788,9 +4058,20 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                 self.def_vec(lid, vals);
             }
             _ => {
-                let ty = self.expected_cl_ty(lid);
-                let val = self.b.ins().load(ty, MemFlagsData::new(), ptr, offset);
-                self.def_scalar_typed(lid, val);
+                let mem_ty = self.ctx.cl_type_for_mir_val(mty);
+                let val = self.b.ins().load(mem_ty, MemFlagsData::new(), ptr, offset);
+                let dst_mty = self.effective_local_mir_ty(lid).clone();
+                let target_ty = self.expected_cl_ty(lid);
+                let coerced = cast_value(
+                    self.b,
+                    val,
+                    mty,
+                    is_signed_int_ty(mty),
+                    target_ty,
+                    is_signed_int_ty(&dst_mty),
+                    self.ctx.ptr_ty,
+                );
+                self.def_scalar_typed(lid, coerced);
             }
         }
     }
@@ -3801,14 +4082,28 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                 let dims = vec_dims(mty).unwrap_or(2);
                 let vals = self.use_vec(lid);
                 for (i, &v) in vals.iter().take(dims as usize).enumerate() {
+                    let fv = coerce_cl_val(self.b, v, types::F32, self.ctx.ptr_ty);
                     self.b
                         .ins()
-                        .store(MemFlagsData::new(), v, ptr, offset + (i * 4) as i32);
+                        .store(MemFlagsData::new(), fv, ptr, offset + (i * 4) as i32);
                 }
             }
             _ => {
+                let src_mty = self.effective_local_mir_ty(lid).clone();
                 let val = self.use_scalar(lid);
-                self.b.ins().store(MemFlagsData::new(), val, ptr, offset);
+                let target_ty = self.ctx.cl_type_for_mir_val(mty);
+                let coerced = cast_value(
+                    self.b,
+                    val,
+                    &src_mty,
+                    is_signed_int_ty(&src_mty),
+                    target_ty,
+                    is_signed_int_ty(mty),
+                    self.ctx.ptr_ty,
+                );
+                self.b
+                    .ins()
+                    .store(MemFlagsData::new(), coerced, ptr, offset);
             }
         }
     }
@@ -3931,7 +4226,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let iter = self.ensure_query_iter(info.query_idx);
         let mut frame_bytes = self.ctx.ptr_bytes;
         for (&lid, &off) in info.live_in_locals.iter().zip(offsets.iter()) {
-            let extra = match self.mir_fn.locals[lid as usize].ty {
+            let extra = match self.effective_local_mir_ty(LocalId(lid)) {
                 MirType::Vec2 | MirType::Vec3 | MirType::Vec4 => 16,
                 _ => 8,
             };
@@ -3943,7 +4238,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             .ins()
             .store(MemFlagsData::trusted(), self.state_ptr, frame_ptr, 0);
         for (&lid, &off) in info.live_in_locals.iter().zip(offsets.iter()) {
-            let mty = self.mir_fn.locals[lid as usize].ty.clone();
+            let mty = self.effective_local_mir_ty(LocalId(lid)).clone();
             self.store_local_to_mem(LocalId(lid), &mty, frame_ptr, off as i32);
         }
         let fref = self.ctx.obj_mod.declare_func_in_func(task_fid, self.b.func);
@@ -4039,6 +4334,9 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             Inst::Copy { val } => {
                 if let Some(d) = dst {
                     self.copy_local(*val, d);
+                    if let Some(schema) = self.batch_schemas.get(&val.0).cloned() {
+                        self.batch_schemas.insert(d.0, schema);
+                    }
                 }
             }
             Inst::SlotAlloc { .. } => {
@@ -4052,6 +4350,9 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             Inst::SlotLoad { slot } => {
                 if let Some(d) = dst {
                     self.copy_local(*slot, d);
+                    if let Some(schema) = self.batch_schemas.get(&slot.0).cloned() {
+                        self.batch_schemas.insert(d.0, schema);
+                    }
                 }
             }
             Inst::SlotStore { slot, val } => {
@@ -4064,6 +4365,9 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                     emit_memcpy(self.b, dst_ptr, src_ptr, sz);
                 } else {
                     self.copy_local(*val, *slot);
+                    if let Some(schema) = self.batch_schemas.get(&val.0).cloned() {
+                        self.batch_schemas.insert(slot.0, schema);
+                    }
                 }
                 // Update any strength-reduced row pointers bound to `slot`.
                 if let Some(entries) = self.sr_plan.by_slot.get(&slot.0).cloned() {
@@ -4189,11 +4493,12 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             }
             Inst::FieldStore {
                 base_ptr,
+                layout_key,
+                field,
                 offset_bytes,
                 val,
-                ..
             } => {
-                self.lower_field_store(*base_ptr, *offset_bytes, *val);
+                self.lower_field_store(*base_ptr, layout_key, field, *offset_bytes, *val);
             }
             Inst::RowPtr {
                 col_ptr,
@@ -4679,6 +4984,23 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             }
             Inst::CmdSpawnBatch { count, components } => {
                 self.lower_cmd_spawn_batch(*count, components)?;
+            }
+            Inst::SpawnBatchBegin { count, components } => {
+                let (hdr_u64, schema) = self.lower_spawn_batch_begin(*count, components)?;
+                if let Some(d) = dst {
+                    self.def_scalar_typed(d, hdr_u64);
+                    self.batch_schemas.insert(d.0, schema);
+                }
+            }
+            Inst::SpawnBatchPush {
+                batch,
+                index,
+                components,
+            } => {
+                self.lower_spawn_batch_push(*batch, *index, components);
+            }
+            Inst::SpawnBatchCommit { batch } => {
+                self.lower_spawn_batch_commit(*batch)?;
             }
             Inst::CmdDespawn { entity } => {
                 let ent = self.use_scalar(*entity);
@@ -5709,9 +6031,10 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         }
 
         for (fname, fval) in fields {
-            let (off, _) = self.ctx.resolve_field_offset_and_ty(type_name, fname);
-            let fty = self.mir_fn.locals[fval.0 as usize].ty.clone();
-            self.store_local_to_mem(*fval, &fty, base_ptr, off as i32);
+            let (off, resolved_ty) = self.ctx.resolve_field_offset_and_ty(type_name, fname);
+            let local_ty = self.effective_local_mir_ty(*fval).clone();
+            let dst_mty = resolved_ty.unwrap_or_else(|| local_ty.clone());
+            self.store_typed_field_to_mem(*fval, &local_ty, &dst_mty, base_ptr, off as i32);
         }
         self.def_scalar_typed(dst, base_ptr);
     }
@@ -5796,7 +6119,52 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let _ = ptr_ty;
     }
 
-    fn lower_field_store(&mut self, base_ptr: LocalId, offset_bytes: u32, val: LocalId) {
+    fn store_typed_field_to_mem(
+        &mut self,
+        val: LocalId,
+        val_mty: &MirType,
+        dst_mty: &MirType,
+        dst_base: Value,
+        offset: i32,
+    ) {
+        let val_is_agg_ptr = matches!(
+            val_mty,
+            MirType::Named(_)
+                | MirType::Array { .. }
+                | MirType::Tuple(_)
+                | MirType::Ptr
+                | MirType::MutPtr
+        );
+        if matches!(
+            dst_mty,
+            MirType::Named(_) | MirType::Array { .. } | MirType::Tuple(_)
+        ) && val_is_agg_ptr
+        {
+            let src_ptr = self.use_scalar(val);
+            let sz = self.ctx.layout_size_of_mir_ty(dst_mty);
+            let dst_addr = self.b.ins().iadd_imm_s(dst_base, i64::from(offset));
+            emit_memcpy(self.b, dst_addr, src_ptr, sz);
+        } else {
+            let store_mty = if matches!(
+                dst_mty,
+                MirType::Named(_) | MirType::Array { .. } | MirType::Tuple(_)
+            ) {
+                val_mty
+            } else {
+                dst_mty
+            };
+            self.store_local_to_mem(val, store_mty, dst_base, offset);
+        }
+    }
+
+    fn lower_field_store(
+        &mut self,
+        base_ptr: LocalId,
+        layout_key: &str,
+        field: &str,
+        offset_bytes: u32,
+        val: LocalId,
+    ) {
         let bp = self.use_scalar(base_ptr);
         let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, bp, 0);
         let store_bb = self.b.create_block();
@@ -5805,18 +6173,10 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
 
         self.b.switch_to_block(store_bb);
         self.b.seal_block(store_bb);
-        let vty = self.mir_fn.locals[val.0 as usize].ty.clone();
-        if matches!(
-            vty,
-            MirType::Named(_) | MirType::Array { .. } | MirType::Tuple(_)
-        ) {
-            let src_ptr = self.use_scalar(val);
-            let sz = self.ctx.layout_size_of_mir_ty(&vty);
-            let dst_addr = self.b.ins().iadd_imm_s(bp, i64::from(offset_bytes));
-            emit_memcpy(self.b, dst_addr, src_ptr, sz);
-        } else {
-            self.store_local_to_mem(val, &vty, bp, offset_bytes as i32);
-        }
+        let val_mty = self.effective_local_mir_ty(val).clone();
+        let (_, resolved_field_ty) = self.ctx.resolve_field_offset_and_ty(layout_key, field);
+        let dst_mty = resolved_field_ty.unwrap_or_else(|| val_mty.clone());
+        self.store_typed_field_to_mem(val, &val_mty, &dst_mty, bp, offset_bytes as i32);
         self.b.ins().jump(skip_bb, &[]);
 
         self.b.switch_to_block(skip_bb);
@@ -7024,6 +7384,379 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         for buf in temp_bufs {
             self.b.ins().call(free_ref, &[buf]);
         }
+        self.b.ins().jump(done_bb, &[]);
+
+        self.b.switch_to_block(done_bb);
+        self.b.seal_block(done_bb);
+        Ok(())
+    }
+
+    fn lower_spawn_batch_begin(
+        &mut self,
+        count: LocalId,
+        components: &[String],
+    ) -> Result<(Value, Vec<usize>), JitError> {
+        let ptr_ty = self.ctx.ptr_ty;
+        let resolved_lidxs: Vec<usize> = components
+            .iter()
+            .filter_map(|c| lookup_name_in_map(&self.ctx.layout_map, c))
+            .collect();
+        let k = resolved_lidxs.len();
+        let comps_off = 32usize;
+        let ptrs_off = comps_off + align_up(k * structs::BAM_COMPONENT_SIZE, 8);
+        let hdr_bytes = (ptrs_off + k * self.ctx.ptr_bytes).max(32);
+
+        let raw_cnt = self.use_scalar(count);
+        let cnt_u64 = coerce_cl_val(self.b, raw_cnt, types::I64, ptr_ty);
+        let cnt_ptr = coerce_cl_val(self.b, raw_cnt, ptr_ty, ptr_ty);
+
+        let calloc_fid = self
+            .ctx
+            .declare_extern_fn("calloc", &[ptr_ty, ptr_ty], Some(ptr_ty))?;
+        let calloc_ref = self
+            .ctx
+            .obj_mod
+            .declare_func_in_func(calloc_fid, self.b.func);
+
+        let one = self.b.ins().iconst(ptr_ty, 1);
+        let hsz = self.b.ins().iconst(ptr_ty, hdr_bytes as i64);
+        let hcall = self.b.ins().call(calloc_ref, &[one, hsz]);
+        let hdr = self.b.inst_results(hcall)[0];
+
+        let hdr_ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, hdr, 0);
+        let init_bb = self.b.create_block();
+        let done_bb = self.b.create_block();
+        self.b.ins().brif(hdr_ok, init_bb, &[], done_bb, &[]);
+
+        self.b.switch_to_block(init_bb);
+        self.b.seal_block(init_bb);
+
+        let k_u64 = self.b.ins().iconst(types::I64, k as i64);
+        let comps_ptr = self.b.ins().iadd_imm_s(hdr, comps_off as i64);
+        let ptrs_ptr = self.b.ins().iadd_imm_s(hdr, ptrs_off as i64);
+        self.b.ins().store(MemFlagsData::trusted(), cnt_u64, hdr, 0);
+        self.b.ins().store(MemFlagsData::trusted(), k_u64, hdr, 8);
+        self.b
+            .ins()
+            .store(MemFlagsData::trusted(), comps_ptr, hdr, 16);
+        self.b
+            .ins()
+            .store(MemFlagsData::trusted(), ptrs_ptr, hdr, 24);
+
+        let cnt_pos = self.b.ins().icmp_imm_s(IntCC::NotEqual, cnt_u64, 0);
+        for (i, &lidx) in resolved_lidxs.iter().enumerate() {
+            let handle = self.b.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                self.state_ptr,
+                self.ctx.state_layout.comp_slot_offset(lidx) as i32,
+            );
+            self.b.ins().store(
+                MemFlagsData::trusted(),
+                handle,
+                comps_ptr,
+                (i * structs::BAM_COMPONENT_SIZE) as i32,
+            );
+            let sz = self.ctx.layouts[lidx].size;
+            if sz > 0 {
+                let alloc_bb = self.b.create_block();
+                let next_c_bb = self.b.create_block();
+                self.b.ins().brif(cnt_pos, alloc_bb, &[], next_c_bb, &[]);
+
+                self.b.switch_to_block(alloc_bb);
+                self.b.seal_block(alloc_bb);
+                let sz_v = self.b.ins().iconst(ptr_ty, sz as i64);
+                let ccall = self.b.ins().call(calloc_ref, &[cnt_ptr, sz_v]);
+                let col_buf = self.b.inst_results(ccall)[0];
+                self.b.ins().store(
+                    MemFlagsData::trusted(),
+                    col_buf,
+                    ptrs_ptr,
+                    (i * self.ctx.ptr_bytes) as i32,
+                );
+                self.b.ins().jump(next_c_bb, &[]);
+
+                self.b.switch_to_block(next_c_bb);
+                self.b.seal_block(next_c_bb);
+            }
+        }
+        self.b.ins().jump(done_bb, &[]);
+
+        self.b.switch_to_block(done_bb);
+        self.b.seal_block(done_bb);
+        let hdr_u64 = coerce_cl_val(self.b, hdr, types::I64, ptr_ty);
+        Ok((hdr_u64, resolved_lidxs))
+    }
+
+    fn lookup_batch_col_buf_by_handle(
+        &mut self,
+        comps_ptr: Value,
+        ptrs_ptr: Value,
+        comp_cnt_ptr: Value,
+        lidx: usize,
+    ) -> Value {
+        let ptr_ty = self.ctx.ptr_ty;
+        let target_h = self.b.ins().load(
+            types::I32,
+            MemFlagsData::trusted(),
+            self.state_ptr,
+            self.ctx.state_layout.comp_slot_offset(lidx) as i32,
+        );
+        let k_var = self.b.declare_var(ptr_ty);
+        let z_ptr = self.b.ins().iconst(ptr_ty, 0);
+        self.b.def_var(k_var, z_ptr);
+
+        let hdr_bb = self.b.create_block();
+        let body_bb = self.b.create_block();
+        let hit_bb = self.b.create_block();
+        let step_bb = self.b.create_block();
+        let done_bb = self.b.create_block();
+        self.b.append_block_param(done_bb, ptr_ty);
+        self.b.ins().jump(hdr_bb, &[]);
+
+        self.b.switch_to_block(hdr_bb);
+        let k = self.b.use_var(k_var);
+        let in_b = self.b.ins().icmp(IntCC::UnsignedLessThan, k, comp_cnt_ptr);
+        self.b
+            .ins()
+            .brif(in_b, body_bb, &[], done_bb, &[BlockArg::Value(z_ptr)]);
+
+        self.b.switch_to_block(body_bb);
+        self.b.seal_block(body_bb);
+        let coff = self
+            .b
+            .ins()
+            .imul_imm_s(k, structs::BAM_COMPONENT_SIZE as i64);
+        let caddr = self.b.ins().iadd(comps_ptr, coff);
+        let h = self
+            .b
+            .ins()
+            .load(types::I32, MemFlagsData::trusted(), caddr, 0);
+        let eq = self.b.ins().icmp(IntCC::Equal, h, target_h);
+        self.b.ins().brif(eq, hit_bb, &[], step_bb, &[]);
+
+        self.b.switch_to_block(hit_bb);
+        self.b.seal_block(hit_bb);
+        let poff = self.b.ins().imul_imm_s(k, self.ctx.ptr_bytes as i64);
+        let paddr = self.b.ins().iadd(ptrs_ptr, poff);
+        let buf = self.b.ins().load(ptr_ty, MemFlagsData::trusted(), paddr, 0);
+        self.b.ins().jump(done_bb, &[BlockArg::Value(buf)]);
+
+        self.b.switch_to_block(step_bb);
+        self.b.seal_block(step_bb);
+        let nk = self.b.ins().iadd_imm_s(k, 1);
+        self.b.def_var(k_var, nk);
+        self.b.ins().jump(hdr_bb, &[]);
+
+        self.b.seal_block(hdr_bb);
+        self.b.switch_to_block(done_bb);
+        self.b.seal_block(done_bb);
+        self.b.block_params(done_bb)[0]
+    }
+
+    fn lower_spawn_batch_push(
+        &mut self,
+        batch: LocalId,
+        index: LocalId,
+        components: &[(String, LocalId)],
+    ) {
+        let ptr_ty = self.ctx.ptr_ty;
+        let hdr_raw = self.use_scalar(batch);
+        let hdr = coerce_cl_val(self.b, hdr_raw, ptr_ty, ptr_ty);
+        let idx_raw = self.use_scalar(index);
+        let idx_u64 = coerce_cl_val(self.b, idx_raw, types::I64, ptr_ty);
+
+        let hdr_ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, hdr, 0);
+        let chk_bb = self.b.create_block();
+        let do_bb = self.b.create_block();
+        let done_bb = self.b.create_block();
+        self.b.ins().brif(hdr_ok, chk_bb, &[], done_bb, &[]);
+
+        self.b.switch_to_block(chk_bb);
+        self.b.seal_block(chk_bb);
+        let cnt_u64 = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), hdr, 0);
+        let in_bounds = self.b.ins().icmp(IntCC::UnsignedLessThan, idx_u64, cnt_u64);
+        self.b.ins().brif(in_bounds, do_bb, &[], done_bb, &[]);
+
+        self.b.switch_to_block(do_bb);
+        self.b.seal_block(do_bb);
+        let comp_cnt = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), hdr, 8);
+        let comp_cnt_ptr = coerce_cl_val(self.b, comp_cnt, ptr_ty, ptr_ty);
+        let comps_ptr = self.b.ins().load(ptr_ty, MemFlagsData::trusted(), hdr, 16);
+        let ptrs_ptr = self.b.ins().load(ptr_ty, MemFlagsData::trusted(), hdr, 24);
+        let idx_ptr = coerce_cl_val(self.b, idx_u64, ptr_ty, ptr_ty);
+        let schema = self.batch_schemas.get(&batch.0).cloned();
+
+        for (cname, val_lid) in components {
+            let Some(lidx) = lookup_name_in_map(&self.ctx.layout_map, cname) else {
+                continue;
+            };
+            let sz = self.ctx.layouts[lidx].size;
+            if sz == 0 {
+                continue;
+            }
+            let col_buf = if let Some(k) = schema
+                .as_ref()
+                .and_then(|s| s.iter().position(|&x| x == lidx))
+            {
+                self.b.ins().load(
+                    ptr_ty,
+                    MemFlagsData::trusted(),
+                    ptrs_ptr,
+                    (k * self.ctx.ptr_bytes) as i32,
+                )
+            } else {
+                self.lookup_batch_col_buf_by_handle(comps_ptr, ptrs_ptr, comp_cnt_ptr, lidx)
+            };
+
+            let buf_ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, col_buf, 0);
+            let wr_bb = self.b.create_block();
+            let next_c_bb = self.b.create_block();
+            self.b.ins().brif(buf_ok, wr_bb, &[], next_c_bb, &[]);
+
+            self.b.switch_to_block(wr_bb);
+            self.b.seal_block(wr_bb);
+            let off = self.b.ins().imul_imm_s(idx_ptr, sz as i64);
+            let dst_ptr = self.b.ins().iadd(col_buf, off);
+            let mty = self.mir_fn.locals[val_lid.0 as usize].ty.clone();
+            if matches!(
+                mty,
+                MirType::Named(_)
+                    | MirType::Ptr
+                    | MirType::MutPtr
+                    | MirType::Array { .. }
+                    | MirType::Tuple(_)
+            ) {
+                let src_ptr = self.use_scalar(*val_lid);
+                let src_ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, src_ptr, 0);
+                let cp_bb = self.b.create_block();
+                self.b.ins().brif(src_ok, cp_bb, &[], next_c_bb, &[]);
+
+                self.b.switch_to_block(cp_bb);
+                self.b.seal_block(cp_bb);
+                emit_memcpy(self.b, dst_ptr, src_ptr, sz);
+                self.b.ins().jump(next_c_bb, &[]);
+            } else {
+                self.store_local_to_mem(*val_lid, &mty, dst_ptr, 0);
+                self.b.ins().jump(next_c_bb, &[]);
+            }
+
+            self.b.switch_to_block(next_c_bb);
+            self.b.seal_block(next_c_bb);
+        }
+        self.b.ins().jump(done_bb, &[]);
+
+        self.b.switch_to_block(done_bb);
+        self.b.seal_block(done_bb);
+    }
+
+    fn lower_spawn_batch_commit(&mut self, batch: LocalId) -> Result<(), JitError> {
+        let ptr_ty = self.ctx.ptr_ty;
+        let hdr_raw = self.use_scalar(batch);
+        let hdr = coerce_cl_val(self.b, hdr_raw, ptr_ty, ptr_ty);
+        let cmds = self.ensure_commands();
+
+        let free_fid = self.ctx.declare_extern_fn("free", &[ptr_ty], None)?;
+        let free_ref = self.ctx.obj_mod.declare_func_in_func(free_fid, self.b.func);
+
+        let hdr_ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, hdr, 0);
+        let do_bb = self.b.create_block();
+        let done_bb = self.b.create_block();
+        self.b.ins().brif(hdr_ok, do_bb, &[], done_bb, &[]);
+
+        self.b.switch_to_block(do_bb);
+        self.b.seal_block(do_bb);
+        let cnt_u64 = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), hdr, 0);
+        let comp_cnt_u64 = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), hdr, 8);
+        let comps_ptr = self.b.ins().load(ptr_ty, MemFlagsData::trusted(), hdr, 16);
+        let ptrs_ptr = self.b.ins().load(ptr_ty, MemFlagsData::trusted(), hdr, 24);
+        let cnt_ptr = coerce_cl_val(self.b, cnt_u64, ptr_ty, ptr_ty);
+        let comp_cnt_ptr = coerce_cl_val(self.b, comp_cnt_u64, ptr_ty, ptr_ty);
+
+        let cnt_pos = self.b.ins().icmp_imm_s(IntCC::NotEqual, cnt_u64, 0);
+        let comp_pos = self.b.ins().icmp_imm_s(IntCC::NotEqual, comp_cnt_u64, 0);
+        let cmds_ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, cmds, 0);
+        let pos_both = self.b.ins().band(cnt_pos, comp_pos);
+        let can_spawn = self.b.ins().band(pos_both, cmds_ok);
+
+        let spawn_bb = self.b.create_block();
+        let free_loop_init_bb = self.b.create_block();
+        self.b
+            .ins()
+            .brif(can_spawn, spawn_bb, &[], free_loop_init_bb, &[]);
+
+        self.b.switch_to_block(spawn_bb);
+        self.b.seal_block(spawn_bb);
+        let null_out = self.b.ins().iconst(ptr_ty, 0);
+        let _rc = call_vtable(
+            &self.ctx.obj_mod,
+            self.b,
+            self.api_ptr,
+            api_slots::CMD_SPAWN_BATCH,
+            &[ptr_ty, ptr_ty, ptr_ty, ptr_ty, ptr_ty, ptr_ty],
+            Some(types::I32),
+            ptr_ty,
+            self.ctx.call_conv,
+            &[cmds, comps_ptr, ptrs_ptr, comp_cnt_ptr, cnt_ptr, null_out],
+        );
+        self.b.ins().jump(free_loop_init_bb, &[]);
+
+        self.b.switch_to_block(free_loop_init_bb);
+        self.b.seal_block(free_loop_init_bb);
+        let k_var = self.b.declare_var(ptr_ty);
+        let z_ptr = self.b.ins().iconst(ptr_ty, 0);
+        self.b.def_var(k_var, z_ptr);
+        let free_hdr_bb = self.b.create_block();
+        let free_body_bb = self.b.create_block();
+        let free_col_bb = self.b.create_block();
+        let free_step_bb = self.b.create_block();
+        let free_self_bb = self.b.create_block();
+        self.b.ins().jump(free_hdr_bb, &[]);
+
+        self.b.switch_to_block(free_hdr_bb);
+        let k = self.b.use_var(k_var);
+        let more = self.b.ins().icmp(IntCC::UnsignedLessThan, k, comp_cnt_ptr);
+        self.b
+            .ins()
+            .brif(more, free_body_bb, &[], free_self_bb, &[]);
+
+        self.b.switch_to_block(free_body_bb);
+        self.b.seal_block(free_body_bb);
+        let poff = self.b.ins().imul_imm_s(k, self.ctx.ptr_bytes as i64);
+        let paddr = self.b.ins().iadd(ptrs_ptr, poff);
+        let col_buf = self.b.ins().load(ptr_ty, MemFlagsData::trusted(), paddr, 0);
+        let col_nz = self.b.ins().icmp_imm_s(IntCC::NotEqual, col_buf, 0);
+        self.b
+            .ins()
+            .brif(col_nz, free_col_bb, &[], free_step_bb, &[]);
+
+        self.b.switch_to_block(free_col_bb);
+        self.b.seal_block(free_col_bb);
+        self.b.ins().call(free_ref, &[col_buf]);
+        self.b.ins().jump(free_step_bb, &[]);
+
+        self.b.switch_to_block(free_step_bb);
+        self.b.seal_block(free_step_bb);
+        let nk = self.b.ins().iadd_imm_s(k, 1);
+        self.b.def_var(k_var, nk);
+        self.b.ins().jump(free_hdr_bb, &[]);
+
+        self.b.seal_block(free_hdr_bb);
+        self.b.switch_to_block(free_self_bb);
+        self.b.seal_block(free_self_bb);
+        self.b.ins().call(free_ref, &[hdr]);
         self.b.ins().jump(done_bb, &[]);
 
         self.b.switch_to_block(done_bb);
@@ -8965,6 +9698,8 @@ fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitError> {
             .max(1);
         let req_slot = alloc_zero_slot(&mut b, req_cap * structs::BAM_COMPONENT_SIZE, ptr_ty);
         let req_buf = b.ins().stack_addr(ptr_ty, req_slot, 0);
+        let req_init_slot = alloc_zero_slot(&mut b, req_cap * REQ_COMP_DESC_SIZE, ptr_ty);
+        let req_init_buf = b.ins().stack_addr(ptr_ty, req_init_slot, 0);
         let linfo_slot = alloc_zero_slot(&mut b, structs::LAYOUT_INFO_SIZE, ptr_ty);
         let linfo_ptr = b.ins().stack_addr(ptr_ty, linfo_slot, 0);
         let linfo_sz_v = b.ins().iconst(types::I32, structs::LAYOUT_INFO_SIZE as i64);
@@ -9086,6 +9821,16 @@ fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitError> {
             emit_memcpy(&mut b, cdesc_buf, ro_cd, structs::COMPONENT_DESC_SIZE);
 
             if !l.required_indices.is_empty() {
+                zero_slot(
+                    &mut b,
+                    req_init_slot,
+                    l.required_indices.len() * REQ_COMP_DESC_SIZE,
+                    ptr_ty,
+                );
+                let req_init_sz_v = b.ins().iconst(types::I32, REQ_COMP_DESC_SIZE as i64);
+                let custom_flag_v = b
+                    .ins()
+                    .iconst(types::I32, i64::from(BAM_REQUIRED_FLAG_CUSTOM_BYTES));
                 for (ri, &req_lidx) in l.required_indices.iter().enumerate() {
                     let rh = b.ins().load(
                         types::I32,
@@ -9099,6 +9844,46 @@ fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitError> {
                         req_buf,
                         (ri * structs::BAM_COMPONENT_SIZE) as i32,
                     );
+                    let entry_off = ri * REQ_COMP_DESC_SIZE;
+                    b.ins().store(
+                        MemFlagsData::trusted(),
+                        req_init_sz_v,
+                        req_init_buf,
+                        (entry_off + REQ_COMP_STRUCT_SIZE_OFF) as i32,
+                    );
+                    b.ins().store(
+                        MemFlagsData::trusted(),
+                        rh,
+                        req_init_buf,
+                        (entry_off + REQ_COMP_COMPONENT_OFF) as i32,
+                    );
+                    let req_meta = &ctx.layouts[req_lidx];
+                    if req_meta.size > 0
+                        && ctx.mir_layouts_sorted[req_lidx].is_abi_pod
+                        && let Some(def_bid) = req_meta.default_blob_id
+                    {
+                        let def_gv = ctx.obj_mod.declare_data_in_func(def_bid, b.func);
+                        let def_ptr = b.ins().symbol_value(ptr_ty, def_gv);
+                        let def_sz = b.ins().iconst(ptr_ty, req_meta.size as i64);
+                        b.ins().store(
+                            MemFlagsData::trusted(),
+                            custom_flag_v,
+                            req_init_buf,
+                            (entry_off + REQ_COMP_FLAGS_OFF) as i32,
+                        );
+                        b.ins().store(
+                            MemFlagsData::trusted(),
+                            def_ptr,
+                            req_init_buf,
+                            (entry_off + REQ_COMP_INIT_BYTES_OFF) as i32,
+                        );
+                        b.ins().store(
+                            MemFlagsData::trusted(),
+                            def_sz,
+                            req_init_buf,
+                            (entry_off + REQ_COMP_INIT_SIZE_OFF) as i32,
+                        );
+                    }
                 }
                 let rcnt = b.ins().iconst(ptr_ty, l.required_indices.len() as i64);
                 b.ins().store(
@@ -9112,6 +9897,18 @@ fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitError> {
                     rcnt,
                     cdesc_buf,
                     structs::COMP_REQUIRED_COMPONENT_COUNT as i32,
+                );
+                b.ins().store(
+                    MemFlagsData::trusted(),
+                    req_init_buf,
+                    cdesc_buf,
+                    COMP_REQUIRED_INIT_DESCS_OFF as i32,
+                );
+                b.ins().store(
+                    MemFlagsData::trusted(),
+                    rcnt,
+                    cdesc_buf,
+                    COMP_REQUIRED_INIT_DESC_COUNT_OFF as i32,
                 );
             }
 
@@ -9365,6 +10162,38 @@ fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitError> {
                 .stack_store(ptr_ty, sid, sset_slot, structs::SSET_SCHEDULE as i32);
             b.ins()
                 .stack_store(ptr_ty, nptr, sset_slot, structs::SSET_NAME as i32);
+            if !sset.after_set_indices.is_empty() {
+                let mut valid_cnt = 0usize;
+                for &after_idx in &sset.after_set_indices {
+                    if after_idx < set_idx {
+                        let ah = b.ins().load(
+                            types::I32,
+                            MemFlagsData::trusted(),
+                            state_addr,
+                            ctx.state_layout.set_slot_offset(after_idx) as i32,
+                        );
+                        b.ins().store(
+                            MemFlagsData::trusted(),
+                            ah,
+                            set_edge_ptr,
+                            (valid_cnt * structs::BAM_SYSTEM_SET_SIZE) as i32,
+                        );
+                        valid_cnt += 1;
+                    }
+                }
+                if valid_cnt > 0 {
+                    let acnt = b.ins().iconst(ptr_ty, valid_cnt as i64);
+                    b.ins().stack_store(
+                        ptr_ty,
+                        set_edge_ptr,
+                        sset_slot,
+                        structs::SSET_AFTER_SETS as i32,
+                    );
+                    b.ins()
+                        .stack_store(ptr_ty, acnt, sset_slot, structs::SSET_AFTER_COUNT as i32);
+                }
+            }
+            let _ = max_set_edges;
 
             let _rc = call_vtable(
                 &ctx.obj_mod,
@@ -9377,7 +10206,6 @@ fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitError> {
                 call_conv,
                 &[load_ctx, sset_ptr, out_set],
             );
-            let _ = (set_edge_ptr, max_set_edges);
         }
 
         // Step 6: Register Startup named-object initializer system (if `mir.objects` non-empty).
@@ -9407,7 +10235,9 @@ fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitError> {
                     state_addr,
                     ctx.state_layout.comp_slot_offset(lidx) as i32,
                 );
-                let mode = b.ins().iconst(types::I32, i64::from(AccessMode::READ.0));
+                let mode = b
+                    .ins()
+                    .iconst(types::I32, i64::from(AccessMode::FILTER_ONLY.0));
                 b.ins()
                     .stack_store(ptr_ty, comp, term_slot, structs::TERM_COMPONENT as i32);
                 b.ins()
@@ -9487,10 +10317,12 @@ fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitError> {
             alloc_zero_slot(&mut b, structs::QUERY_DESC_SIZE * SYSTEM_QUERY_CAP, ptr_ty);
         let qdescs_ptr = b.ins().stack_addr(ptr_ty, qdescs_slot, 0);
 
+        let mut mount_ops: Vec<(usize, usize, u32, Vec<usize>)> = Vec::new();
         for sys in &ctx.systems {
+            let sys_slot_idx = cur_sys_slot_idx;
             let sys_out = b.ins().iadd_imm_s(
                 state_addr,
-                ctx.state_layout.sys_slot_offset(cur_sys_slot_idx) as i64,
+                ctx.state_layout.sys_slot_offset(sys_slot_idx) as i64,
             );
             cur_sys_slot_idx += 1;
 
@@ -9560,7 +10392,13 @@ fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitError> {
             // Append hidden lookup queries for `extra_obj_queries` (always added in static order).
             for eq in &sys.extra_obj_queries {
                 if let Some(obj) = ctx.mir.objects.get(eq.obj_idx)
-                    && let Some(cname) = obj.components.first()
+                    && let Some(cname) = obj.components.first().map(String::as_str).or_else(|| {
+                        obj.inits.first().map(|ci| {
+                            ci.canonical_component
+                                .as_deref()
+                                .unwrap_or(ci.component.as_str())
+                        })
+                    })
                     && let Some(lidx) = lookup_name_in_map(&ctx.layout_map, cname)
                 {
                     let cur_q = b.use_var(q_idx_var);
@@ -9579,7 +10417,7 @@ fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitError> {
                         qdescs_ptr,
                         cur_q,
                         lidx,
-                        AccessMode::READ.0,
+                        AccessMode::FILTER_ONLY.0,
                         ptr_ty,
                     );
                     let nxt = b.ins().iadd_imm_s(cur_q, 1);
@@ -9726,6 +10564,16 @@ fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitError> {
                 ptr_ty,
                 ptr_bytes,
             );
+            populate_cstr_ptr_array(
+                &ctx.obj_mod,
+                &mut b,
+                &sys.in_set_names,
+                sdesc_slot,
+                structs::SYS_IN_SETS,
+                structs::SYS_IN_SET_COUNT,
+                ptr_ty,
+                ptr_bytes,
+            );
 
             let rc = call_vtable(
                 &ctx.obj_mod,
@@ -9746,10 +10594,26 @@ fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitError> {
             b.switch_to_block(reg_ok_bb);
             b.seal_block(reg_ok_bb);
 
-            let sys_handle = b
-                .ins()
-                .load(types::I32, MemFlagsData::trusted(), sys_out, 0);
-            for &set_idx in &sys.mount_set_indices {
+            if !sys.mount_set_indices.is_empty() {
+                mount_ops.push((
+                    sys.sched_order,
+                    sys_slot_idx,
+                    sys.schedule_id,
+                    sys.mount_set_indices.clone(),
+                ));
+            }
+        }
+
+        mount_ops.sort_by_key(|&(ord, slot_idx, _, _)| (ord, slot_idx));
+        for (_, sys_slot_idx, schedule_id, set_indices) in mount_ops {
+            let sys_handle = b.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                state_addr,
+                ctx.state_layout.sys_slot_offset(sys_slot_idx) as i32,
+            );
+            let sched_v = b.ins().iconst(types::I32, i64::from(schedule_id));
+            for set_idx in set_indices {
                 let set_h = b.ins().load(
                     types::I32,
                     MemFlagsData::trusted(),
@@ -10458,5 +11322,119 @@ mod tests {
             access_mode_u32(TermAccessMode::StreamWrite),
             AccessMode::MESSAGE_WRITE.0
         );
+        assert_eq!(
+            AccessMode::FILTER_ONLY.0,
+            bamabi_sys::AccessMode::FILTER_ONLY.0
+        );
+    }
+
+    #[test]
+    fn bare_schedule_target_strips_multi_module_prefixes_and_preserves_host() {
+        assert_eq!(
+            bare_schedule_target("genres::metroidvania::MetroidvaniaFrame"),
+            "MetroidvaniaFrame"
+        );
+        assert_eq!(bare_schedule_target("foo::bar"), "bar");
+        assert_eq!(bare_schedule_target("host::PreUpdate"), "host::PreUpdate");
+        assert_eq!(bare_schedule_target("Movement"), "Movement");
+    }
+
+    #[test]
+    fn find_res_access_in_hir_matches_generic_res_call_expression() {
+        let call_expr = HirExpr::Call(HirCall {
+            receiver: None,
+            callee: "res".to_string(),
+            generic_args: vec!["SimClock".to_string()],
+            args: Vec::new(),
+            arg_names: Vec::new(),
+            ty: Ty::Unknown,
+        });
+        let field_expr = HirExpr::Field {
+            base: Box::new(call_expr),
+            field: "hitstop_rem".to_string(),
+            ty: Ty::F32,
+        };
+        assert_eq!(
+            find_res_access_in_hir(&field_expr),
+            Some(("SimClock".to_string(), "hitstop_rem".to_string()))
+        );
+    }
+
+    #[test]
+    fn metroidvania_obj_query_reuse_and_jit_emit_succeed() {
+        let src = include_str!("../../../fixtures/cookbooks/03_metroidvania_core.strata");
+        let analyzed = strata_sema::analyze_source("03_metroidvania_core.strata", src);
+        assert!(
+            analyzed.ok(),
+            "03_metroidvania_core diagnostics: {:?}",
+            analyzed.diagnostics
+        );
+
+        let mir = strata_mir::lower_to_mir(&analyzed);
+        assert!(mir.objects.iter().any(|o| o.name == "PlayerHero"));
+        assert!(
+            mir.functions
+                .iter()
+                .any(|f| f.name == "sample_platformer_inputs")
+        );
+
+        let opts = JitCompileOptions {
+            out_dir: std::env::temp_dir(),
+            module_stem: "test_03_mv".into(),
+            opt_level: JitOptLevel::Speed,
+        };
+        let artifact = emit_pic_object(&mir, &opts).expect("03_metroidvania_core JIT should emit");
+        assert!(!artifact.object_bytes.is_empty());
+    }
+
+    #[test]
+    fn rain_swarm_indexed_spawn_batch_emits_pic_object() {
+        let src = include_str!("../../../fixtures/cookbooks/01_rain_swarm.strata");
+        let analyzed = strata_sema::analyze_source("01_rain_swarm.strata", src);
+        assert!(
+            analyzed.ok(),
+            "01_rain_swarm diagnostics: {:?}",
+            analyzed.diagnostics
+        );
+        let mir = strata_mir::lower_to_mir(&analyzed);
+        let has_spawn_batch_begin = mir.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.stmts
+                    .iter()
+                    .any(|s| matches!(s.inst, Inst::SpawnBatchBegin { .. }))
+            })
+        });
+        assert!(has_spawn_batch_begin);
+        let opts = JitCompileOptions {
+            out_dir: std::env::temp_dir(),
+            module_stem: "test_01_rain".into(),
+            opt_level: JitOptLevel::Speed,
+        };
+        let artifact = emit_pic_object(&mir, &opts).expect("01_rain_swarm JIT should emit");
+        assert!(!artifact.object_bytes.is_empty());
+    }
+
+    #[test]
+    fn subword_field_store_narrowing_emits_cleanly() {
+        assert_eq!(mir_type_from_ty(&Ty::GraceWindow), MirType::F32);
+        let src = r#"
+module test_subword;
+component Flags { count: u8 = 0, pad_u8: u8 = 0, armed: bool = true }
+sys set_count() {
+    for f in query(fl: &mut Flags) {
+        f.fl.count = 1;
+    }
+}
+"#;
+        let analyzed = strata_sema::analyze_source("test_subword.strata", src);
+        assert!(analyzed.ok(), "{:?}", analyzed.diagnostics);
+        let mir = strata_mir::lower_to_mir(&analyzed);
+        let opts = JitCompileOptions {
+            out_dir: std::env::temp_dir(),
+            module_stem: "test_subword".into(),
+            opt_level: JitOptLevel::Speed,
+        };
+        let artifact = emit_pic_object(&mir, &opts).expect("subword JIT should emit");
+        assert!(!artifact.object_bytes.is_empty());
     }
 }
