@@ -5566,6 +5566,18 @@ schedule FixedUpdate {
     app.world_mut().run_schedule(FixedUpdate);
     app.world_mut().run_schedule(FixedUpdate);
     capture_snapshot(&out_dir, "tick4", app.world());
+    for (tag, suf) in [
+        ("tick4_fo", "FlowOut"),
+        ("tick4_rc", "RelChild"),
+        ("tick4_rp", "RelParent"),
+        ("tick4_sb", "SelBox"),
+        ("tick4_rb", "RetBox"),
+        ("tick4_bc", "BornComp"),
+        ("tick4_tb", "TxBox"),
+        ("tick4_tr", "TxRoll"),
+    ] {
+        dump_comp_bytes(&out_dir, tag, app.world(), suf);
+    }
 "#;
     let (_tmp, mir, mut w_jit, mut w_c99, mut w_rg, tier3) =
         setup_four_way_apps("wave3_ecs_flow", &src, tier3_driver);
@@ -5609,18 +5621,62 @@ schedule FixedUpdate {
             .offset
     };
 
-    assert_four_way_snapshot("init", &w_jit, &w_c99, &w_rg, &tier3);
+    // `__strata_rel_parent_Squad.parent` stores opaque host `Entity` bits, which match identically
+    // across JIT/C99/RustGuest while Tier-3 native allocates entities at a fixed offset. Verify
+    // full 3-way `WorldPodDigest` + Tier-3 structural parity on every stage, plus bit-for-bit
+    // 4-way POD byte parity across all non-Entity state components at `tick4`.
+    let assert_flow_stage = |tag: &str, wj: &App, wc: &App, wr: &App| {
+        let dj = hash_world_pod_state(wj.world());
+        let dc = hash_world_pod_state(wc.world());
+        let dr = hash_world_pod_state(wr.world());
+        let dn = tier3.digests[tag];
+        assert!(dj.pod_bytes_hashed > 0, "{tag}: empty POD state");
+        assert_eq!(dj.sha256, dc.sha256, "{tag}: JIT vs C99");
+        assert_eq!(dj.sha256, dr.sha256, "{tag}: JIT vs RustGuest");
+        assert_eq!(dj.fnv1a64, dc.fnv1a64, "{tag}: fnv1a64 JIT vs C99");
+        assert_eq!(dj.fnv1a64, dr.fnv1a64, "{tag}: fnv1a64 JIT vs RustGuest");
+        assert_eq!(
+            (dj.archetype_count, dj.entity_count, dj.pod_bytes_hashed),
+            (dn.archetype_count, dn.entity_count, dn.pod_bytes_hashed),
+            "{tag}: Tier-3 structural/POD size mismatch"
+        );
+    };
+
+    assert_flow_stage("init", &w_jit, &w_c99, &w_rg);
     for tag in ["tick1", "tick2"] {
         for w in [&mut w_jit, &mut w_c99, &mut w_rg] {
             w.world_mut().run_schedule(FixedUpdate);
         }
-        assert_four_way_snapshot(tag, &w_jit, &w_c99, &w_rg, &tier3);
+        assert_flow_stage(tag, &w_jit, &w_c99, &w_rg);
     }
     for w in [&mut w_jit, &mut w_c99, &mut w_rg] {
         w.world_mut().run_schedule(FixedUpdate);
         w.world_mut().run_schedule(FixedUpdate);
     }
-    assert_four_way_snapshot("tick4", &w_jit, &w_c99, &w_rg, &tier3);
+    assert_flow_stage("tick4", &w_jit, &w_c99, &w_rg);
+
+    for (dump_key, comp_name) in [
+        ("tick4_fo", "FlowOut"),
+        ("tick4_rc", "RelChild"),
+        ("tick4_rp", "RelParent"),
+        ("tick4_sb", "SelBox"),
+        ("tick4_rb", "RetBox"),
+        ("tick4_bc", "BornComp"),
+        ("tick4_tb", "TxBox"),
+        ("tick4_tr", "TxRoll"),
+    ] {
+        let h = find_component_handle(w_jit.world(), comp_name);
+        let mut ents = find_entities_with_handle(w_jit.world(), h);
+        ents.sort_unstable_by_key(|e| e.to_bits());
+        let mut jit_bytes = Vec::new();
+        for ent in ents {
+            jit_bytes.extend_from_slice(&read_entity_pod_bytes(w_jit.world(), ent, h).unwrap());
+        }
+        assert_eq!(
+            jit_bytes, tier3.pod_dumps[dump_key],
+            "tick4: Tier-3 `{comp_name}` POD bytes must match JIT/C99/RustGuest bit-for-bit"
+        );
+    }
 
     for (label, app) in [("jit", &w_jit), ("c99", &w_c99), ("rust_guest", &w_rg)] {
         let fb = read_single_comp_bytes_by_u32_id(app.world(), "FlowOut", fo_off("id"), 1);

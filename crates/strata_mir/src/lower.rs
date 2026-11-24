@@ -7493,14 +7493,15 @@ impl<'a> CfgBuilder<'a> {
                     "count" | "any" | "all" | "sum" | "prod" | "min" | "max" => op_lower,
                     _ => entry.op.clone(),
                 };
-                let (id_val, id_ty) = self.lower_expr(&entry.identity);
+                let (raw_id_val, id_ty) = self.lower_expr(&entry.identity);
                 let ty = if norm == "count" {
                     MirType::U32
                 } else if entry.ty != Ty::Unknown && entry.ty != Ty::Unit {
                     mir_ty_from_hir(&entry.ty)
                 } else {
-                    id_ty
+                    id_ty.clone()
                 };
+                let id_val = self.coerce_local_to_ty(raw_id_val, id_ty, &ty);
                 (norm, id_val, ty)
             };
             let init_l = self.alloc_and_emit(
@@ -7679,6 +7680,8 @@ impl<'a> CfgBuilder<'a> {
             };
             let val_l = if *is_pred_1arg && val_ty != MirType::Bool {
                 self.coerce_local_to_ty(val_l, val_ty, &MirType::Bool)
+            } else if !*is_pred_1arg && !matches!(norm_op.as_str(), "count" | "any" | "all") {
+                self.coerce_local_to_ty(val_l, val_ty, ty)
             } else {
                 val_l
             };

@@ -2042,6 +2042,22 @@ fn strata_reduce_accum(acc: &StrataVal, op: &str, val: &StrataVal) -> StrataVal 
     }
 }
 
+fn strata_point_seg_2d_dist_sq(p: [f32; 4], a: [f32; 4], b: [f32; 4], ax0: usize, ax1: usize) -> f32 {
+    let abx = b[ax0] - a[ax0];
+    let aby = b[ax1] - a[ax1];
+    let apx = p[ax0] - a[ax0];
+    let apy = p[ax1] - a[ax1];
+    let len_sq = abx * abx + aby * aby;
+    let t = if len_sq > 1e-12 {
+        ((apx * abx + apy * aby) / len_sq).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let dx = a[ax0] + abx * t - p[ax0];
+    let dy = a[ax1] + aby * t - p[ax1];
+    dx * dx + dy * dy
+}
+
 fn strata_point_seg_dist_sq(p: [f32; 4], a: [f32; 4], b: [f32; 4]) -> f32 {
     let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
     let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
@@ -2134,7 +2150,12 @@ fn strata_query_segment_hits(
             if let Some((cs, ce)) = StrataSpatialGridState::csr_cell_range(&fr.cell_offsets, cell, total) {
                 for k in cs..ce {
                     let p = fr.positions[k];
-                    if strata_point_seg_dist_sq(p, start, end) <= r2 {
+                    let dist_sq = if ax0 != 0 || ax1 != 1 {
+                        strata_point_seg_2d_dist_sq(p, start, end, ax0, ax1)
+                    } else {
+                        strata_point_seg_dist_sq(p, start, end)
+                    };
+                    if dist_sq <= r2 {
                         out.push((fr.entities[k], p));
                         if out.len() >= 64 { return out; }
                     }

@@ -694,32 +694,66 @@ static BAM_UNUSED inline StrataSpatialHits strata_spatial_query_segment_at(
     max_cx = strata_spatial_clamp_cell_coord(max_x, h->bounds_min_x, h->inv_cell_size, h->cols);
     min_cy = strata_spatial_clamp_cell_coord(min_y, h->bounds_min_y, h->inv_cell_size, h->rows);
     max_cy = strata_spatial_clamp_cell_coord(max_y, h->bounds_min_y, h->inv_cell_size, h->rows);
-    ab = strata_vec3_sub(p1, p0);
-    ab_sq = strata_vec3_len_sq(ab);
-    for (cy = min_cy; cy <= max_cy && hits.count < 64u; ++cy) {
-        for (cx = min_cx; cx <= max_cx && hits.count < 64u; ++cx) {
-            uint32_t start = 0u;
-            uint32_t end = 0u;
-            uint32_t cell = (uint32_t)cy * h->cols + (uint32_t)cx;
-            if (strata_spatial_csr_cell_range(off, h->cell_count, cell, total, &start, &end)) {
-                uint32_t k;
-                for (k = start; k < end && hits.count < 64u; ++k) {
-                    StrataVec4 p = h->positions[base + k];
-                    float t = 0.0f;
-                    float dx;
-                    float dy;
-                    float dz;
-                    if (ab_sq > 1e-12f) {
-                        float apx = p.x - p0.x;
-                        float apy = p.y - p0.y;
-                        float apz = p.z - p0.z;
-                        t = strata_clamp_f32((apx * ab.x + apy * ab.y + apz * ab.z) / ab_sq, 0.0f, 1.0f);
+    if (h->plane_ax0 != 0u || h->plane_ax1 != 1u) {
+        float abx = b0 - a0;
+        float aby = b1 - a1;
+        float ab2d_sq = abx * abx + aby * aby;
+        for (cy = min_cy; cy <= max_cy && hits.count < 64u; ++cy) {
+            for (cx = min_cx; cx <= max_cx && hits.count < 64u; ++cx) {
+                uint32_t start = 0u;
+                uint32_t end = 0u;
+                uint32_t cell = (uint32_t)cy * h->cols + (uint32_t)cx;
+                if (strata_spatial_csr_cell_range(off, h->cell_count, cell, total, &start, &end)) {
+                    uint32_t k;
+                    for (k = start; k < end && hits.count < 64u; ++k) {
+                        StrataVec4 p = h->positions[base + k];
+                        float px = strata_spatial_axis4(p, h->plane_ax0);
+                        float py = strata_spatial_axis4(p, h->plane_ax1);
+                        float t = 0.0f;
+                        float dx;
+                        float dy;
+                        if (ab2d_sq > 1e-12f) {
+                            float apx = px - a0;
+                            float apy = py - a1;
+                            t = strata_clamp_f32((apx * abx + apy * aby) / ab2d_sq, 0.0f, 1.0f);
+                        }
+                        dx = a0 + abx * t - px;
+                        dy = a1 + aby * t - py;
+                        if (dx * dx + dy * dy <= r2) {
+                            hits.entities[hits.count++] = h->entities[base + k];
+                        }
                     }
-                    dx = p0.x + ab.x * t - p.x;
-                    dy = p0.y + ab.y * t - p.y;
-                    dz = p0.z + ab.z * t - p.z;
-                    if (dx * dx + dy * dy + dz * dz <= r2) {
-                        hits.entities[hits.count++] = h->entities[base + k];
+                }
+            }
+        }
+    } else {
+        ab = strata_vec3_sub(p1, p0);
+        ab_sq = strata_vec3_len_sq(ab);
+        for (cy = min_cy; cy <= max_cy && hits.count < 64u; ++cy) {
+            for (cx = min_cx; cx <= max_cx && hits.count < 64u; ++cx) {
+                uint32_t start = 0u;
+                uint32_t end = 0u;
+                uint32_t cell = (uint32_t)cy * h->cols + (uint32_t)cx;
+                if (strata_spatial_csr_cell_range(off, h->cell_count, cell, total, &start, &end)) {
+                    uint32_t k;
+                    for (k = start; k < end && hits.count < 64u; ++k) {
+                        StrataVec4 p = h->positions[base + k];
+                        float t = 0.0f;
+                        float dx;
+                        float dy;
+                        float dz;
+                        if (ab_sq > 1e-12f) {
+                            float apx = p.x - p0.x;
+                            float apy = p.y - p0.y;
+                            float apz = p.z - p0.z;
+                            t = strata_clamp_f32((apx * ab.x + apy * ab.y + apz * ab.z) / ab_sq, 0.0f, 1.0f);
+                        }
+                        dx = p0.x + ab.x * t - p.x;
+                        dy = p0.y + ab.y * t - p.y;
+                        dz = p0.z + ab.z * t - p.z;
+                        if (dx * dx + dy * dy + dz * dz <= r2) {
+                            hits.entities[hits.count++] = h->entities[base + k];
+                        }
                     }
                 }
             }

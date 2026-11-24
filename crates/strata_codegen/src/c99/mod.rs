@@ -1171,7 +1171,7 @@ impl<'a> EmitCtx<'a> {
                         .or_else(|| sys_sched_order.get(&f.name))
                         .copied()
                         .unwrap_or(usize::MAX);
-                    let run_if_fn = self.schedule_run_if_for(sched_label, fn_idx);
+                    let run_if_fn = self.schedule_run_if_for(sched_label, &f.name, &f.kind, fn_idx);
                     let run_if_resources = run_if_fn
                         .as_ref()
                         .map(|(_, r)| r.clone())
@@ -1224,13 +1224,34 @@ impl<'a> EmitCtx<'a> {
     fn schedule_run_if_for(
         &mut self,
         sched_label: &str,
+        fn_name: &str,
+        fn_kind: &MirFnKind,
         sys_idx: usize,
     ) -> Option<(String, Vec<usize>)> {
+        let is_synth = matches!(
+            fn_kind,
+            MirFnKind::SynthesizedTimeline
+                | MirFnKind::SynthesizedTask
+                | MirFnKind::SynthesizedFsm
+                | MirFnKind::SynthesizedSpatialCsr
+                | MirFnKind::SynthesizedTimerTick
+        );
         let sched = self
             .mir
             .schedules
             .iter()
-            .find(|s| s.label.eq_ignore_ascii_case(sched_label))?;
+            .find(|s| {
+                s.label.eq_ignore_ascii_case(sched_label)
+                    && c99_schedule_nodes_contain(&s.nodes, fn_name)
+            })
+            .or_else(|| {
+                is_synth.then(|| {
+                    self.mir
+                        .schedules
+                        .iter()
+                        .find(|s| s.label.eq_ignore_ascii_case(sched_label))
+                })?
+            })?;
         let cond_expr = sched.run_if.as_deref()?;
         let mut res_indices = Vec::new();
         for c in &self.components {
@@ -4305,6 +4326,14 @@ fn approx_mir_size_align(ty: &MirType) -> (u32, u32) {
             (sz.saturating_mul(*len as u32), al)
         }
     }
+}
+
+fn c99_schedule_nodes_contain(nodes: &[HirScheduleGroup], fn_name: &str) -> bool {
+    let fshort = short_name(fn_name);
+    nodes.iter().any(|n| {
+        (n.kind == "leaf" && (n.name == fn_name || short_name(&n.name) == fshort))
+            || c99_schedule_nodes_contain(&n.children, fn_name)
+    })
 }
 
 fn c_schedule_const(label: &str) -> &'static str {

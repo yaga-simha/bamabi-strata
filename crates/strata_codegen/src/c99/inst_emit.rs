@@ -2327,6 +2327,18 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                             let _ = writeln!(s, "    {ae} = ({ae}) * ({ve});");
                         }
                     },
+                    "any" | "Any" | "||" => {
+                        let _ = writeln!(s, "    {ae} = (({ae}) != 0 || ({ve}) != 0) ? 1u : 0u;");
+                    }
+                    "all" | "All" | "&&" => {
+                        let _ = writeln!(s, "    {ae} = (({ae}) != 0 && ({ve}) != 0) ? 1u : 0u;");
+                    }
+                    "count" | "Count" => {
+                        let _ = writeln!(
+                            s,
+                            "    {ae} = (uint32_t)({ae}) + ((({ve}) != 0) ? 1u : 0u);"
+                        );
+                    }
                     _ => match aty {
                         MirType::Vec2 => {
                             let _ = writeln!(s, "    {ae} = strata_vec2_add({ae}, {ve});");
