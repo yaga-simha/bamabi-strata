@@ -3,7 +3,7 @@
 
 use crate::ir::{
     BlockId, Inst, LocalId, MirFnKind, MirFunction, MirModule, MirQueryBinding,
-    MirQueryTermBinding, MirType, Terminator,
+    MirQueryTermBinding, MirStmt, MirType, Terminator,
 };
 use crate::lower::{CfgBuilder, MirLowerCtx, TermAccessBinding, VarSlot};
 use std::collections::{HashMap, HashSet};
@@ -749,6 +749,7 @@ pub fn run(module: &mut MirModule) {
             layout_key: task.state_layout.canonical_name.clone(),
             row_inc,
             loop_targets: Vec::new(),
+            alloc_bb: dispatch_bb,
         };
         b.switch_to(state0_bb);
         lower_task_stmts(&mut b, &mut tctx, &exec_stmts);
@@ -1307,6 +1308,7 @@ struct TaskLowerCtx {
     layout_key: String,
     row_inc: BlockId,
     loop_targets: Vec<(BlockId, BlockId)>,
+    alloc_bb: BlockId,
 }
 
 impl TaskLowerCtx {
@@ -1876,11 +1878,13 @@ fn lower_task_stmts(b: &mut CfgBuilder<'_>, tctx: &mut TaskLowerCtx, stmts: &[Hi
             HirStmt::Race { branches } => {
                 let (race_pc, race_bb) = tctx.alloc_state(b, "task_race");
                 let (after_pc, after_bb) = tctx.alloc_state(b, "task_race_after");
-                let race_timer_slot = b.alloc_and_emit(
-                    &format!("race_tmr_{race_pc}"),
-                    MirType::MutPtr,
-                    Inst::SlotAlloc { ty: MirType::F32 },
-                );
+                let race_timer_slot = b
+                    .func
+                    .alloc_local(&format!("race_tmr_{race_pc}"), MirType::MutPtr);
+                b.func.blocks[tctx.alloc_bb.0 as usize].stmts.push(MirStmt {
+                    dst: Some(race_timer_slot),
+                    inst: Inst::SlotAlloc { ty: MirType::F32 },
+                });
                 let race_check_bb = b.new_block(&format!("race_chk_{race_pc}"));
                 let miss_bb = b.new_block(&format!("race_miss_{race_pc}"));
 

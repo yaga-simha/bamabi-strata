@@ -474,11 +474,20 @@ pub(super) fn collect_guest_fn_const_info(
                                 slot_table_ptrs.insert(*slot, tp);
                                 changed = true;
                             }
-                            if let Some(t) = ptr_sema_tys.get(val).cloned()
-                                && slot_ptr_tys.get(slot) != Some(&t)
-                            {
-                                slot_ptr_tys.insert(*slot, t);
+                            let slot_tp = (*slot, String::new());
+                            if table_ptrs.get(slot) != Some(&slot_tp) {
+                                table_ptrs.insert(*slot, slot_tp);
                                 changed = true;
+                            }
+                            if let Some(t) = ptr_sema_tys.get(val).cloned() {
+                                if slot_ptr_tys.get(slot) != Some(&t) {
+                                    slot_ptr_tys.insert(*slot, t.clone());
+                                    changed = true;
+                                }
+                                if ptr_sema_tys.get(slot) != Some(&t) {
+                                    ptr_sema_tys.insert(*slot, t);
+                                    changed = true;
+                                }
                             }
                         }
                     }

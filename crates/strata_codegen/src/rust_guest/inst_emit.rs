@@ -2,6 +2,53 @@
 
 use super::*;
 
+/// Builds the Rust expression initializing a default `StrataVal` for a stack slot of `ty`.
+fn guest_slot_default_expr(ty: &MirType, mir: &MirModule, cat: &GuestCatalog) -> String {
+    match ty {
+        MirType::Named(n) => {
+            if let Some(rc) = cat.resolve_comp(n) {
+                format!(
+                    "StrataVal::Obj(StrataObj::{}({}::default()))",
+                    rc.variant_name, rc.struct_name
+                )
+            } else if let Some(bits) = n
+                .strip_prefix("BitSet<")
+                .and_then(|s| s.strip_suffix('>'))
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                format!("StrataVal::Words(vec![0u32; {}])", bits.div_ceil(32).max(1))
+            } else if n.starts_with("InlineStr<") {
+                "StrataVal::Str(String::new())".to_owned()
+            } else if n == "mat3" || n == "Mat3" {
+                "StrataVal::Arr(vec![StrataVal::F32(0.0); 9])".to_owned()
+            } else if n == "mat4" || n == "Mat4" {
+                "StrataVal::Arr(vec![StrataVal::F32(0.0); 16])".to_owned()
+            } else if let Some(sty) = mir_ty_to_guest_ty_hint(ty, mir) {
+                let (sz, _) = guest_ty_abi_size_align(&sty, mir);
+                format!("StrataVal::Bytes(vec![0u8; {}])", sz.max(1))
+            } else {
+                default_strata_val_for_mir_ty(ty).to_owned()
+            }
+        }
+        MirType::Array { .. } => {
+            let sz = if let Some(sty) = mir_ty_to_guest_ty_hint(ty, mir) {
+                guest_ty_abi_size_align(&sty, mir).0
+            } else {
+                guest_mir_elem_byte_size(ty, cat)
+            };
+            format!("StrataVal::Bytes(vec![0u8; {}])", sz.max(1))
+        }
+        MirType::Tuple(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .map(|it| default_strata_val_for_mir_ty(it).to_owned())
+                .collect();
+            format!("StrataVal::Tuple(vec![{}])", parts.join(", "))
+        }
+        _ => default_strata_val_for_mir_ty(ty).to_owned(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_cfg_body(
     out: &mut String,
@@ -82,6 +129,35 @@ pub(super) fn emit_cfg_body(
     }
 
     let const_info = collect_guest_fn_const_info(func, mir, cat);
+
+    let mut def_counts: HashMap<u32, usize> = HashMap::new();
+    for p in &func.params {
+        if let Some(lid) = p.local {
+            *def_counts.entry(lid.0).or_insert(0) += 1;
+        }
+    }
+    let mut single_slot_allocs: Vec<(u32, MirType)> = Vec::new();
+    for bb in &func.blocks {
+        for st in &bb.stmts {
+            if let Some(d) = st.dst {
+                *def_counts.entry(d.0).or_insert(0) += 1;
+                if let Inst::SlotAlloc { ty } = &st.inst {
+                    single_slot_allocs.push((d.0, ty.clone()));
+                }
+            }
+        }
+    }
+    for (sid, ty) in single_slot_allocs {
+        if def_counts.get(&sid) == Some(&1) {
+            let def = guest_slot_default_expr(&ty, mir, cat);
+            writeln!(
+                out,
+                "    slots[{sid}] = {def};\n\
+                 \x20   locals[{sid}] = StrataVal::Ptr(StrataPtr::Slot {{ sid: {sid}, off: 0 }});"
+            )
+            .ok();
+        }
+    }
 
     let fast_loops = if migrate_vars.is_none()
         && observer_vars.is_none()
@@ -398,49 +474,7 @@ pub(super) fn emit_inst(
         }
         Inst::SlotAlloc { ty } => {
             if let Some(dst) = stmt.dst {
-                let def = match ty {
-                    MirType::Named(n) => {
-                        if let Some(rc) = cat.resolve_comp(n) {
-                            format!(
-                                "StrataVal::Obj(StrataObj::{}({}::default()))",
-                                rc.variant_name, rc.struct_name
-                            )
-                        } else if let Some(bits) = n
-                            .strip_prefix("BitSet<")
-                            .and_then(|s| s.strip_suffix('>'))
-                            .and_then(|s| s.parse::<usize>().ok())
-                        {
-                            format!("StrataVal::Words(vec![0u32; {}])", bits.div_ceil(32).max(1))
-                        } else if n.starts_with("InlineStr<") {
-                            "StrataVal::Str(String::new())".to_owned()
-                        } else if n == "mat3" || n == "Mat3" {
-                            "StrataVal::Arr(vec![StrataVal::F32(0.0); 9])".to_owned()
-                        } else if n == "mat4" || n == "Mat4" {
-                            "StrataVal::Arr(vec![StrataVal::F32(0.0); 16])".to_owned()
-                        } else if let Some(sty) = mir_ty_to_guest_ty_hint(ty, mir) {
-                            let (sz, _) = guest_ty_abi_size_align(&sty, mir);
-                            format!("StrataVal::Bytes(vec![0u8; {}])", sz.max(1))
-                        } else {
-                            default_strata_val_for_mir_ty(ty).to_owned()
-                        }
-                    }
-                    MirType::Array { .. } => {
-                        let sz = if let Some(sty) = mir_ty_to_guest_ty_hint(ty, mir) {
-                            guest_ty_abi_size_align(&sty, mir).0
-                        } else {
-                            guest_mir_elem_byte_size(ty, cat)
-                        };
-                        format!("StrataVal::Bytes(vec![0u8; {}])", sz.max(1))
-                    }
-                    MirType::Tuple(items) => {
-                        let parts: Vec<String> = items
-                            .iter()
-                            .map(|it| default_strata_val_for_mir_ty(it).to_owned())
-                            .collect();
-                        format!("StrataVal::Tuple(vec![{}])", parts.join(", "))
-                    }
-                    _ => default_strata_val_for_mir_ty(ty).to_owned(),
-                };
+                let def = guest_slot_default_expr(ty, mir, cat);
                 writeln!(
                     out,
                     "                slots[{d}] = {def};\n\

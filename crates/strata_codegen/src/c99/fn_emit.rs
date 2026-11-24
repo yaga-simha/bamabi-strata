@@ -1050,7 +1050,11 @@ impl<'a> EmitCtx<'a> {
                     let _ = writeln!(s, "    (void)col_{lid};");
                 } else if let Some(pk) = ptr_meta.get(&local.id) {
                     let cty = pk.c_type(&self.layout_c_names);
-                    if live_slot_set.contains(&lid) {
+                    if live_slot_set.contains(&lid)
+                        || (slot_alloc_map.contains_key(&local.id)
+                            && info.allocs_inside.contains(&lid)
+                            && def_counts.get(&local.id) == Some(&1))
+                    {
                         let _ = writeln!(s, "    {cty} v_{lid} = ({cty})&slot_buf_{lid};");
                     } else {
                         let _ = writeln!(s, "    {cty} v_{lid} = NULL;");
@@ -1273,7 +1277,11 @@ impl<'a> EmitCtx<'a> {
                 let _ = writeln!(s, "    (void)col_{lid};");
             } else if let Some(pk) = ptr_meta.get(&local.id) {
                 let cty = pk.c_type(&self.layout_c_names);
-                let _ = writeln!(s, "    {cty} v_{lid} = NULL;");
+                if slot_alloc_map.contains_key(&local.id) && def_counts.get(&local.id) == Some(&1) {
+                    let _ = writeln!(s, "    {cty} v_{lid} = ({cty})&slot_buf_{lid};");
+                } else {
+                    let _ = writeln!(s, "    {cty} v_{lid} = NULL;");
+                }
                 let _ = writeln!(s, "    (void)v_{lid};");
             } else {
                 let eff_ty = local_types.get(&local.id).unwrap_or(&local.ty);
