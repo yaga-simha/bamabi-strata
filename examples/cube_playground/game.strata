@@ -1,0 +1,329 @@
+// =========================================================================
+// Strata 3D Cube Playground (game.strata)
+//
+// Strata owns the ENTIRE 3D scene, procedural geometry, and 60 Hz simulation:
+//   - Procedural 6-face cube mesh (24 vertices, 24 normals, 24 UVs, 36 indices)
+//   - Procedural floor quad (4 vertices, 6 indices)
+//   - Camera, lighting, PBR material, and 60 Hz FixedUpdate animation
+//
+// The Rust host has ZERO shape or game logic: it just uploads raw vertex/index
+// buffers from `component Mesh` into Bevy's GPU mesh buffers and hot-reloads
+// this file whenever you press Cmd+S in Zed.
+// =========================================================================
+module demo::cube @version(1.0.0);
+
+// --- Tweakable Parameters (Edit in Zed & press Cmd+S to hot-reload live!) ---
+const CUBE_HALF_EXTENTS : vec3 = vec3(0.5, 0.5, 0.5);
+const FLOOR_HALF_EXTENT : f32 = 6.0;
+
+const BASE_POSITION : vec3 = vec3(0.0, 1.35, 0.0);
+const ORBIT_RADIUS : f32 = 0.75;
+const ORBIT_SPEED : f32 = 1.40;
+const BOB_AMPLITUDE : f32 = 0.28;
+const BOB_SPEED : f32 = 2.60;
+
+const SPIN_SPEED : vec3 = vec3(0.65, 1.35, 0.35);
+
+const BASE_SCALE : vec3 = vec3(1.0, 1.0, 1.0);
+const PULSE_AMPLITUDE : f32 = 0.16;
+const PULSE_SPEED : f32 = 3.20;
+
+const COLOR_A : vec3 = vec3(0.18, 0.76, 1.00);
+const COLOR_B : vec3 = vec3(1.00, 0.36, 0.62);
+const COLOR_SPEED : f32 = 1.80;
+const METALLIC : f32 = 0.35;
+const ROUGHNESS : f32 = 0.25;
+const EMISSIVE_STRENGTH : f32 = 0.35;
+
+resource Clock {
+    dt : sec = 16.6667_ms,
+    elapsed : f32 = 0.0,
+}
+
+// --- Generic Shape-Agnostic Scene Components ---
+component Position { xyz : vec3 = vec3::ZERO }
+component Rotation { euler : vec3 = vec3::ZERO }
+component Scale { xyz : vec3 = vec3::ONE }
+
+// Procedural triangle-list geometry buffers built 100% in Strata.
+// Host Rust reads `positions`, `normals`, `uvs`, and `indices` generically
+// without knowing anything about cubes, planes, or primitives.
+component Mesh {
+    positions : [vec3; 24],
+    normals : [vec3; 24],
+    uvs : [vec2; 24],
+    indices : [u32; 36],
+    vertex_count : u32 = 0,
+    index_count : u32 = 0,
+    revision : u32 = 0,
+}
+
+component Material {
+    base_color : rgba = rgba(1.0, 1.0, 1.0, 1.0),
+    metallic : f32 = 0.0,
+    roughness : f32 = 0.5,
+    emissive : rgba = rgba(0.0, 0.0, 0.0, 1.0),
+}
+component Camera {
+    look_at : vec3 = vec3::ZERO,
+    fov_deg : f32 = 45.0,
+    clear_color : rgba = rgba(0.04, 0.05, 0.08, 1.0),
+}
+component PointLight {
+    color : rgba = rgba(1.0, 1.0, 1.0, 1.0),
+    intensity : f32 = 1500000.0,
+    shadows : bool = true,
+}
+component Cube;
+component Floor;
+
+// --- Pure Strata Procedural Mesh Builders ---
+fn push_quad(m : &mut Mesh, p0 : vec3, p1 : vec3, p2 : vec3, p3 : vec3, n : vec3) {
+    let v = m.vertex_count;
+    let idx = m.index_count;
+
+    m.positions[v] = p0;
+    m.positions[v + 1_u32] = p1;
+    m.positions[v + 2_u32] = p2;
+    m.positions[v + 3_u32] = p3;
+
+    m.normals[v] = n;
+    m.normals[v + 1_u32] = n;
+    m.normals[v + 2_u32] = n;
+    m.normals[v + 3_u32] = n;
+
+    m.uvs[v] = vec2(0.0, 0.0);
+    m.uvs[v + 1_u32] = vec2(1.0, 0.0);
+    m.uvs[v + 2_u32] = vec2(1.0, 1.0);
+    m.uvs[v + 3_u32] = vec2(0.0, 1.0);
+
+    m.indices[idx] = v;
+    m.indices[idx + 1_u32] = v + 1_u32;
+    m.indices[idx + 2_u32] = v + 2_u32;
+    m.indices[idx + 3_u32] = v;
+    m.indices[idx + 4_u32] = v + 2_u32;
+    m.indices[idx + 5_u32] = v + 3_u32;
+
+    m.vertex_count = v + 4_u32;
+    m.index_count = idx + 6_u32;
+}
+
+fn build_cube_mesh(m : &mut Mesh, half : vec3) {
+    m.vertex_count = 0_u32;
+    m.index_count = 0_u32;
+
+    let hx = half.x;
+    let hy = half.y;
+    let hz = half.z;
+
+    let c001 = vec3(-hx, -hy, hz);
+    let c101 = vec3(hx, -hy, hz);
+    let c111 = vec3(hx, hy, hz);
+    let c011 = vec3(-hx, hy, hz);
+
+    let c000 = vec3(-hx, -hy, -hz);
+    let c100 = vec3(hx, -hy, -hz);
+    let c110 = vec3(hx, hy, -hz);
+    let c010 = vec3(-hx, hy, -hz);
+
+    // +Z (front)
+    push_quad(m, c001, c101, c111, c011, vec3(0.0, 0.0, 1.0));
+    // -Z (back)
+    push_quad(m, c100, c000, c010, c110, vec3(0.0, 0.0, -1.0));
+    // +X (right)
+    push_quad(m, c101, c100, c110, c111, vec3(1.0, 0.0, 0.0));
+    // -X (left)
+    push_quad(m, c000, c001, c011, c010, vec3(-1.0, 0.0, 0.0));
+    // +Y (top)
+    push_quad(m, c011, c111, c110, c010, vec3(0.0, 1.0, 0.0));
+    // -Y (bottom)
+    push_quad(m, c000, c100, c101, c001, vec3(0.0, -1.0, 0.0));
+
+    m.revision += 1_u32;
+}
+
+fn build_plane_mesh(m : &mut Mesh, half_x : f32, half_z : f32) {
+    m.vertex_count = 0_u32;
+    m.index_count = 0_u32;
+
+    push_quad(
+        m,
+        vec3(-half_x, 0.0, half_z),
+        vec3(half_x, 0.0, half_z),
+        vec3(half_x, 0.0, -half_z),
+        vec3(-half_x, 0.0, -half_z),
+        vec3(0.0, 1.0, 0.0),
+    );
+
+    m.revision += 1_u32;
+}
+
+// --- Startup: Strata spawns Camera, Lights, Floor, and Hero Cube ---
+sys spawn_scene() effects(spawns : [Camera, PointLight, Mesh, Material, Position, Rotation, Scale, Cube, Floor]) {
+    // 3D Camera
+    spawn {
+        Camera {
+            look_at : vec3(0.0, 1.0, 0.0),
+            fov_deg : 45.0,
+            clear_color : rgba(0.035, 0.043, 0.072, 1.0),
+        },
+        Position { xyz : vec3(3.8, 3.0, 4.8) },
+    };
+
+    // Warm key light (with shadows) + cool fill light
+    spawn {
+        PointLight {
+            color : rgba(1.0, 0.96, 0.90, 1.0),
+            intensity : 2200000.0,
+            shadows : true,
+        },
+        Position { xyz : vec3(4.0, 6.5, 4.0) },
+    };
+    spawn {
+        PointLight {
+            color : rgba(0.45, 0.72, 1.0, 1.0),
+            intensity : 750000.0,
+            shadows : false,
+        },
+        Position { xyz : vec3(-4.5, 3.0, -3.5) },
+    };
+
+    // Studio floor quad (mesh vertices & indices generated by `build_plane_mesh`)
+    spawn {
+        Floor { },
+        Mesh { },
+        Material {
+            base_color : rgba(0.08, 0.10, 0.15, 1.0),
+            metallic : 0.05,
+            roughness : 0.85,
+            emissive : rgba(0.0, 0.0, 0.0, 1.0),
+        },
+        Position { xyz : vec3::ZERO },
+    };
+
+    // Hero Cube (mesh vertices, normals, UVs & indices generated by `build_cube_mesh`)
+    spawn {
+        Cube { },
+        Mesh { },
+        Material {
+            base_color : rgba(COLOR_A.x, COLOR_A.y, COLOR_A.z, 1.0),
+            metallic : METALLIC,
+            roughness : ROUGHNESS,
+            emissive : rgba(COLOR_A.x * EMISSIVE_STRENGTH, COLOR_A.y * EMISSIVE_STRENGTH, COLOR_A.z * EMISSIVE_STRENGTH, 1.0),
+        },
+        Position { xyz : BASE_POSITION },
+        Rotation { euler : vec3::ZERO },
+        Scale { xyz : BASE_SCALE },
+    };
+}
+
+// --- Mesh Population: Builds raw triangle buffers on first frame or hot-reload ---
+sys build_cube_meshes() effects(writes : [Mesh], reads : [Cube]) {
+    for c in query(m : &mut?Mesh).with<Cube>() {
+        if c.m.revision == 0_u32 {
+            build_cube_mesh(c.m, CUBE_HALF_EXTENTS);
+        }
+    }
+}
+
+sys build_floor_meshes() effects(writes : [Mesh], reads : [Floor]) {
+    for f in query(m : &mut?Mesh).with<Floor>() {
+        if f.m.revision == 0_u32 {
+            build_plane_mesh(f.m, FLOOR_HALF_EXTENT, FLOOR_HALF_EXTENT);
+        }
+    }
+}
+
+sys ensure_cube_mesh_fixed() effects(writes : [Mesh], reads : [Cube]) {
+    for c in query(m : &mut?Mesh).with<Cube>() {
+        if c.m.revision == 0_u32 {
+            build_cube_mesh(c.m, CUBE_HALF_EXTENTS);
+        }
+    }
+}
+
+sys ensure_floor_mesh_fixed() effects(writes : [Mesh], reads : [Floor]) {
+    for f in query(m : &mut?Mesh).with<Floor>() {
+        if f.m.revision == 0_u32 {
+            build_plane_mesh(f.m, FLOOR_HALF_EXTENT, FLOOR_HALF_EXTENT);
+        }
+    }
+}
+
+// --- FixedUpdate (60 Hz): Update position, rotation, scale, and PBR material ---
+sys update_cube(clk : &mut res Clock) effects(writes : [Clock, Position, Rotation, Scale, Material], reads : [Cube]) {
+    uniform let dt = clk.dt.as_secs();
+    clk.elapsed += dt;
+    uniform let t = clk.elapsed;
+
+    for c in query(
+        pos : &mut Position.xyz,
+        rot : &mut Rotation.euler,
+        scale : &mut Scale.xyz,
+        mat : &mut Material,
+    ).with<Cube>() {
+        // Position: smooth circular orbit + vertical hover bob
+        c.pos = vec3(
+            BASE_POSITION.x + cos(t * ORBIT_SPEED) * ORBIT_RADIUS,
+            BASE_POSITION.y + sin(t * BOB_SPEED) * BOB_AMPLITUDE,
+            BASE_POSITION.z + sin(t * ORBIT_SPEED) * ORBIT_RADIUS,
+        );
+
+        // Rotation: continuous Euler spin (radians: pitch, yaw, roll)
+        c.rot += SPIN_SPEED * dt;
+
+        // Scale: breathing squash-and-stretch pulse
+        let pulse = 1.0 + sin(t * PULSE_SPEED) * PULSE_AMPLITUDE;
+        c.scale = vec3(
+            BASE_SCALE.x * pulse,
+            BASE_SCALE.y / sqrt(max(pulse, 0.1)),
+            BASE_SCALE.z * pulse,
+        );
+
+        // Material: smooth gradient blend + subtle emissive glow
+        let blend = 0.5 + 0.5 * sin(t * COLOR_SPEED);
+        let rgb = lerp(COLOR_A, COLOR_B, blend);
+        c.mat.base_color = rgba(rgb.x, rgb.y, rgb.z, 1.0);
+        c.mat.metallic = METALLIC;
+        c.mat.roughness = ROUGHNESS;
+        c.mat.emissive = rgba(
+            rgb.x * EMISSIVE_STRENGTH,
+            rgb.y * EMISSIVE_STRENGTH,
+            rgb.z * EMISSIVE_STRENGTH,
+            1.0,
+        );
+    }
+}
+
+schedule Startup { spawn_scene }
+schedule Update { build_cube_meshes, build_floor_meshes }
+schedule FixedUpdate { ensure_cube_mesh_fixed, ensure_floor_mesh_fixed, update_cube }
+
+// --- Embedded Deterministic 60 Hz Simulation Test ---
+sim_test "cube_updates_at_60hz" {
+    step_fixed(60);
+
+    let elapsed = res<Clock>().elapsed;
+    assert(elapsed > 0.99);
+    assert(elapsed < 1.01);
+
+    let mut found_cubes = 0_u32;
+    for c in query(m : &Mesh, pos : &Position.xyz, rot : &Rotation.euler, scale : &Scale.xyz).with<Cube>() {
+        found_cubes += 1_u32;
+        assert_eq(c.m.vertex_count, 24_u32);
+        assert_eq(c.m.index_count, 36_u32);
+        assert(c.m.revision >= 1_u32);
+        assert(c.rot.y > 1.30);
+        assert(c.pos.y > 0.0);
+        assert(c.scale.x > 0.5);
+    }
+    assert_eq(found_cubes, 1_u32);
+
+    let mut found_floors = 0_u32;
+    for f in query(m : &Mesh).with<Floor>() {
+        found_floors += 1_u32;
+        assert_eq(f.m.vertex_count, 4_u32);
+        assert_eq(f.m.index_count, 6_u32);
+    }
+    assert_eq(found_floors, 1_u32);
+}

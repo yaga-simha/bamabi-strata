@@ -1,0 +1,17 @@
+{
+  "lsp": {
+    "strata-lsp": {
+      "settings": {
+        "telemetryEndpoint": "tcp://127.0.0.1:15703"
+      }
+    }
+  },
+  "languages": {
+    "Strata": {
+      "format_on_save": "on",
+      "inlay_hints": {
+        "enabled": true
+      }
+    }
+  }
+}

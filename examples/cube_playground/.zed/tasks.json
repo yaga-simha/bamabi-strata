@@ -1,0 +1,47 @@
+[
+  {
+    "label": "Launch Default Scene (Live Hot-Reload)",
+    "command": "cargo",
+    "args": ["run", "--release"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Run Headless Bevy + Hot-Reload Tests",
+    "command": "cargo",
+    "args": ["test", "--release"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Strata: Check game.strata",
+    "command": "stratac",
+    "args": ["check", "game.strata"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "Strata: Test game.strata",
+    "command": "stratac",
+    "args": ["test", "game.strata"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "Strata: Inspect AbiPod Layouts",
+    "command": "stratac",
+    "args": ["layout", "game.strata"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  }
+]

@@ -1,0 +1,39 @@
+[package]
+name = "strata_cube_playground"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Lean Bevy + StrataPlugin single-script 3D cube playground with 60 Hz live hot-reload"
+
+[dependencies]
+bevy = { version = "0.20.1", features = ["bevy_remote"] }
+bamabi = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi.git", branch = "main", features = ["preset-3d", "preset-ui", "sub-app-extract", "bridge-reflect", "diagnostics"] }
+bamabi_host = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-core.git", branch = "main" }
+bamabi_sys = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+strata_sema = { path = "../../crates/strata_sema" }
+strata_mir = { path = "../../crates/strata_mir" }
+strata_jit = { path = "../../crates/strata_jit" }
+strata_codegen = { path = "../../crates/strata_codegen" }
+notify-debouncer-full = "0.7"
+tempfile = "3"
+
+# Isolated workspace so root `bamabi-strata` `Cargo.toml` and `Cargo.lock` stay untouched.
+[workspace]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+improper_ctypes_definitions = "deny"
+unreachable_pub = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+ptr_as_ptr = "warn"
+cast_ptr_alignment = "warn"
+transmute_ptr_to_ptr = "warn"
+needless_pass_by_ref_mut = "warn"
+redundant_clone = "warn"
+match_same_arms = "warn"
