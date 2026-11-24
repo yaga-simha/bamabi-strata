@@ -259,6 +259,29 @@ fn parse_uuid_value(v: &Value) -> Option<u128> {
         {
             return u128::from_str_radix(hex, 16).ok();
         }
+        if trimmed.contains('-') {
+            let parts: Vec<&str> = trimmed.split('-').collect();
+            if parts.len() == 5
+                && [8, 4, 4, 4, 12]
+                    .iter()
+                    .zip(parts.iter())
+                    .all(|(len, part)| {
+                        part.len() == *len && part.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+            {
+                let hex: String = parts.concat();
+                return u128::from_str_radix(&hex, 16).ok();
+            }
+            return None;
+        }
+        if trimmed.len() == 32
+            && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+            && trimmed
+                .bytes()
+                .any(|b| matches!(b, b'a'..=b'f' | b'A'..=b'F'))
+        {
+            return u128::from_str_radix(trimmed, 16).ok();
+        }
         return trimmed.parse::<u128>().ok();
     }
     None
@@ -291,7 +314,12 @@ fn parse_schema_array(arr: &[Value]) -> Result<Vec<BrpSchemaEntry>, TelemetryErr
             .and_then(|v| v.as_u64())
             .and_then(|n| u16::try_from(n).ok())
             .unwrap_or(0);
-        let uuid = obj.get("uuid").and_then(parse_uuid_value).unwrap_or(0);
+        let uuid = match obj.get("uuid") {
+            None | Some(Value::Null) => 0,
+            Some(v) => parse_uuid_value(v).ok_or_else(|| {
+                TelemetryError::InvalidBrpJson(format!("invalid BRP schema `uuid` value `{v}`"))
+            })?,
+        };
         let is_pod = obj
             .get("is_pod")
             .or_else(|| obj.get("is_abi_pod"))
@@ -465,10 +493,19 @@ impl TelemetryStore {
 
     /// Looks up a previously ingested BRP component schema by canonical (or short) name.
     pub fn get_schema(&self, canonical_name: &str) -> Option<BrpSchemaEntry> {
-        self.inner
-            .read()
-            .ok()
-            .and_then(|g| g.schemas.get(canonical_name).cloned())
+        let g = self.inner.read().ok()?;
+        if let Some(exact) = g.schemas.get(canonical_name) {
+            return Some(exact.clone());
+        }
+        if !canonical_name.contains("::") {
+            return g
+                .schemas
+                .iter()
+                .filter(|(k, _)| k.rsplit("::").next() == Some(canonical_name))
+                .min_by(|(a, _), (b, _)| a.cmp(b))
+                .map(|(_, v)| v.clone());
+        }
+        None
     }
 
     /// Returns the total number of distinct component schemas stored from BRP.
@@ -577,15 +614,25 @@ pub fn spawn_telemetry_subscriber(
     TelemetrySubscription { shutdown_tx, task }
 }
 
-fn decode_http_chunked(raw: &str) -> Result<String, TelemetryError> {
-    let mut out = String::new();
+fn split_bytes_once<'a>(haystack: &'a [u8], needle: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|pos| (&haystack[..pos], &haystack[pos + needle.len()..]))
+}
+
+fn decode_http_chunked(raw: &[u8]) -> Result<Vec<u8>, TelemetryError> {
+    let mut out = Vec::new();
     let mut rest = raw;
     loop {
-        let Some((size_line, after_line)) = rest.split_once("\r\n") else {
+        let Some((size_line_bytes, after_line)) = split_bytes_once(rest, b"\r\n") else {
             return Err(TelemetryError::InvalidBrpJson(
                 "malformed chunked HTTP body from BRP endpoint".to_owned(),
             ));
         };
+        let size_line = std::str::from_utf8(size_line_bytes).map_err(|e| {
+            TelemetryError::InvalidBrpJson(format!("non-UTF-8 HTTP chunk header: {e}"))
+        })?;
         let hex_part = size_line.split(';').next().unwrap_or("").trim();
         let chunk_len = usize::from_str_radix(hex_part, 16).map_err(|e| {
             TelemetryError::InvalidBrpJson(format!("invalid HTTP chunk length `{hex_part}`: {e}"))
@@ -593,12 +640,12 @@ fn decode_http_chunked(raw: &str) -> Result<String, TelemetryError> {
         if chunk_len == 0 {
             break;
         }
-        if after_line.len() < chunk_len + 2 {
+        if after_line.len() < chunk_len + 2 || &after_line[chunk_len..chunk_len + 2] != b"\r\n" {
             return Err(TelemetryError::InvalidBrpJson(
                 "truncated HTTP chunk body from BRP endpoint".to_owned(),
             ));
         }
-        out.push_str(&after_line[..chunk_len]);
+        out.extend_from_slice(&after_line[..chunk_len]);
         rest = &after_line[chunk_len + 2..];
     }
     Ok(out)
@@ -641,16 +688,15 @@ pub async fn fetch_brp_component_schemas(
         .await
         .map_err(|e| TelemetryError::Io(e.to_string()))?;
 
-    let text = String::from_utf8(raw_resp).map_err(|e| {
-        TelemetryError::InvalidBrpJson(format!("non-UTF-8 HTTP response from BRP endpoint: {e}"))
-    })?;
-
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .or_else(|| text.split_once("\n\n"))
+    let (head_bytes, body_bytes) = split_bytes_once(&raw_resp, b"\r\n\r\n")
+        .or_else(|| split_bytes_once(&raw_resp, b"\n\n"))
         .ok_or_else(|| {
             TelemetryError::InvalidBrpJson("HTTP response missing header/body separator".to_owned())
         })?;
+
+    let head = std::str::from_utf8(head_bytes).map_err(|e| {
+        TelemetryError::InvalidBrpJson(format!("non-UTF-8 HTTP header from BRP endpoint: {e}"))
+    })?;
 
     let status_line = head.lines().next().unwrap_or("");
     let status_code = status_line
@@ -660,21 +706,31 @@ pub async fn fetch_brp_component_schemas(
         .ok_or_else(|| {
             TelemetryError::InvalidBrpJson(format!("malformed HTTP status line `{status_line}`"))
         })?;
-    if !(200..300).contains(&status_code) {
-        return Err(TelemetryError::InvalidBrpJson(format!(
-            "BRP HTTP error status {status_code}: {body}"
-        )));
-    }
-
     let is_chunked = head.lines().any(|l| {
         l.to_ascii_lowercase().contains("transfer-encoding:")
             && l.to_ascii_lowercase().contains("chunked")
     });
-    let json_payload = if is_chunked {
-        decode_http_chunked(body)?
+    if !(200..300).contains(&status_code) {
+        let err_body = if is_chunked {
+            decode_http_chunked(body_bytes)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_else(|_| String::from_utf8_lossy(body_bytes).into_owned())
+        } else {
+            String::from_utf8_lossy(body_bytes).into_owned()
+        };
+        return Err(TelemetryError::InvalidBrpJson(format!(
+            "BRP HTTP error status {status_code}: {err_body}"
+        )));
+    }
+
+    let decoded_body = if is_chunked {
+        decode_http_chunked(body_bytes)?
     } else {
-        body.to_owned()
+        body_bytes.to_vec()
     };
+    let json_payload = String::from_utf8(decoded_body).map_err(|e| {
+        TelemetryError::InvalidBrpJson(format!("non-UTF-8 HTTP response from BRP endpoint: {e}"))
+    })?;
 
     parse_brp_schema_json(&json_payload)
 }
@@ -788,5 +844,68 @@ mod tests {
             .expect("frame should be recorded");
         assert_eq!(recorded.frame_seq, 42);
         assert_eq!(recorded.p50_us, 420);
+    }
+
+    #[test]
+    fn brp_chunked_utf8_split_hyphenated_uuid_and_short_name_lookup() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let json_body = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"components":["#,
+            r#"{"name":"game::net::Pos","size":16,"align":4,"#,
+            r#""uuid":"01234567-89ab-cdef-0123-456789abcdef","is_pod":true,"doc":"rocket 🚀 ok"}"#,
+            r#"]}}"#,
+        );
+        let body_bytes = json_body.as_bytes();
+        let rocket_pos = json_body.find("🚀").expect("emoji in test JSON");
+        // Split strictly inside the 4-byte UTF-8 sequence for `🚀`.
+        let split_at = rocket_pos + 2;
+        assert!(std::str::from_utf8(&body_bytes[..split_at]).is_err());
+
+        let chunk1 = &body_bytes[..split_at];
+        let chunk2 = &body_bytes[split_at..];
+        let mut raw_resp = Vec::new();
+        raw_resp.extend_from_slice(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        raw_resp.extend_from_slice(format!("{:x}\r\n", chunk1.len()).as_bytes());
+        raw_resp.extend_from_slice(chunk1);
+        raw_resp.extend_from_slice(b"\r\n");
+        raw_resp.extend_from_slice(format!("{:x}\r\n", chunk2.len()).as_bytes());
+        raw_resp.extend_from_slice(chunk2);
+        raw_resp.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock BRP");
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let mut req_buf = [0u8; 512];
+            let _ = stream.read(&mut req_buf);
+            stream.write_all(&raw_resp).expect("write chunked resp");
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("build runtime");
+        let schemas = rt
+            .block_on(fetch_brp_component_schemas(addr))
+            .expect("chunked split-UTF-8 parse");
+        handle.join().expect("server thread");
+
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].canonical_name, "game::net::Pos");
+        assert_eq!(schemas[0].uuid, 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+
+        let store = TelemetryStore::new();
+        assert_eq!(store.ingest_brp_json(json_body).expect("ingest json"), 1);
+        let by_short = store.get_schema("Pos").expect("short-name schema fallback");
+        assert_eq!(by_short.canonical_name, "game::net::Pos");
+
+        let bad_uuid_json = r#"{"jsonrpc":"2.0","id":1,"result":{"components":[{"name":"Bad","size":4,"align":4,"uuid":"not-a-valid-uuid"}]}}"#;
+        let err = parse_brp_schema_json(bad_uuid_json)
+            .expect_err("invalid UUID must error rather than coerce to 0");
+        assert!(matches!(err, TelemetryError::InvalidBrpJson(_)));
     }
 }

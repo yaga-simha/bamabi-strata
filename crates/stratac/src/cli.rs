@@ -90,6 +90,11 @@ pub enum Commands {
         format: OutputFormat,
     },
     /// Compile a `.strata` module to native shared library (`jit`, `c99`, or `rust-guest`) and optionally package/sign as `.bampack`.
+    #[command(group(
+        clap::ArgGroup::new("signing_action")
+            .multiple(true)
+            .args(["bampack", "sign"])
+    ))]
     Build {
         /// Path to `.strata` source file.
         file: PathBuf,
@@ -113,11 +118,17 @@ pub enum Commands {
             long,
             value_name = "PATH",
             group = "signing_key",
+            requires = "signing_action",
             conflicts_with = "ephemeral_key"
         )]
         key: Option<PathBuf>,
         /// Generate and use a throwaway ephemeral Ed25519 keypair (development/testing only).
-        #[arg(long, group = "signing_key", conflicts_with = "key")]
+        #[arg(
+            long,
+            group = "signing_key",
+            requires = "signing_action",
+            conflicts_with = "key"
+        )]
         ephemeral_key: bool,
         /// Output format (`text` or `json`).
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -135,11 +146,12 @@ pub enum Commands {
             long,
             value_name = "PATH",
             group = "signing_key",
+            requires = "sign",
             conflicts_with = "ephemeral_key"
         )]
         key: Option<PathBuf>,
         /// Generate and use a throwaway ephemeral Ed25519 keypair (development/testing only).
-        #[arg(long, group = "signing_key", conflicts_with = "key")]
+        #[arg(long, group = "signing_key", requires = "sign", conflicts_with = "key")]
         ephemeral_key: bool,
         /// Run one watch/rebuild cycle immediately and exit (for CI & tests).
         #[arg(long)]
@@ -335,6 +347,31 @@ mod tests {
         assert!(Cli::try_parse_from(["stratac", "build", "sim.strata", "--sign"]).is_err());
         assert!(Cli::try_parse_from(["stratac", "build", "sim.strata", "--bampack"]).is_err());
         assert!(Cli::try_parse_from(["stratac", "watch", "sim.strata", "--sign"]).is_err());
+
+        // Passing key flags without `--sign` / `--bampack` is rejected.
+        assert!(
+            Cli::try_parse_from(["stratac", "build", "sim.strata", "--key", "id.ed25519"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["stratac", "build", "sim.strata", "--ephemeral-key"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["stratac", "watch", "sim.strata", "--key", "id.ed25519"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["stratac", "watch", "sim.strata", "--ephemeral-key"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "stratac",
+                "build",
+                "sim.strata",
+                "--bampack",
+                "--sign",
+                "--ephemeral-key",
+            ])
+            .is_ok()
+        );
 
         // Conflicting `--key` + `--ephemeral-key` is rejected on both `build` and `watch`.
         assert!(

@@ -195,6 +195,16 @@ impl StrataNetPacket {
     }
 }
 
+fn safe_quantize_step(min: f64, max: f64, max_q: u64, step: Option<f64>) -> f64 {
+    match step {
+        Some(s) if s.is_finite() && s > 0.0 => s,
+        _ => {
+            let levels = max_q.max(1) as f64;
+            (max / levels) - (min / levels)
+        }
+    }
+}
+
 /// Quantizes a scalar `f64` value in `[min, max]` into an unsigned integer of `bits` (`1..=32`)
 /// using `u64` arithmetic so `bits == 32` never shift-overflows.
 #[must_use]
@@ -204,10 +214,7 @@ pub fn quantize_scalar_f64(val: f64, min: f64, max: f64, bits: u8, step: Option<
     }
     let eff_bits = bits.min(32);
     let max_q = (1u64 << eff_bits) - 1;
-    let eff_step = match step {
-        Some(s) if s.is_finite() && s > 0.0 => s,
-        _ => (max - min) / (max_q.max(1) as f64),
-    };
+    let eff_step = safe_quantize_step(min, max, max_q, step);
     if !eff_step.is_finite() || eff_step <= 0.0 {
         return 0;
     }
@@ -216,9 +223,13 @@ pub fn quantize_scalar_f64(val: f64, min: f64, max: f64, bits: u8, step: Option<
     } else {
         val.clamp(min, max)
     };
-    ((clamped - min) / eff_step)
-        .round()
-        .clamp(0.0, max_q as f64) as u64
+    let diff = clamped - min;
+    let qf = if diff.is_finite() {
+        diff / eff_step
+    } else {
+        (clamped / eff_step) - (min / eff_step)
+    };
+    qf.round().clamp(0.0, max_q as f64) as u64
 }
 
 /// Dequantizes a `bits`-wide (`1..=32`) unsigned integer back into `f64` in `[min, max]`.
@@ -230,14 +241,18 @@ pub fn dequantize_scalar_f64(raw: u64, min: f64, max: f64, bits: u8, step: Optio
     let eff_bits = bits.min(32);
     let max_q = (1u64 << eff_bits) - 1;
     let q = raw & max_q;
-    let eff_step = match step {
-        Some(s) if s.is_finite() && s > 0.0 => s,
-        _ => (max - min) / (max_q.max(1) as f64),
-    };
+    let eff_step = safe_quantize_step(min, max, max_q, step);
     if !eff_step.is_finite() || eff_step <= 0.0 {
         return min;
     }
-    (min + (q as f64) * eff_step).clamp(min, max)
+    let prod = (q as f64) * eff_step;
+    let out = if prod.is_finite() {
+        min + prod
+    } else {
+        let half_delta = (q as f64) * (eff_step * 0.5);
+        (min + half_delta) + half_delta
+    };
+    out.clamp(min, max)
 }
 
 /// Packs the lowest `bits` (`0..=64`) of `val` into `buf` starting at `bit_offset` in little-endian
@@ -307,4 +322,42 @@ pub fn unpack_bits_le(buf: &[u8], bit_offset: u32, bits: u8) -> u64 {
 #[must_use]
 pub const fn verify_handshake_fingerprint(expected: u64, received: u64) -> bool {
     expected != 0 && expected == received
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantize_wide_range_uses_overflow_safe_step() {
+        let min = -1e308;
+        let max = 1e308;
+        let bits = 16;
+
+        let q_min = quantize_scalar_f64(min, min, max, bits, None);
+        let q_zero = quantize_scalar_f64(0.0, min, max, bits, None);
+        let q_mid = quantize_scalar_f64(1234.5, min, max, bits, None);
+        let q_hi = quantize_scalar_f64(1e307, min, max, bits, None);
+        let q_max = quantize_scalar_f64(max, min, max, bits, None);
+
+        assert_eq!(q_min, 0);
+        assert_eq!(q_max, 65_535);
+        // Zero/1234.5 sit at the center of the symmetric [-1e308, 1e308] interval.
+        assert!((32_767..=32_768).contains(&q_zero), "q_zero={q_zero}");
+        assert!((32_767..=32_768).contains(&q_mid), "q_mid={q_mid}");
+        assert!(q_hi > q_mid && q_hi < q_max, "q_hi={q_hi}");
+
+        for q in [q_min, q_zero, q_mid, q_hi, q_max] {
+            let d = dequantize_scalar_f64(q, min, max, bits, None);
+            assert!(d.is_finite(), "dequantized value not finite for q={q}: {d}");
+            assert!((min..=max).contains(&d), "out of bounds: {d}");
+        }
+        let d_mid = dequantize_scalar_f64(q_mid, min, max, bits, None);
+        let eff_step = (max / 65_535.0) - (min / 65_535.0);
+        assert!(eff_step.is_finite());
+        assert!(
+            ((d_mid / eff_step) - (1234.5 / eff_step)).abs() <= 1.0,
+            "d_mid={d_mid} too far from 1234.5"
+        );
+    }
 }

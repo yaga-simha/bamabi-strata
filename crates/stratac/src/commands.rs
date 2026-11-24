@@ -38,11 +38,11 @@ use strata_codegen::{
     BevyNativeOptions, RustGuestOptions, emit_bevy_native, emit_c99, module_stem,
 };
 use strata_jit::{JitCompileOptions, JitOptLevel, compile_module_to_dylib};
-use strata_mir::{MirFnKind, MirModule, lower_to_mir};
+use strata_mir::{MirFnKind, MirModule, lower_to_mir, verify_mir};
 use strata_sema::access::ConcurrencyGraph;
 use strata_sema::db::Setter;
-use strata_sema::diagnostics::{Diagnostic, Severity};
-use strata_sema::hir::HirScheduleGroup;
+use strata_sema::diagnostics::{Diagnostic, Severity, Span};
+use strata_sema::hir::{HirSchedule, HirScheduleGroup};
 use strata_sema::layout::SolvedLayout;
 use strata_sema::{SemaDb, SourceFile, analyze_source};
 use strata_syntax::ast::AstNode as _;
@@ -345,13 +345,26 @@ pub fn cmd_check(file: &Path, format: OutputFormat) -> (i32, String) {
         Err(e) => return e,
     };
     let analyzed = analyze_source(file.display().to_string(), &src);
-    let error_count = analyzed
-        .diagnostics
+    let mut diagnostics = analyzed.diagnostics.clone();
+    if !diagnostics.iter().any(|d| d.severity == Severity::Error) {
+        let mir = lower_to_mir(&analyzed);
+        if let Err(errs) = verify_mir(&mir) {
+            let file_str = file.display().to_string();
+            for err in errs {
+                diagnostics.push(Diagnostic::error(
+                    "E0900_MIR_VERIFICATION_FAILED",
+                    Span::from_bytes(file_str.clone(), &src, 0, 0),
+                    err.to_string(),
+                    None,
+                ));
+            }
+        }
+    }
+    let error_count = diagnostics
         .iter()
         .filter(|d| d.severity == Severity::Error)
         .count();
-    let warning_count = analyzed
-        .diagnostics
+    let warning_count = diagnostics
         .iter()
         .filter(|d| d.severity == Severity::Warning)
         .count();
@@ -364,7 +377,7 @@ pub fn cmd_check(file: &Path, format: OutputFormat) -> (i32, String) {
         module_path: analyzed.module_path,
         error_count,
         warning_count,
-        diagnostics: analyzed.diagnostics,
+        diagnostics,
     };
 
     let text = match format {
@@ -677,6 +690,13 @@ pub fn cmd_build_with_key(
             "cannot specify both `--key <path>` and `--ephemeral-key`".to_owned(),
         );
     }
+    if !(bampack || sign) && (key_path.is_some() || ephemeral_key) {
+        return (
+            EXIT_COMPILE_ERROR,
+            "cannot specify `--key` or `--ephemeral-key` without `--sign` or `--bampack`"
+                .to_owned(),
+        );
+    }
     let resolved_key = if bampack || sign {
         match resolve_signing_key(key_path, ephemeral_key, "stratac-ephemeral") {
             Ok(k) => Some(k),
@@ -698,6 +718,17 @@ pub fn cmd_build_with_key(
         );
     }
     let mir = lower_to_mir(&analyzed);
+    if let Err(errs) = verify_mir(&mir) {
+        let msg = errs
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return (
+            EXIT_COMPILE_ERROR,
+            format!("MIR verification failed:\n{msg}"),
+        );
+    }
     let stem = module_stem(&mir.module_path);
 
     let default_out = file
@@ -851,11 +882,16 @@ pub fn cmd_build_with_key(
     }
 
     // Emit and validate `mod.toml` via `bamabi_manifest`.
+    let mod_version = analyzed
+        .version
+        .as_ref()
+        .map(|v| format!("{}.{}.{}", v.major, v.minor, v.patch))
+        .unwrap_or_else(|| "0.3.0".to_owned());
     let mod_toml_path = out.join("mod.toml");
     let mod_toml_content = format!(
         "[mod]\n\
          id = \"{stem}\"\n\
-         version = \"0.3.0\"\n\
+         version = \"{mod_version}\"\n\
          abi_version = \"0.3.0\"\n\
          entry = \"{bin_filename}\"\n\
          language = \"{lang_tag}\"\n"
@@ -1147,21 +1183,79 @@ fn extract_before_after_mods(node: &SyntaxNode) -> Option<(Vec<String>, Vec<Stri
             }
         }
         if is_before || is_after {
-            let path = ast::child::<ast::Path>(m.syntax())?;
-            let raw = ast::path_text(&path);
-            let target = bare_schedule_target(&raw);
-            if target.is_empty() {
+            let paths: Vec<String> = ast::children::<ast::Path>(m.syntax())
+                .map(|p| ast::path_text(&p))
+                .collect();
+            if paths.is_empty() {
                 return None;
             }
-            if is_before {
-                before.push(target.to_owned());
-            }
-            if is_after {
-                after.push(target.to_owned());
+            for raw in paths {
+                let target = bare_schedule_target(&raw);
+                if target.is_empty() {
+                    return None;
+                }
+                if is_before {
+                    before.push(target.to_owned());
+                }
+                if is_after {
+                    after.push(target.to_owned());
+                }
             }
         }
     }
     Some((before, after))
+}
+
+fn parse_cst_schedule_group(
+    node: &SyntaxNode,
+    mod_targets_to_validate: &mut Vec<String>,
+) -> Option<HirScheduleGroup> {
+    let kind = node
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find_map(|t| match t.kind() {
+            SyntaxKind::KwSeq => Some("seq".to_owned()),
+            SyntaxKind::KwSeqWeak => Some("seq_weak".to_owned()),
+            SyntaxKind::KwPar => Some("par".to_owned()),
+            SyntaxKind::KwSet => Some("set".to_owned()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "leaf".to_owned());
+
+    let (before, after) = extract_before_after_mods(node)?;
+    mod_targets_to_validate.extend(before.iter().cloned());
+    mod_targets_to_validate.extend(after.iter().cloned());
+
+    if kind == "leaf" {
+        let raw = ast::child::<ast::Path>(node).map(|p| ast::path_text(&p))?;
+        let bare = bare_schedule_target(&raw);
+        if bare.is_empty() {
+            return None;
+        }
+        return Some(HirScheduleGroup {
+            kind,
+            name: bare.to_owned(),
+            before,
+            after,
+            children: Vec::new(),
+        });
+    }
+
+    let name = ast::first_ident(node).map_or_else(String::new, |t| t.text().to_owned());
+    let mut children = Vec::new();
+    for ch in ast::children::<ast::ScheduleNode>(node) {
+        children.push(parse_cst_schedule_group(
+            ch.syntax(),
+            mod_targets_to_validate,
+        )?);
+    }
+    Some(HirScheduleGroup {
+        kind,
+        name,
+        before,
+        after,
+        children,
+    })
 }
 
 fn encode_hex_32(bytes: &[u8; 32]) -> String {
@@ -1189,6 +1283,7 @@ pub struct WatchSession {
     has_timer_tick: bool,
     cached_module_path: String,
     cached_stem: String,
+    cached_base_mir: Option<MirModule>,
     cached_out_dir: Option<PathBuf>,
     cached_dylib_path: Option<PathBuf>,
     cached_signature_path: Option<String>,
@@ -1208,6 +1303,12 @@ impl WatchSession {
             return Err((
                 EXIT_COMPILE_ERROR,
                 "cannot specify both `--key <path>` and `--ephemeral-key`".to_owned(),
+            ));
+        }
+        if !sign && (key_path.is_some() || ephemeral_key) {
+            return Err((
+                EXIT_COMPILE_ERROR,
+                "cannot specify `--key` or `--ephemeral-key` without `--sign`".to_owned(),
             ));
         }
         let signing_key = if sign {
@@ -1246,6 +1347,7 @@ impl WatchSession {
             has_timer_tick: false,
             cached_module_path: String::new(),
             cached_stem: String::new(),
+            cached_base_mir: None,
             cached_out_dir: None,
             cached_dylib_path: None,
             cached_signature_path: None,
@@ -1323,6 +1425,17 @@ impl WatchSession {
             && executed.iter().any(|q| q.contains("resolve_layouts"));
 
         let mir = lower_to_mir(&analyzed);
+        if let Err(errs) = verify_mir(&mir) {
+            let msg = errs
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err((
+                EXIT_COMPILE_ERROR,
+                format!("MIR verification failed:\n{msg}"),
+            ));
+        }
         let stem = module_stem(&mir.module_path);
         let out_dir = self
             .file
@@ -1366,6 +1479,11 @@ impl WatchSession {
 
         let (known_systems, has_timer_tick) = collect_mir_known_systems(&mir);
         let (known_sets, scheduled_systems) = collect_mir_schedule_sets_and_systems(&mir);
+        let mut base_mir = mir.clone();
+        base_mir
+            .functions
+            .retain(|f| !matches!(f.kind, MirFnKind::SynthesizedSpatialCsr));
+        base_mir.schedules.clear();
 
         self.prev_layouts = next_layouts;
         self.known_systems = known_systems;
@@ -1374,6 +1492,7 @@ impl WatchSession {
         self.has_timer_tick = has_timer_tick;
         self.cached_module_path = mir.module_path;
         self.cached_stem = stem;
+        self.cached_base_mir = Some(base_mir);
         self.cached_out_dir = Some(out_dir);
         self.cached_dylib_path = Some(art.dylib_path.clone());
         self.cached_signature_path = signature_path.clone();
@@ -1406,37 +1525,23 @@ impl WatchSession {
         sched_sig: [u8; 32],
     ) -> Option<ScheduleDeltaArtifact> {
         #[allow(clippy::too_many_arguments)]
-        fn walk_node(
+        fn walk_group(
             known_systems: &HashSet<String>,
             sched_id: u32,
             label: &str,
-            node: &SyntaxNode,
+            group: &HirScheduleGroup,
             parent_sets: &[(usize, String)],
             sets: &mut Vec<ScheduleDeltaSet>,
             set_index_map: &mut HashMap<(u32, String), usize>,
             sys_map: &mut HashMap<String, ScheduleDeltaSystem>,
             sys_order: &mut Vec<String>,
             new_scheduled_systems: &mut HashMap<String, u32>,
-            mod_targets_to_validate: &mut Vec<String>,
             mod_name: &str,
             seq_counter: &mut usize,
             leaf_order: &mut usize,
         ) -> Option<(Vec<String>, Option<usize>)> {
-            let kind = node
-                .children_with_tokens()
-                .filter_map(|e| e.into_token())
-                .find_map(|t| match t.kind() {
-                    SyntaxKind::KwSeq => Some("seq"),
-                    SyntaxKind::KwSeqWeak => Some("seq_weak"),
-                    SyntaxKind::KwPar => Some("par"),
-                    SyntaxKind::KwSet => Some("set"),
-                    _ => None,
-                })
-                .unwrap_or("leaf");
-
-            if kind == "leaf" {
-                let raw = ast::child::<ast::Path>(node).map(|p| ast::path_text(&p))?;
-                let bare = bare_schedule_target(&raw);
+            if group.kind == "leaf" {
+                let bare = bare_schedule_target(&group.name);
                 if bare.is_empty() || !known_systems.contains(bare) {
                     return None;
                 }
@@ -1447,10 +1552,6 @@ impl WatchSession {
                 } else {
                     new_scheduled_systems.insert(bare.to_owned(), sched_id);
                 }
-
-                let (explicit_before, explicit_after) = extract_before_after_mods(node)?;
-                mod_targets_to_validate.extend(explicit_before.iter().cloned());
-                mod_targets_to_validate.extend(explicit_after.iter().cloned());
 
                 let entry = sys_map.entry(bare.to_owned()).or_insert_with(|| {
                     let order = *leaf_order;
@@ -1483,27 +1584,29 @@ impl WatchSession {
                         mounted.push(bare.to_owned());
                     }
                 }
-                for t in explicit_before {
-                    if !entry.before.contains(&t) {
-                        entry.before.push(t);
+                for t in &group.before {
+                    let target = bare_schedule_target(t);
+                    if !target.is_empty() && !entry.before.iter().any(|x| x == target) {
+                        entry.before.push(target.to_owned());
                     }
                 }
-                for t in explicit_after {
-                    if !entry.after.contains(&t) {
-                        entry.after.push(t);
+                for t in &group.after {
+                    let target = bare_schedule_target(t);
+                    if !target.is_empty() && !entry.after.iter().any(|x| x == target) {
+                        entry.after.push(target.to_owned());
                     }
                 }
                 return Some((vec![bare.to_owned()], None));
             }
 
-            let raw_name = ast::first_ident(node)
-                .map(|t| t.text().to_owned())
-                .unwrap_or_else(|| {
-                    *seq_counter += 1;
-                    format!("__group_{seq_counter}")
-                });
+            let raw_name = if group.name.is_empty() {
+                *seq_counter += 1;
+                format!("__group_{seq_counter}")
+            } else {
+                group.name.clone()
+            };
             let bare = bare_schedule_target(&raw_name).to_owned();
-            let (mode, flags) = match kind {
+            let (mode, flags) = match group.kind.as_str() {
                 "seq" => (ScheduleDeltaMode::Sequence, BAM_SCHEDULE_SET_FLAG_SEQUENCE),
                 "seq_weak" => (
                     ScheduleDeltaMode::SequenceWeak,
@@ -1511,10 +1614,6 @@ impl WatchSession {
                 ),
                 _ => (ScheduleDeltaMode::Parallel, BAM_SCHEDULE_SET_FLAG_PARALLEL),
             };
-
-            let (explicit_before, explicit_after) = extract_before_after_mods(node)?;
-            mod_targets_to_validate.extend(explicit_before.iter().cloned());
-            mod_targets_to_validate.extend(explicit_after.iter().cloned());
 
             let key = (sched_id, bare.clone());
             let own_idx = if let Some(&existing) = set_index_map.get(&key) {
@@ -1538,39 +1637,40 @@ impl WatchSession {
                 idx
             };
 
-            for t in explicit_before {
-                if !sets[own_idx].before_sets.contains(&t) {
-                    sets[own_idx].before_sets.push(t);
+            for t in &group.before {
+                let target = bare_schedule_target(t);
+                if !target.is_empty() && !sets[own_idx].before_sets.iter().any(|x| x == target) {
+                    sets[own_idx].before_sets.push(target.to_owned());
                 }
             }
-            for t in explicit_after {
-                if !sets[own_idx].after_sets.contains(&t) {
-                    sets[own_idx].after_sets.push(t);
+            for t in &group.after {
+                let target = bare_schedule_target(t);
+                if !target.is_empty() && !sets[own_idx].after_sets.iter().any(|x| x == target) {
+                    sets[own_idx].after_sets.push(target.to_owned());
                 }
             }
 
             let mut next_parent_sets = parent_sets.to_vec();
             next_parent_sets.push((own_idx, bare));
 
-            let is_seq = kind == "seq";
-            let is_seq_weak = kind == "seq_weak";
+            let is_seq = group.kind == "seq";
+            let is_seq_weak = group.kind == "seq_weak";
             let mut prev_leaves: Vec<String> = Vec::new();
             let mut prev_set_idx: Option<usize> = None;
             let mut all_leaves: Vec<String> = Vec::new();
 
-            for ch in ast::children::<ast::ScheduleNode>(node) {
-                let (leaves, cur_set_idx) = walk_node(
+            for ch in &group.children {
+                let (leaves, cur_set_idx) = walk_group(
                     known_systems,
                     sched_id,
                     label,
-                    ch.syntax(),
+                    ch,
                     &next_parent_sets,
                     sets,
                     set_index_map,
                     sys_map,
                     sys_order,
                     new_scheduled_systems,
-                    mod_targets_to_validate,
                     mod_name,
                     seq_counter,
                     leaf_order,
@@ -1622,43 +1722,99 @@ impl WatchSession {
             Some((all_leaves, Some(own_idx)))
         }
 
-        let mut sets = Vec::new();
-        let mut set_index_map = HashMap::new();
-        let mut sys_map = HashMap::new();
-        let mut sys_order = Vec::new();
-        let mut new_scheduled_systems = HashMap::new();
+        let base_mir = self.cached_base_mir.as_ref()?;
         let mut mod_targets_to_validate = Vec::new();
-        let mut seq_counter = 0usize;
-        let mut leaf_order = 0usize;
+        let mut parsed_schedules = Vec::new();
 
         for item in sf.items() {
             if let ast::Item::Schedule(sd) = item {
                 let label = ast::child::<ast::Path>(sd.syntax())
                     .map(|p| ast::path_text(&p))
                     .unwrap_or_else(|| "Update".to_owned());
-                let sched_id = schedule_id_for_label(&label).0;
                 let (sched_before, sched_after) = extract_before_after_mods(sd.syntax())?;
                 mod_targets_to_validate.extend(sched_before);
                 mod_targets_to_validate.extend(sched_after);
 
+                let mut nodes = Vec::new();
                 for ch in ast::children::<ast::ScheduleNode>(sd.syntax()) {
-                    walk_node(
-                        &self.known_systems,
-                        sched_id,
-                        &label,
+                    nodes.push(parse_cst_schedule_group(
                         ch.syntax(),
-                        &[],
-                        &mut sets,
-                        &mut set_index_map,
-                        &mut sys_map,
-                        &mut sys_order,
-                        &mut new_scheduled_systems,
                         &mut mod_targets_to_validate,
-                        &self.cached_stem,
-                        &mut seq_counter,
-                        &mut leaf_order,
-                    )?;
+                    )?);
                 }
+                parsed_schedules.push(HirSchedule {
+                    label,
+                    run_if: None,
+                    run_if_expr: None,
+                    nodes,
+                });
+            }
+        }
+
+        let mut temp_mir = base_mir.clone();
+        temp_mir.schedules = parsed_schedules;
+        if self.has_timer_tick {
+            let tick_leaf = HirScheduleGroup {
+                kind: "leaf".to_owned(),
+                name: "strata_timer_tick".to_owned(),
+                before: Vec::new(),
+                after: Vec::new(),
+                children: Vec::new(),
+            };
+            if let Some(fixed) = temp_mir
+                .schedules
+                .iter_mut()
+                .find(|s| s.label == "FixedUpdate")
+            {
+                fixed.nodes.insert(0, tick_leaf);
+            } else {
+                temp_mir.schedules.push(HirSchedule {
+                    label: "FixedUpdate".to_owned(),
+                    run_if: None,
+                    run_if_expr: None,
+                    nodes: vec![tick_leaf],
+                });
+            }
+        }
+        strata_mir::passes::spatial_csr::run(&mut temp_mir);
+
+        let (new_known_systems, _) = collect_mir_known_systems(&temp_mir);
+        if new_known_systems != self.known_systems {
+            return None;
+        }
+
+        let effective_mod_name = if self.cached_module_path.is_empty() {
+            "strata_mod".to_owned()
+        } else {
+            self.cached_module_path.clone()
+        };
+
+        let mut sets = Vec::new();
+        let mut set_index_map = HashMap::new();
+        let mut sys_map = HashMap::new();
+        let mut sys_order = Vec::new();
+        let mut new_scheduled_systems = HashMap::new();
+        let mut seq_counter = 0usize;
+        let mut leaf_order = 0usize;
+
+        for sched in &temp_mir.schedules {
+            let sched_id = schedule_id_for_label(&sched.label).0;
+            for ch in &sched.nodes {
+                walk_group(
+                    &new_known_systems,
+                    sched_id,
+                    &sched.label,
+                    ch,
+                    &[],
+                    &mut sets,
+                    &mut set_index_map,
+                    &mut sys_map,
+                    &mut sys_order,
+                    &mut new_scheduled_systems,
+                    &effective_mod_name,
+                    &mut seq_counter,
+                    &mut leaf_order,
+                )?;
             }
         }
 
@@ -1709,7 +1865,7 @@ impl WatchSession {
             target_pass: "ModScheduleSetRewirePass".to_owned(),
             abi_version: ABI_VERSION,
             module_path: self.cached_module_path.clone(),
-            mod_name: self.cached_stem.clone(),
+            mod_name: effective_mod_name,
             schedule_signature: encode_hex_32(&sched_sig),
             touched_schedules,
             requires_set_registration,

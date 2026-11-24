@@ -14,13 +14,15 @@ use bamabi_sys::{
 };
 use bevy_app::{App, FixedUpdate, Last, PostStartup, PostUpdate, PreUpdate, Startup, Update};
 use bevy_ecs::entity::Entity;
-use bevy_ecs::schedule::SingleThreadedExecutor;
+use bevy_ecs::hierarchy::ChildOf;
+use bevy_ecs::prelude::{IntoScheduleConfigs, Res, Resource};
+use bevy_ecs::schedule::{Schedules, SingleThreadedExecutor};
 use bevy_ecs::world::World;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 use std::alloc::System;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use strata_jit::{JitCompileOptions, JitOptLevel, compile_module_to_dylib};
@@ -240,12 +242,128 @@ pub fn hash_world_pod_state(world: &World) -> WorldPodDigest {
     }
 }
 
+#[derive(Resource, Default)]
+pub(crate) struct SimDispatchOnly(pub(crate) bool);
+
+pub(crate) fn ensure_child_of_registered(world: &mut World) {
+    let child_of_id = world.register_component::<ChildOf>();
+    let is_immutable = world
+        .components()
+        .get_info(child_of_id)
+        .is_some_and(|info| !info.mutable());
+    if let Some(mut reg) = world.get_resource_mut::<ModRegistry>()
+        && reg.get_by_name(bamabi_sys::BAM_CHILD_OF_NAME).is_none()
+    {
+        let _ = reg.register_hierarchy(child_of_id, is_immutable);
+    }
+}
+
+pub(crate) fn collect_user_update_systems(mir: &MirModule) -> Vec<String> {
+    fn collect_group_leaves(
+        group: &HirScheduleGroup,
+        in_non_update_builtin: bool,
+        non_update_leaves: &mut HashSet<String>,
+        explicit_update_leaves: &mut HashSet<String>,
+    ) {
+        if group.kind == "leaf" {
+            let bare = group.name.rsplit("::").next().unwrap_or(&group.name);
+            if !bare.is_empty() {
+                if in_non_update_builtin {
+                    non_update_leaves.insert(bare.to_owned());
+                } else {
+                    explicit_update_leaves.insert(bare.to_owned());
+                }
+            }
+            return;
+        }
+        for ch in &group.children {
+            collect_group_leaves(
+                ch,
+                in_non_update_builtin,
+                non_update_leaves,
+                explicit_update_leaves,
+            );
+        }
+    }
+
+    let mut non_update_leaves = HashSet::new();
+    let mut explicit_update_leaves = HashSet::new();
+    for sched in &mir.schedules {
+        let is_non_update_builtin = matches!(
+            sched.label.as_str(),
+            "Startup" | "PreUpdate" | "PostUpdate" | "FixedUpdate" | "Last"
+        );
+        for node in &sched.nodes {
+            collect_group_leaves(
+                node,
+                is_non_update_builtin,
+                &mut non_update_leaves,
+                &mut explicit_update_leaves,
+            );
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for f in &mir.functions {
+        let bare = f.name.rsplit("::").next().unwrap_or(&f.name);
+        if bare.starts_with("__strata_sim_dispatch_") {
+            continue;
+        }
+        let targets_update = explicit_update_leaves.contains(bare)
+            || (matches!(f.kind, MirFnKind::System) && !non_update_leaves.contains(bare));
+        if targets_update && seen.insert(bare.to_owned()) {
+            out.push(bare.to_owned());
+        }
+    }
+    out
+}
+
+pub(crate) fn configure_dedicated_dispatch(
+    app: &mut App,
+    mir: &MirModule,
+    mod_id: ModId,
+    dispatch: &DispatchMetadata,
+) {
+    if dispatch.schedule != DispatchSchedule::Dedicated || dispatch.user_update_systems.is_empty() {
+        return;
+    }
+    app.world_mut().insert_resource(SimDispatchOnly(false));
+    let world = app.world_mut();
+    let mut mod_name = if mir.module_path.is_empty() {
+        "strata_mod".to_owned()
+    } else {
+        mir.module_path.clone()
+    };
+    let mut q = world.query::<&LoadedModInfo>();
+    for info in q.iter(world) {
+        if info.id == mod_id {
+            mod_name = info.name.clone();
+            break;
+        }
+    }
+    let own_gen = world
+        .get_resource::<ModHost>()
+        .map(|h| h.mod_generation(&mod_name))
+        .unwrap_or(0);
+    if let Some(mut schedules) = world.get_resource_mut::<Schedules>() {
+        for bare_sys in &dispatch.user_update_systems {
+            let own_set =
+                ModNamedSystemSet::with_generation(mod_name.as_str(), bare_sys.as_str(), own_gen);
+            schedules.configure_sets(
+                Update,
+                own_set.run_if(|flag: Option<Res<SimDispatchOnly>>| flag.is_none_or(|f| !f.0)),
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DispatchSchedule {
     PostUpdate,
     PreUpdate,
     Last,
-    Update,
+    Dedicated,
 }
 
 impl DispatchSchedule {
@@ -254,7 +372,7 @@ impl DispatchSchedule {
             Self::PostUpdate => "PostUpdate",
             Self::PreUpdate => "PreUpdate",
             Self::Last => "Last",
-            Self::Update => "Update",
+            Self::Dedicated => "Update",
         }
     }
 
@@ -269,7 +387,7 @@ impl DispatchSchedule {
             Self::Last => {
                 app.init_schedule(Last);
             }
-            Self::Update => {
+            Self::Dedicated => {
                 app.init_schedule(Update);
             }
         }
@@ -280,7 +398,17 @@ impl DispatchSchedule {
             Self::PostUpdate => world.run_schedule(PostUpdate),
             Self::PreUpdate => world.run_schedule(PreUpdate),
             Self::Last => world.run_schedule(Last),
-            Self::Update => world.run_schedule(Update),
+            Self::Dedicated => {
+                if let Some(mut flag) = world.get_resource_mut::<SimDispatchOnly>() {
+                    flag.0 = true;
+                } else {
+                    world.insert_resource(SimDispatchOnly(true));
+                }
+                world.run_schedule(Update);
+                if let Some(mut flag) = world.get_resource_mut::<SimDispatchOnly>() {
+                    flag.0 = false;
+                }
+            }
         }
     }
 }
@@ -299,6 +427,7 @@ pub(crate) struct DispatchMetadata {
     pub(crate) ctrl_layout: Option<SolvedLayout>,
     pub(crate) res_ops: HashMap<(String, String), ResFieldDispatch>,
     pub(crate) obj_ops: HashMap<String, u32>,
+    pub(crate) user_update_systems: Vec<String>,
 }
 
 impl DispatchMetadata {
@@ -422,7 +551,7 @@ fn pick_dispatch_schedule(mir: &MirModule) -> DispatchSchedule {
     } else if !used("Last") {
         DispatchSchedule::Last
     } else {
-        DispatchSchedule::Update
+        DispatchSchedule::Dedicated
     }
 }
 
@@ -1033,6 +1162,11 @@ pub(crate) fn augment_mir_for_sim_tests(
     mir: &MirModule,
 ) -> Result<(MirModule, DispatchMetadata), String> {
     let schedule = pick_dispatch_schedule(mir);
+    let user_update_systems = if schedule == DispatchSchedule::Dedicated {
+        collect_user_update_systems(mir)
+    } else {
+        Vec::new()
+    };
 
     let mut by_resource: BTreeMap<String, Vec<ResOpPlan>> = BTreeMap::new();
     let mut res_ops_map: HashMap<(String, String), ResFieldDispatch> = HashMap::new();
@@ -1099,6 +1233,7 @@ pub(crate) fn augment_mir_for_sim_tests(
                 ctrl_layout: None,
                 res_ops: res_ops_map,
                 obj_ops: obj_ops_map,
+                user_update_systems,
             },
         ));
     }
@@ -1241,6 +1376,7 @@ pub(crate) fn augment_mir_for_sim_tests(
             ctrl_layout: Some(ctrl_layout),
             res_ops: res_ops_map,
             obj_ops: obj_ops_map,
+            user_update_systems,
         },
     ))
 }
@@ -1348,6 +1484,7 @@ fn run_single_sim_test(
     });
     dispatch.schedule.init_on_app(&mut app);
     app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
+    ensure_child_of_registered(app.world_mut());
 
     let mod_id = match app.load_mod_with(dylib_path, LoadOptions::default()) {
         Ok(id) => id,
@@ -1362,6 +1499,7 @@ fn run_single_sim_test(
             };
         }
     };
+    configure_dedicated_dispatch(&mut app, mir, mod_id, dispatch);
 
     // Execute Bevy Startup once so `strata_init_objects` spawns `object` entities & binds them.
     app.world_mut().run_schedule(Startup);
@@ -2671,11 +2809,12 @@ impl<'a> SimRunner<'a> {
                         base_layout.canonical_name
                     )
                 })?;
-            let val = decode_ty_from_bytes(
+            let val = decode_ty_from_bytes_with_layouts(
                 &bytes,
                 offset,
                 cur_ty,
                 &self.mir.enums,
+                &self.mir.layouts,
                 &self.mir.module_path,
             )?;
             if let Some(lane) = lane_opt {
@@ -2692,11 +2831,12 @@ impl<'a> SimRunner<'a> {
             .iter()
             .find(|r| r.field_name == fname)
             .ok_or_else(|| format!("exported field `{fname}` missing"))?;
-        let val = decode_ty_from_bytes(
+        let val = decode_ty_from_bytes_with_layouts(
             &rec.bytes,
             0,
             cur_ty,
             &self.mir.enums,
+            &self.mir.layouts,
             &self.mir.module_path,
         )?;
         if let Some(lane) = lane_opt {
@@ -2741,28 +2881,35 @@ impl<'a> SimRunner<'a> {
             let new_val = if op == HirAssignOp::Set {
                 rhs
             } else {
-                let old_val = decode_ty_from_bytes(
+                let old_val = decode_ty_from_bytes_with_layouts(
                     &bytes,
                     effective_off,
                     &effective_ty,
                     &self.mir.enums,
+                    &self.mir.layouts,
                     &self.mir.module_path,
                 )?;
                 apply_assign_op(op, old_val, rhs)?
             };
-            encode_ty_to_bytes(
+            encode_ty_to_bytes_with_layouts(
                 &mut bytes,
                 effective_off,
                 &effective_ty,
                 &new_val,
                 &self.mir.enums,
+                &self.mir.layouts,
                 &self.mir.module_path,
             )?;
             if write_entity_pod_bytes(self.app.world_mut(), entity, reg.handle, &bytes).is_ok() {
                 return Ok(());
             }
             // Host non-raw-insertable POD fallback via `apply_entity_component_fields`.
-            let fsize = field_byte_size(&effective_ty, &self.mir.enums, &self.mir.module_path);
+            let fsize = field_byte_size_with_layouts(
+                &effective_ty,
+                &self.mir.enums,
+                &self.mir.layouts,
+                &self.mir.module_path,
+            );
             let rec = ExportedFieldRecord {
                 field_name: segments.join("."),
                 type_tag: effective_ty.canonical_tag(),
@@ -2772,7 +2919,7 @@ impl<'a> SimRunner<'a> {
                 .map_err(|e| format!("apply_entity_component_fields failed: {e:?}"));
         }
 
-        // Non-POD host component path via `export_entity_component_fields` / `apply_entity_component_fields`.
+        // Host non-POD host component path via `export_entity_component_fields` / `apply_entity_component_fields`.
         let exported = export_entity_component_fields(self.app.world(), entity, reg.handle)
             .map_err(|e| format!("export_entity_component_fields failed: {e:?}"))?;
         let fname = segments.first().map(String::as_str).unwrap_or("");
@@ -2785,21 +2932,23 @@ impl<'a> SimRunner<'a> {
         let new_val = if op == HirAssignOp::Set {
             rhs
         } else {
-            let old_val = decode_ty_from_bytes(
+            let old_val = decode_ty_from_bytes_with_layouts(
                 &fbytes,
                 rel_off,
                 &effective_ty,
                 &self.mir.enums,
+                &self.mir.layouts,
                 &self.mir.module_path,
             )?;
             apply_assign_op(op, old_val, rhs)?
         };
-        encode_ty_to_bytes(
+        encode_ty_to_bytes_with_layouts(
             &mut fbytes,
             rel_off,
             &effective_ty,
             &new_val,
             &self.mir.enums,
+            &self.mir.layouts,
             &self.mir.module_path,
         )?;
         let rec = ExportedFieldRecord {
@@ -2873,11 +3022,12 @@ impl<'a> SimRunner<'a> {
                 .iter()
                 .find(|r| r.field_name == fname)
                 .ok_or_else(|| format!("host resource `{resource}` has no field `{fname}`"))?;
-            let val = decode_ty_from_bytes(
+            let val = decode_ty_from_bytes_with_layouts(
                 &rec.bytes,
                 0,
                 &cur_ty,
                 &self.mir.enums,
+                &self.mir.layouts,
                 &self.mir.module_path,
             )?;
             return match lane_opt {
@@ -2938,21 +3088,23 @@ impl<'a> SimRunner<'a> {
             let new_val = if op == HirAssignOp::Set {
                 rhs
             } else {
-                let old_val = decode_ty_from_bytes(
+                let old_val = decode_ty_from_bytes_with_layouts(
                     &fbytes,
                     rel_off,
                     &eff_ty,
                     &self.mir.enums,
+                    &self.mir.layouts,
                     &self.mir.module_path,
                 )?;
                 apply_assign_op(op, old_val, rhs)?
             };
-            encode_ty_to_bytes(
+            encode_ty_to_bytes_with_layouts(
                 &mut fbytes,
                 rel_off,
                 &eff_ty,
                 &new_val,
                 &self.mir.enums,
+                &self.mir.layouts,
                 &self.mir.module_path,
             )?;
             let patch = ExportedFieldRecord {
@@ -3374,12 +3526,13 @@ impl<'a> SimRunner<'a> {
                     if let Some(sf) = layout.fields.iter().find(|f| f.name == *fname)
                         && let Some(sv) = mir_const_to_sim_val(dval)
                     {
-                        let _ = encode_ty_to_bytes(
+                        let _ = encode_ty_to_bytes_with_layouts(
                             &mut bytes,
                             sf.offset,
                             &sf.ty,
                             &sv,
                             &self.mir.enums,
+                            &self.mir.layouts,
                             &self.mir.module_path,
                         );
                     }
@@ -3397,12 +3550,13 @@ impl<'a> SimRunner<'a> {
                             layout.canonical_name
                         )
                     })?;
-                encode_ty_to_bytes(
+                encode_ty_to_bytes_with_layouts(
                     &mut bytes,
                     sf.offset,
                     &sf.ty,
                     fval,
                     &self.mir.enums,
+                    &self.mir.layouts,
                     &self.mir.module_path,
                 )?;
             }
@@ -3576,26 +3730,66 @@ pub(crate) fn extract_vec_lane_val(val: SimVal, lane: u8) -> Result<SimVal, Stri
     }
 }
 
-pub(crate) fn field_byte_size(ty: &Ty, enums: &[EnumDef], module_path: &str) -> usize {
+pub(crate) fn ty_layout_size_align(
+    ty: &Ty,
+    enums: &[EnumDef],
+    layouts: &[SolvedLayout],
+    module_path: &str,
+) -> (usize, usize) {
     match ty {
-        Ty::Bool | Ty::U8 | Ty::I8 => 1,
-        Ty::U16 | Ty::I16 => 2,
-        Ty::U64 | Ty::I64 | Ty::F64 | Ty::Fix64 | Ty::Vec2 | Ty::UVec2 | Ty::IVec2 => 8,
-        Ty::Vec3 | Ty::IVec3 => 12,
-        Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => 16,
-        Ty::Ref(n) if n == "Entity" => 8,
+        Ty::Bool | Ty::U8 | Ty::I8 => (1, 1),
+        Ty::U16 | Ty::I16 => (2, 2),
+        Ty::U64 | Ty::I64 | Ty::F64 | Ty::Fix64 | Ty::Vec2 | Ty::UVec2 | Ty::IVec2 => (8, 8),
+        Ty::Vec3 | Ty::IVec3 => (12, 4),
+        Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => (16, 16),
+        Ty::Ref(n) if n == "Entity" => (8, 8),
+        Ty::InlineStr(cap) => (4 + cap.div_ceil(4) * 4, 4),
+        Ty::Array { elem, len } => {
+            let (es, ea) = ty_layout_size_align(elem, enums, layouts, module_path);
+            let ea = ea.max(1);
+            let stride = es.div_ceil(ea) * ea;
+            (stride * *len, ea)
+        }
+        Ty::SmallVec { elem, cap } => {
+            let (es, ea) = ty_layout_size_align(elem, enums, layouts, module_path);
+            let align = ea.max(4);
+            let stride = es.div_ceil(ea.max(1)) * ea.max(1);
+            (8 + stride * *cap, align)
+        }
+        Ty::InputBuffer { cap, .. } => (cap * 8, 4),
         Ty::Named(n) => {
             let q = format!("{module_path}::{n}");
-            enums
-                .iter()
-                .find(|e| e.canonical_name == *n || e.canonical_name == q)
-                .map(|e| e.repr_bytes)
-                .unwrap_or(4)
+            if let Some(ed) = enums.iter().find(|e| {
+                e.canonical_name == *n
+                    || e.canonical_name == q
+                    || e.canonical_name.rsplit("::").next() == Some(n.as_str())
+            }) {
+                return (ed.repr_bytes, ed.repr_bytes.max(1));
+            }
+            if let Some(l) = find_layout_in_slice(layouts, module_path, n) {
+                return (l.size, l.align.max(1));
+            }
+            (4, 4)
         }
-        _ => 4,
+        _ => (4, 4),
     }
 }
 
+pub(crate) fn field_byte_size_with_layouts(
+    ty: &Ty,
+    enums: &[EnumDef],
+    layouts: &[SolvedLayout],
+    module_path: &str,
+) -> usize {
+    ty_layout_size_align(ty, enums, layouts, module_path).0
+}
+
+#[allow(dead_code)]
+pub(crate) fn field_byte_size(ty: &Ty, enums: &[EnumDef], module_path: &str) -> usize {
+    field_byte_size_with_layouts(ty, enums, &[], module_path)
+}
+
+#[allow(dead_code)]
 pub(crate) fn decode_ty_from_bytes(
     bytes: &[u8],
     offset: usize,
@@ -3603,7 +3797,18 @@ pub(crate) fn decode_ty_from_bytes(
     enums: &[EnumDef],
     module_path: &str,
 ) -> Result<SimVal, String> {
-    let need = field_byte_size(ty, enums, module_path);
+    decode_ty_from_bytes_with_layouts(bytes, offset, ty, enums, &[], module_path)
+}
+
+pub(crate) fn decode_ty_from_bytes_with_layouts(
+    bytes: &[u8],
+    offset: usize,
+    ty: &Ty,
+    enums: &[EnumDef],
+    layouts: &[SolvedLayout],
+    module_path: &str,
+) -> Result<SimVal, String> {
+    let need = field_byte_size_with_layouts(ty, enums, layouts, module_path);
     if offset + need > bytes.len() {
         return Err(format!(
             "POD field read out of bounds: offset={offset}, need={need}, len={}",
@@ -3685,12 +3890,37 @@ pub(crate) fn decode_ty_from_bytes(
                 Ok(SimVal::Entity(Some(Entity::from_bits(bits))))
             }
         }
+        Ty::InlineStr(cap) => {
+            let raw_len = u32::from_le_bytes(slice[0..4].try_into().unwrap()) as usize;
+            let max_bytes = (*cap).min(slice.len().saturating_sub(4));
+            let used = raw_len.min(max_bytes);
+            Ok(SimVal::String(
+                String::from_utf8_lossy(&slice[4..4 + used]).into_owned(),
+            ))
+        }
+        Ty::Array { elem, len } => {
+            let (es, ea) = ty_layout_size_align(elem, enums, layouts, module_path);
+            let stride = es.div_ceil(ea.max(1)) * ea.max(1);
+            let mut out = Vec::with_capacity(*len);
+            for i in 0..*len {
+                out.push(decode_ty_from_bytes_with_layouts(
+                    slice,
+                    i * stride,
+                    elem,
+                    enums,
+                    layouts,
+                    module_path,
+                )?);
+            }
+            Ok(SimVal::Array(out))
+        }
         Ty::Named(n) => {
             let q = format!("{module_path}::{n}");
-            if let Some(ed) = enums
-                .iter()
-                .find(|e| e.canonical_name == *n || e.canonical_name == q)
-            {
+            if let Some(ed) = enums.iter().find(|e| {
+                e.canonical_name == *n
+                    || e.canonical_name == q
+                    || e.canonical_name.rsplit("::").next() == Some(n.as_str())
+            }) {
                 let v = match (ed.repr_bytes, ed.is_signed) {
                     (1, _) => i64::from(slice[0]),
                     (2, _) => i64::from(u16::from_le_bytes(slice.try_into().unwrap())),
@@ -3699,21 +3929,43 @@ pub(crate) fn decode_ty_from_bytes(
                 };
                 return Ok(SimVal::Int(v));
             }
+            if let Some(layout) = find_layout_in_slice(layouts, module_path, n) {
+                let mut fields = Vec::with_capacity(layout.fields.len());
+                for sf in &layout.fields {
+                    if sf.is_padding {
+                        continue;
+                    }
+                    let fv = decode_ty_from_bytes_with_layouts(
+                        slice,
+                        sf.offset,
+                        &sf.ty,
+                        enums,
+                        layouts,
+                        module_path,
+                    )?;
+                    fields.push((sf.name.clone(), fv));
+                }
+                return Ok(SimVal::Struct {
+                    _name: layout.canonical_name.clone(),
+                    fields,
+                });
+            }
             Err(format!("unsupported POD field type `{ty:?}`"))
         }
         _ => Err(format!("unsupported POD field type `{ty:?}`")),
     }
 }
 
-pub(crate) fn encode_ty_to_bytes(
+pub(crate) fn encode_ty_to_bytes_with_layouts(
     bytes: &mut [u8],
     offset: usize,
     ty: &Ty,
     val: &SimVal,
     enums: &[EnumDef],
+    layouts: &[SolvedLayout],
     module_path: &str,
 ) -> Result<(), String> {
-    let need = field_byte_size(ty, enums, module_path);
+    let need = field_byte_size_with_layouts(ty, enums, layouts, module_path);
     if offset + need > bytes.len() {
         return Err(format!(
             "POD field write out of bounds: offset={offset}, need={need}, len={}",
@@ -3811,17 +4063,85 @@ pub(crate) fn encode_ty_to_bytes(
             };
             slice.copy_from_slice(&bits.to_le_bytes());
         }
+        Ty::InlineStr(cap) => {
+            let SimVal::String(s) = val else {
+                return Err(format!("expected InlineStr string, got `{val:?}`"));
+            };
+            slice.fill(0);
+            let max_bytes = (*cap).min(slice.len().saturating_sub(4));
+            let mut end = s.len().min(max_bytes);
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            slice[0..4].copy_from_slice(&(end as u32).to_le_bytes());
+            slice[4..4 + end].copy_from_slice(&s.as_bytes()[..end]);
+        }
+        Ty::Array { elem, len } => {
+            let SimVal::Array(elems) = val else {
+                return Err(format!("expected array `[T; {len}]`, got `{val:?}`"));
+            };
+            if elems.len() != *len {
+                return Err(format!(
+                    "array length mismatch: expected {len}, got {}",
+                    elems.len()
+                ));
+            }
+            slice.fill(0);
+            let (es, ea) = ty_layout_size_align(elem, enums, layouts, module_path);
+            let stride = es.div_ceil(ea.max(1)) * ea.max(1);
+            for (i, elem_val) in elems.iter().enumerate() {
+                encode_ty_to_bytes_with_layouts(
+                    slice,
+                    i * stride,
+                    elem,
+                    elem_val,
+                    enums,
+                    layouts,
+                    module_path,
+                )?;
+            }
+        }
         Ty::Named(n) => {
             let q = format!("{module_path}::{n}");
-            if let Some(ed) = enums
-                .iter()
-                .find(|e| e.canonical_name == *n || e.canonical_name == q)
-            {
+            if let Some(ed) = enums.iter().find(|e| {
+                e.canonical_name == *n
+                    || e.canonical_name == q
+                    || e.canonical_name.rsplit("::").next() == Some(n.as_str())
+            }) {
                 let iv = as_int(val)?;
                 match ed.repr_bytes {
                     1 => slice[0] = iv as u8,
                     2 => slice.copy_from_slice(&(iv as u16).to_le_bytes()),
                     _ => slice.copy_from_slice(&(iv as u32).to_le_bytes()),
+                }
+                return Ok(());
+            }
+            if let Some(layout) = find_layout_in_slice(layouts, module_path, n) {
+                let SimVal::Struct { fields, .. } = val else {
+                    return Err(format!("expected struct `{n}`, got `{val:?}`"));
+                };
+                let layout = layout.clone();
+                slice.fill(0);
+                for (fname, fval) in fields {
+                    let Some(sf) = layout
+                        .fields
+                        .iter()
+                        .find(|sf| !sf.is_padding && sf.name == *fname)
+                    else {
+                        return Err(format!(
+                            "struct `{}` has no field `{fname}`",
+                            layout.canonical_name
+                        ));
+                    };
+                    encode_ty_to_bytes_with_layouts(
+                        slice,
+                        sf.offset,
+                        &sf.ty,
+                        fval,
+                        enums,
+                        layouts,
+                        module_path,
+                    )?;
                 }
                 return Ok(());
             }
@@ -3876,6 +4196,14 @@ pub(crate) fn sim_val_eq(a: &SimVal, b: &SimVal) -> bool {
         }
         (SimVal::QueryHit { entity: a, .. }, SimVal::QueryHit { entity: b, .. }) => a == b,
         (SimVal::OptionHit(Some(x)), SimVal::OptionHit(Some(y))) => sim_val_eq(x, y),
+        (SimVal::Array(a), SimVal::Array(b)) | (SimVal::Tuple(a), SimVal::Tuple(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| sim_val_eq(x, y))
+        }
+        (SimVal::Struct { fields: a, .. }, SimVal::Struct { fields: b, .. }) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(k, v)| b.iter().any(|(bk, bv)| bk == k && sim_val_eq(v, bv)))
+        }
         _ => false,
     }
 }
@@ -4424,6 +4752,7 @@ resource HostClock { dt: f32 = 0.016, paused: bool = false }
             ctrl_layout: None,
             res_ops: HashMap::new(),
             obj_ops: HashMap::new(),
+            user_update_systems: Vec::new(),
         };
         let mut runner = SimRunner {
             app: &mut app,
@@ -4456,5 +4785,24 @@ resource HostClock { dt: f32 = 0.016, paused: bool = false }
             .unwrap();
         assert!(as_bool(&paused).unwrap());
         assert!(app.world().resource::<HostClock>().paused);
+    }
+
+    #[test]
+    fn ensure_child_of_registered_populates_mod_registry() {
+        let mut world = World::new();
+        world.insert_resource(ModRegistry::default());
+        assert!(
+            world
+                .resource::<ModRegistry>()
+                .get_by_name(bamabi_sys::BAM_CHILD_OF_NAME)
+                .is_none()
+        );
+        ensure_child_of_registered(&mut world);
+        assert!(
+            world
+                .resource::<ModRegistry>()
+                .get_by_name(bamabi_sys::BAM_CHILD_OF_NAME)
+                .is_some()
+        );
     }
 }

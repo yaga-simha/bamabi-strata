@@ -1221,3 +1221,388 @@ schedule FixedUpdate { noop_tick }
         );
     }
 }
+
+#[test]
+fn nt_02_role_filters_obs_task_fsm_timeline_and_blocks_client_server_overwrite() {
+    let _test_guard = NET_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("nt02_roles.strata");
+    fs::write(
+        &p,
+        r#"
+module test::nt02_roles @version(1.0.0);
+
+@authority(server)
+@net(reliable, channel = 0)
+resource SrvVault {
+    gold: u32 = 100,
+    obs_hits: u32 = 0,
+}
+
+@authority(server)
+@net(reliable, channel = 0)
+component RoleState {
+    fsm_ticks: u32 = 0,
+    task_hits: u32 = 0,
+    tl_hits: u32 = 0,
+}
+
+event SrvPing { val: u32 }
+
+obs on_srv_ping(trg: &Trigger<SrvPing>, vault: &mut res SrvVault) {
+    let ev = trg.payload;
+    vault.obs_hits += ev.val;
+}
+
+@sparse
+timeline SrvTl @rate(60_hz) @duration(4_f) {
+    at 1_f => trigger(self, SrvPing { val: 5_u32 });
+}
+
+fsm SrvFsm @require(RoleState) {
+    initial Active;
+    state Active {
+        on_tick {
+            for r in query(rs: &mut RoleState) {
+                r.rs.fsm_ticks += 1_u32;
+            }
+        }
+        to Active when false;
+    }
+}
+
+@sparse
+task SrvTask()
+on (rs: &mut RoleState) {
+    rs.task_hits += 1_u32;
+    yield_tick;
+    rs.task_hits += 1_u32;
+}
+
+object Hero {
+    RoleState { fsm_ticks: 0, task_hits: 0, tl_hits: 0 },
+}
+
+@authority(server)
+sys kick_srv() {
+    for e in query(rs: &mut RoleState) {
+        if e.rs.tl_hits == 0_u32 {
+            e.rs.tl_hits = 1_u32;
+            insert @if_new(e.id, SrvTask::start());
+            insert @if_new(e.id, SrvTl::start());
+            insert @if_new(e.id, SrvFsm::start());
+        }
+    }
+}
+
+schedule FixedUpdate { kick_srv }
+
+net_sim_test "server_only_obs_fsm_task_tl_and_srv_res_not_overwritten"(latency: 16ms, jitter: 0ms, loss: 0.0, seed: 3, clients: 1) {
+    // Stepping client alone must NOT execute server-only fsm/obs/task/timeline.
+    client_step(0, 4);
+    let cli_rs0 = client_query(0, rs: &RoleState).on(Hero).unwrap().rs;
+    assert_eq(cli_rs0.fsm_ticks, 0_u32);
+    assert_eq(cli_rs0.task_hits, 0_u32);
+    assert_eq(client_res<SrvVault>(0).obs_hits, 0_u32);
+
+    // Client tampering `@authority(server)` resource must NOT overwrite server authority.
+    client_res<SrvVault>(0).gold = 9999_u32;
+    step_net(6);
+    assert_eq(server_res<SrvVault>().gold, 100_u32);
+    assert(server_query(rs: &RoleState).on(Hero).unwrap().rs.fsm_ticks >= 4_u32);
+    assert_eq(server_query(rs: &RoleState).on(Hero).unwrap().rs.task_hits, 2_u32);
+    assert_eq(server_res<SrvVault>().obs_hits, 5_u32);
+    assert_converged();
+    assert_eq(client_res<SrvVault>(0).gold, 100_u32);
+}
+"#,
+    )
+    .unwrap();
+
+    let (rc, out) = cmd_test(&p, OutputFormat::Json);
+    assert_eq!(rc, EXIT_OK, "NT-02 test failed:\n{out}");
+}
+
+#[test]
+fn nt_07_unreliable_monotonicity_dynamic_replication_and_late_join_baseline() {
+    let _test_guard = NET_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+
+    // 1. Positive path: unreliable snapshot monotonicity under jitter + dynamic spawn/remove + late join baseline.
+    let ok_path = tmp.path().join("nt07_ok.strata");
+    fs::write(
+        &ok_path,
+        r#"
+module test::nt07_ok @version(1.0.0);
+
+@authority(server)
+@net(unreliable, rate = 60Hz, channel = 1)
+component Snap {
+    seq: u32 = 0,
+}
+
+@authority(server)
+@net(reliable, channel = 0)
+component DynBadge {
+    score: u32 = 0,
+}
+
+resource SpawnerCtl {
+    remove_now: bool = false,
+}
+
+object Anchor {
+    Snap { seq: 0 },
+}
+
+@authority(server)
+sys tick_snap(ctl: &res SpawnerCtl) {
+    for s in query(sn: &mut Snap) {
+        if s.sn.seq < 20_u32 {
+            s.sn.seq += 1_u32;
+        }
+    }
+    if ctl.remove_now {
+        for d in query(b: &DynBadge) {
+            despawn(d.id);
+        }
+    }
+}
+
+schedule FixedUpdate { tick_snap }
+
+net_sim_test "unreliable_monotonic_and_late_join_and_dynamic_cleanup"(latency: 30ms, jitter: 25ms, loss: 0.2, seed: 7, clients: 1) {
+    let mut prev: u32 = 0_u32;
+    let mut i: i32 = 0;
+    while i < 20 {
+        step_net(1);
+        let cur = client_query(0, sn: &Snap).on(Anchor).unwrap().sn.seq;
+        assert(cur >= prev);
+        prev = cur;
+        i += 1;
+    }
+
+    // Dynamic server spawn replicates to clients after channel drains.
+    let _dyn_ent = server_spawn(DynBadge { score: 77_u32 });
+    step_net(10);
+    assert_converged();
+
+    // Late-joining client 1 receives baseline state snapshot cleanly.
+    spawn_client(1);
+    step_net(10);
+    assert_converged(1);
+
+    // Dynamic despawn on server replicates removal to all clients.
+    server_res<SpawnerCtl>().remove_now = true;
+    step_net(12);
+    assert_converged();
+}
+"#,
+    )
+    .unwrap();
+
+    let (rc_ok, out_ok) = cmd_test(&ok_path, OutputFormat::Json);
+    assert_eq!(rc_ok, EXIT_OK, "NT-07 positive test failed:\n{out_ok}");
+
+    // 2. Negative path: un-replicated dynamic spawn before latency must fail `assert_converged()`.
+    let fail_path = tmp.path().join("nt07_missing_dyn.strata");
+    fs::write(
+        &fail_path,
+        r#"
+module test::nt07_fail @version(1.0.0);
+
+@authority(server)
+@net(reliable, channel = 0)
+component DynOnly {
+    v: u32 = 0,
+}
+
+net_sim_test "unreplicated_dynamic_spawn_detected"(latency: 60ms, jitter: 0ms, loss: 0.0, seed: 1, clients: 1) {
+    let _e = server_spawn(DynOnly { v: 12_u32 });
+    step_net(1);
+    assert_converged();
+}
+"#,
+    )
+    .unwrap();
+    let (rc_fail, out_fail) = cmd_test(&fail_path, OutputFormat::Json);
+    assert_eq!(
+        rc_fail, EXIT_SIM_TEST_FAILED,
+        "expected unreplicated dynamic spawn to fail assert_converged: {out_fail}"
+    );
+}
+
+#[test]
+fn nt_09_wide_quantize_bounds_converge_headlessly() {
+    let _test_guard = NET_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+
+    // 1. Overflow-safe `send_rpc` wide quantize/dequantize with [-1e308, 1e308].
+    let rpc_wide_path = tmp.path().join("nt09_rpc_wide.strata");
+    fs::write(
+        &rpc_wide_path,
+        r#"
+module test::nt09_rpc_wide @version(1.0.0);
+
+@authority(server)
+resource WideRpcOut {
+    got_val: f64 = -1.0,
+    calls: u32 = 0,
+}
+
+@net_rpc(direction = client_to_server, reliability = reliable, channel = 0)
+rpc WideRpc {
+    @quantize(min = -1.0e308, max = 1.0e308, bits = 16)
+    val: f64,
+}
+
+obs on_wide_rpc(trg: &Trigger<WideRpc>, out: &mut res WideRpcOut) {
+    let p = trg.payload;
+    out.got_val = p.val;
+    out.calls += 1_u32;
+}
+
+net_sim_test "wide_quantize_rpc_remains_finite_and_accurate"(latency: 16ms, jitter: 0ms, loss: 0.0, seed: 1, clients: 1) {
+    send_rpc(0, WideRpc { val: 1.0e307_f64 });
+    step_net(5);
+    assert_eq(server_res<WideRpcOut>().calls, 1_u32);
+    let got = server_res<WideRpcOut>().got_val;
+    assert(got == got);
+}
+"#,
+    )
+    .unwrap();
+    let (rc_ok, out_ok) = cmd_test(&rpc_wide_path, OutputFormat::Json);
+    assert_eq!(rc_ok, EXIT_OK, "NT-09 wide RPC quantize failed:\n{out_ok}");
+
+    // 2. Non-finite 1-bit step tolerance on [-1e308, 1e308] must fail mismatch instead of passing `+Inf`.
+    let mismatch_path = tmp.path().join("nt09_inf_tol.strata");
+    fs::write(
+        &mismatch_path,
+        r#"
+module test::nt09_inf_tol @version(1.0.0);
+
+@authority(server)
+@net(unreliable, channel = 0)
+component WideOneBit {
+    @quantize(min = -1.0e308, max = 1.0e308, bits = 1)
+    val: f64 = 0.0,
+}
+
+object Anchor {
+    WideOneBit { val: 0.0 },
+}
+
+@authority(server)
+sys mutate_wide() {
+    for w in query(wb: &mut WideOneBit) {
+        w.wb.val = 1234.5;
+    }
+}
+
+schedule FixedUpdate { mutate_wide }
+
+net_sim_test "infinite_step_tol_must_not_mask_mismatch"(latency: 0ms, jitter: 0ms, loss: 1.0, seed: 1, clients: 1) {
+    step_net(2);
+    assert_converged();
+}
+"#,
+    )
+    .unwrap();
+    let (rc_fail, out_fail) = cmd_test(&mismatch_path, OutputFormat::Json);
+    assert_eq!(
+        rc_fail, EXIT_SIM_TEST_FAILED,
+        "non-finite effective_step tolerance must not pass mismatched assert_converged: {out_fail}"
+    );
+}
+
+#[test]
+fn nt_10_composite_rpc_and_packet_kind_rpc_runtime_dispatch() {
+    let _test_guard = NET_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("nt10_rpc.strata");
+    fs::write(
+        &p,
+        r#"
+module test::nt10_rpc @version(1.0.0);
+
+struct PayloadMeta {
+    tier: u32 = 0,
+    label: InlineStr<16> = "init",
+}
+
+@authority(server)
+@net(reliable, channel = 0)
+resource RpcAudit {
+    calls: u32 = 0,
+    last_val: u32 = 0,
+}
+
+@authority(server)
+@net(reliable, channel = 0)
+component ActorState {
+    meta: PayloadMeta = PayloadMeta { tier: 0, label: "init" },
+    codes: [u32; 3] = [0, 0, 0],
+}
+
+@net_rpc(direction = client_to_server, reliability = reliable, channel = 0)
+rpc PingRpc {
+    val: u32,
+}
+
+@net_rpc(direction = client_to_server, reliability = reliable, channel = 0)
+rpc ComplexCmd {
+    meta: PayloadMeta,
+    codes: [u32; 3],
+}
+
+object Hero {
+    ActorState {
+        meta: PayloadMeta { tier: 0, label: "init" },
+        codes: [0, 0, 0],
+    },
+}
+
+obs on_ping_rpc(trg: &Trigger<PingRpc>, audit: &mut res RpcAudit) {
+    let p = trg.payload;
+    audit.calls += 1_u32;
+    audit.last_val = p.val;
+    for a in query(st: &mut ActorState) {
+        a.st.meta.tier = p.val;
+    }
+}
+
+net_sim_test "composite_rpc_dispatches_to_obs_and_converges"(latency: 16ms, jitter: 0ms, loss: 0.0, seed: 9, clients: 1) {
+    send_rpc(0, PingRpc { val: 42_u32 });
+    send_rpc(0, ComplexCmd {
+        meta: PayloadMeta { tier: 7_u32, label: "alpha" },
+        codes: [10_u32, 20_u32, 30_u32],
+    });
+    let dyn_hero = server_spawn(ActorState {
+        meta: PayloadMeta { tier: 7_u32, label: "alpha" },
+        codes: [10_u32, 20_u32, 30_u32],
+    });
+    if let Some(h) = server_query(st: &mut ActorState).on(Hero) {
+        h.st.meta = PayloadMeta { tier: 3_u32, label: "bravo" };
+        h.st.codes = [1_u32, 2_u32, 3_u32];
+    }
+    step_net(6);
+    assert_eq(server_res<RpcAudit>().calls, 1_u32);
+    assert_eq(server_res<RpcAudit>().last_val, 42_u32);
+    assert_converged();
+    let cli_hero = client_query(0, st: &ActorState).on(Hero).unwrap().st;
+    assert_eq(cli_hero.meta.tier, 42_u32);
+    assert_eq(cli_hero.meta.label, "bravo");
+    assert_eq(cli_hero.codes[2], 3_u32);
+    let cli_dyn = client_query(0, st: &ActorState).on(dyn_hero);
+    assert(cli_dyn.is_none() == false);
+    assert_eq(cli_dyn.unwrap().st.meta.label, "alpha");
+    assert_eq(cli_dyn.unwrap().st.codes[1], 20_u32);
+}
+"#,
+    )
+    .unwrap();
+
+    let (rc, out) = cmd_test(&p, OutputFormat::Json);
+    assert_eq!(rc, EXIT_OK, "NT-10a/c test failed:\n{out}");
+}

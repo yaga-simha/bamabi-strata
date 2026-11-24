@@ -5,16 +5,18 @@
 use crate::commands::SimTestCaseResult;
 use crate::sim_runner::{
     DispatchMetadata, SIM_EXEC_MUTEX, SimRunner, SimVal, apply_assign_op, as_bool, as_float,
-    as_int, augment_mir_for_sim_tests, encode_ty_to_bytes, eval_binop_vals, eval_cast,
+    as_int, augment_mir_for_sim_tests, configure_dedicated_dispatch,
+    encode_ty_to_bytes_with_layouts, ensure_child_of_registered, eval_binop_vals, eval_cast,
     eval_math_fn, eval_unary, find_layout_in_slice, find_registry_component, sim_val_eq,
 };
 use bamabi_host::prelude::*;
 use bamabi_host::{ModBudgetTelemetry, write_entity_pod_bytes};
 use bamabi_native_rt::{
-    FLAG_IS_RELIABLE, FLAG_IS_RPC, PACKET_KIND_COMPONENT_DELTA, PACKET_KIND_RESOURCE_DELTA,
-    PACKET_KIND_RPC, STRATA_NET_MAX_PAYLOAD_BYTES, STRATA_NET_PACKET_MAGIC,
-    STRATA_NET_WIRE_VERSION, SharedBridgeAppExt, StrataNetPacket, pack_bits_le,
-    quantize_scalar_f64, verify_handshake_fingerprint,
+    FLAG_IS_PREDICTED, FLAG_IS_RELIABLE, FLAG_IS_RESOURCE, FLAG_IS_RPC,
+    PACKET_KIND_COMPONENT_DELTA, PACKET_KIND_RESOURCE_DELTA, PACKET_KIND_RPC,
+    STRATA_NET_MAX_PAYLOAD_BYTES, STRATA_NET_PACKET_MAGIC, STRATA_NET_WIRE_VERSION,
+    SharedBridgeAppExt, StrataNetPacket, dequantize_scalar_f64, pack_bits_le, quantize_scalar_f64,
+    unpack_bits_le, verify_handshake_fingerprint,
 };
 use bamabi_sys::fnv1a_64_str;
 use bevy_app::{App, FixedUpdate, PostStartup, Startup};
@@ -25,13 +27,18 @@ use stats_alloc::{INSTRUMENTED_SYSTEM, Region};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use strata_jit::{JitCompileOptions, JitOptLevel, compile_module_to_dylib};
-use strata_mir::{MirFnKind, MirModule, MirNetComponent, MirRpc, MirType, verify_mir};
-use strata_sema::access::TermAccessMode;
+use strata_mir::{
+    BasicBlock, BlockId, Inst, LocalId, MirFnKind, MirFunction, MirModule, MirNetComponent,
+    MirQueryBinding, MirQueryTermBinding, MirRpc, MirStmt, MirStreamOp, MirStreamOpKind, MirType,
+    Terminator, verify_mir,
+};
+use strata_sema::access::{QueryAccessDesc, QueryTerm, TermAccessMode};
 use strata_sema::hir::{
     AuthorityKind, HirAssignOp, HirBinOp, HirCall, HirExpr, HirFor, HirForIter, HirLValue,
     HirPattern, HirQuery, HirQueryTerm, HirSchedule, HirScheduleGroup, HirStmt, HirUnOp,
     NetDirection, NetReliability,
 };
+use strata_sema::layout::{LayoutEnv, SchemaItemKind, solve_pod_layout};
 use strata_sema::types::Ty;
 use tempfile::TempDir;
 
@@ -97,12 +104,123 @@ struct CompiledNetArtifacts {
     client_dylib: PathBuf,
 }
 
+fn is_server_auth_key(mir: &MirModule, key: &str) -> bool {
+    let bare = bare_name(key);
+    mir.net_components.iter().any(|nc| {
+        nc.authority == AuthorityKind::Server
+            && (nc.canonical_name == key
+                || nc.name == bare
+                || nc.canonical_name.rsplit("::").next() == Some(bare))
+    })
+}
+
+fn fn_mutates_server_state(
+    mir: &MirModule,
+    func: &MirFunction,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(func.name.clone()) {
+        return false;
+    }
+    if func.resources.iter().any(|r| {
+        r.mutable
+            && (is_server_auth_key(mir, &r.canonical_name)
+                || is_server_auth_key(mir, &r.resource_name))
+    }) {
+        return true;
+    }
+    if func.queries.iter().any(|q| {
+        q.terms
+            .iter()
+            .any(|t| t.mode.is_mutable() && is_server_auth_key(mir, &t.storage_key))
+    }) {
+        return true;
+    }
+    if func.query_bindings.iter().any(|qb| {
+        qb.terms.iter().any(|t| {
+            t.mode.is_mutable()
+                && (is_server_auth_key(mir, &t.canonical_component)
+                    || is_server_auth_key(mir, &t.storage_key))
+        })
+    }) {
+        return true;
+    }
+    for bb in &func.blocks {
+        for stmt in &bb.stmts {
+            match &stmt.inst {
+                Inst::ResWrite { resource } if is_server_auth_key(mir, resource) => return true,
+                Inst::FieldStore { layout_key, .. } if is_server_auth_key(mir, layout_key) => {
+                    return true;
+                }
+                Inst::CmdInsert { component, .. } | Inst::CmdRemove { component, .. }
+                    if is_server_auth_key(mir, component) =>
+                {
+                    return true;
+                }
+                Inst::CmdDespawn { .. }
+                    if func.queries.iter().any(|q| {
+                        q.terms
+                            .iter()
+                            .any(|t| is_server_auth_key(mir, &t.storage_key))
+                    }) =>
+                {
+                    return true;
+                }
+                Inst::Call { callee, .. } => {
+                    let cbare = bare_name(callee);
+                    if let Some(helper) = mir
+                        .fns
+                        .iter()
+                        .find(|h| h.name == *callee || bare_name(&h.name) == cbare)
+                        && fn_mutates_server_state(mir, helper, visited)
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+fn is_role_filtered_fn_kind(kind: &MirFnKind) -> bool {
+    matches!(
+        kind,
+        MirFnKind::System
+            | MirFnKind::Observer { .. }
+            | MirFnKind::SynthesizedTask
+            | MirFnKind::SynthesizedFsm
+            | MirFnKind::SynthesizedTimeline
+    )
+}
+
+fn effective_fn_authority(mir: &MirModule, f: &MirFunction) -> AuthorityKind {
+    if f.is_predicted {
+        return AuthorityKind::Predicted;
+    }
+    if f.authority != AuthorityKind::Unspecified {
+        return f.authority;
+    }
+    if matches!(
+        f.kind,
+        MirFnKind::Observer { .. }
+            | MirFnKind::SynthesizedTask
+            | MirFnKind::SynthesizedFsm
+            | MirFnKind::SynthesizedTimeline
+    ) && fn_mutates_server_state(mir, f, &mut HashSet::new())
+    {
+        return AuthorityKind::Server;
+    }
+    AuthorityKind::Unspecified
+}
+
 fn has_role_restricted_systems(mir: &MirModule) -> bool {
     mir.functions.iter().any(|f| {
-        matches!(f.kind, MirFnKind::System)
+        is_role_filtered_fn_kind(&f.kind)
             && (f.is_predicted
                 || matches!(
-                    f.authority,
+                    effective_fn_authority(mir, f),
                     AuthorityKind::Server | AuthorityKind::Client | AuthorityKind::Predicted
                 ))
     })
@@ -143,23 +261,26 @@ fn prune_schedule_group(
 
 fn filter_mir_for_role(mir: &MirModule, role: NetWorldRole) -> MirModule {
     let mut filtered = mir.clone();
-    filtered.functions.retain(|f| match f.kind {
-        MirFnKind::System => match role {
+    filtered.functions.retain(|f| {
+        if !is_role_filtered_fn_kind(&f.kind) {
+            return true;
+        }
+        let auth = effective_fn_authority(mir, f);
+        match role {
             NetWorldRole::Server => {
                 matches!(
-                    f.authority,
+                    auth,
                     AuthorityKind::Server | AuthorityKind::Shared | AuthorityKind::Unspecified
                 ) && !f.is_predicted
             }
             NetWorldRole::Client => matches!(
-                f.authority,
+                auth,
                 AuthorityKind::Client
                     | AuthorityKind::Predicted
                     | AuthorityKind::Shared
                     | AuthorityKind::Unspecified
             ),
-        },
-        _ => true,
+        }
     });
 
     let mut kept_names: HashSet<String> = HashSet::new();
@@ -167,15 +288,13 @@ fn filter_mir_for_role(mir: &MirModule, role: NetWorldRole) -> MirModule {
         kept_names.insert(f.name.clone());
         kept_names.insert(bare_name(&f.name).to_owned());
     }
-    for tl in &filtered.timelines {
-        kept_names.insert(tl.name.clone());
-    }
-    for task in &filtered.tasks {
-        kept_names.insert(task.name.clone());
-    }
-    for fsm in &filtered.fsms {
-        kept_names.insert(fsm.name.clone());
-    }
+    filtered
+        .timelines
+        .retain(|tl| kept_names.contains(&tl.name) || kept_names.contains(&tl.canonical_name));
+    filtered
+        .tasks
+        .retain(|task| kept_names.contains(&task.name));
+    filtered.fsms.retain(|fsm| kept_names.contains(&fsm.name));
 
     let mut new_schedules = Vec::with_capacity(filtered.schedules.len());
     for s in &filtered.schedules {
@@ -196,13 +315,415 @@ fn filter_mir_for_role(mir: &MirModule, role: NetWorldRole) -> MirModule {
     filtered
 }
 
+fn rpc_slot_name(idx: usize) -> String {
+    format!("__StrataSimRpcSlot_{idx}")
+}
+
+fn augment_mir_for_rpc_dispatch(mir: &mut MirModule) -> Result<(), String> {
+    if mir.rpcs.is_empty() {
+        return Ok(());
+    }
+    let mut env = LayoutEnv::default();
+    for e in &mir.enums {
+        let size = e.repr_bytes.max(1);
+        let kind = match size {
+            1 => bamabi_sys::BamFieldKind::U8.0,
+            2 => bamabi_sys::BamFieldKind::U16.0,
+            _ => bamabi_sys::BamFieldKind::U32.0,
+        };
+        let entry = (size, size, true, kind, e.canonical_name.clone());
+        env.resolved.insert(e.canonical_name.clone(), entry.clone());
+        env.resolved
+            .entry(bare_name(&e.canonical_name).to_owned())
+            .or_insert(entry);
+    }
+    for l in &mir.layouts {
+        let short = bare_name(&l.canonical_name);
+        let entry = (
+            l.size,
+            l.align.max(1),
+            l.is_abi_pod,
+            bamabi_sys::BamFieldKind::NESTED.0,
+            l.canonical_name.clone(),
+        );
+        env.resolved.insert(l.canonical_name.clone(), entry.clone());
+        env.resolved.entry(short.to_owned()).or_insert(entry);
+    }
+
+    let rpcs = mir.rpcs.clone();
+    let mut dispatch_leaves = Vec::new();
+    for (ri, rpc) in rpcs.iter().enumerate() {
+        let has_observer = mir.functions.iter().any(|f| {
+            matches!(&f.kind, MirFnKind::Observer { event, .. }
+                if bare_name(event) == rpc.name || event == &rpc.canonical_name)
+        });
+        let has_stream_reader = mir.functions.iter().any(|f| {
+            f.stream_ops.iter().any(|op| {
+                op.kind == MirStreamOpKind::StreamRead
+                    && (op.stream == rpc.name
+                        || op.canonical_stream == rpc.canonical_name
+                        || bare_name(&op.canonical_stream) == rpc.name)
+            })
+        });
+        if !has_observer && !has_stream_reader {
+            continue;
+        }
+
+        if !mir
+            .layouts
+            .iter()
+            .any(|l| l.canonical_name == rpc.canonical_name)
+        {
+            let rpc_fields_ty: Vec<(String, Ty)> = rpc
+                .fields
+                .iter()
+                .map(|(fname, mty, _, _)| (fname.clone(), mir_type_to_ty(mty)))
+                .collect();
+            let rpc_layout = solve_pod_layout(
+                &rpc.canonical_name,
+                SchemaItemKind::Event,
+                &rpc_fields_ty,
+                0,
+                Vec::new(),
+                &env,
+            )
+            .map_err(|e| format!("failed solving RPC layout `{}`: {e:?}", rpc.canonical_name))?;
+            let rpc_entry = (
+                rpc_layout.size,
+                rpc_layout.align.max(1),
+                rpc_layout.is_abi_pod,
+                bamabi_sys::BamFieldKind::NESTED.0,
+                rpc_layout.canonical_name.clone(),
+            );
+            env.resolved
+                .insert(rpc_layout.canonical_name.clone(), rpc_entry.clone());
+            env.resolved.entry(rpc.name.clone()).or_insert(rpc_entry);
+            mir.layouts.push(rpc_layout);
+        }
+
+        let slot_short = rpc_slot_name(ri);
+        let slot_canon = if mir.module_path.is_empty() {
+            slot_short.clone()
+        } else {
+            format!("{}::{slot_short}", mir.module_path)
+        };
+        let slot_fields = if rpc.payload_bytes > 0 {
+            vec![
+                ("seq".to_owned(), Ty::U32),
+                ("payload".to_owned(), Ty::Named(rpc.canonical_name.clone())),
+            ]
+        } else {
+            vec![("seq".to_owned(), Ty::U32)]
+        };
+        let slot_layout = solve_pod_layout(
+            &slot_canon,
+            SchemaItemKind::Component,
+            &slot_fields,
+            0,
+            Vec::new(),
+            &env,
+        )
+        .map_err(|e| format!("failed solving RPC slot layout `{slot_canon}`: {e:?}"))?;
+        let payload_off = slot_layout
+            .fields
+            .iter()
+            .find(|f| f.name == "payload")
+            .map_or(0u32, |f| f.offset as u32);
+        let slot_size = slot_layout.size as u32;
+        mir.layouts.push(slot_layout);
+
+        let sys_name = format!("__strata_sim_rpc_dispatch_{ri}");
+        let mut func = MirFunction::new(sys_name.clone(), MirFnKind::System);
+        func.is_deterministic = mir.is_deterministic;
+        func.queries.push(QueryAccessDesc {
+            terms: vec![QueryTerm {
+                storage_key: slot_short.clone(),
+                field_name: None,
+                mode: TermAccessMode::Read,
+                byte_start: 0,
+                byte_end: 0,
+            }],
+            ..Default::default()
+        });
+        func.query_bindings.push(MirQueryBinding {
+            query_idx: 0,
+            terms: vec![MirQueryTermBinding {
+                term_idx: 0,
+                alias: "slot".to_owned(),
+                storage_key: slot_short.clone(),
+                canonical_component: slot_canon.clone(),
+                field_name: None,
+                mode: TermAccessMode::Read,
+                is_sparse: false,
+            }],
+            with_filters: Vec::new(),
+            without_filters: Vec::new(),
+            is_point_lookup: false,
+        });
+        if has_stream_reader {
+            func.stream_ops.push(MirStreamOp {
+                kind: MirStreamOpKind::StreamSend,
+                stream: rpc.name.clone(),
+                canonical_stream: rpc.canonical_name.clone(),
+                requires_outside_par: false,
+                channel: None,
+            });
+        }
+
+        let mut next_loc = 0u32;
+        let mut alloc = |name: &str, ty: MirType| -> LocalId {
+            let id = LocalId(next_loc);
+            next_loc += 1;
+            func.locals.push(strata_mir::MirLocal {
+                id,
+                name: name.to_owned(),
+                ty,
+            });
+            id
+        };
+
+        let entry_bb = BlockId(0);
+        let chunk_hdr = BlockId(1);
+        let chunk_body = BlockId(2);
+        let row_hdr = BlockId(3);
+        let row_body = BlockId(4);
+        let exit_bb = BlockId(5);
+
+        let has_chunk = alloc("has_chunk", MirType::Bool);
+        let chunk_len = alloc("chunk_len", MirType::U32);
+        let ents_ptr = alloc("ents", MirType::Ptr);
+        let col_ptr = alloc("col", MirType::Ptr);
+        let rslot = alloc("ridx_slot", MirType::MutPtr);
+        let zero = alloc("z", MirType::U32);
+        let ridx = alloc("ridx", MirType::U32);
+        let rcond = alloc("rcond", MirType::Bool);
+        let ent = alloc("ent", MirType::Entity);
+        let rptr = alloc("rptr", MirType::Ptr);
+        let payload_local = if rpc.payload_bytes > 0 {
+            Some(alloc("payload_ptr", MirType::Ptr))
+        } else {
+            None
+        };
+        let dummy_payload = if rpc.payload_bytes == 0 && has_stream_reader {
+            Some(alloc("dummy_pl", MirType::U32))
+        } else {
+            None
+        };
+        let one = alloc("one", MirType::U32);
+        let nxt = alloc("r_nxt", MirType::U32);
+
+        func.blocks.push(BasicBlock {
+            id: entry_bb,
+            label: "entry".to_owned(),
+            stmts: Vec::new(),
+            terminator: Terminator::Goto(chunk_hdr),
+        });
+        func.blocks.push(BasicBlock {
+            id: chunk_hdr,
+            label: "chunk_hdr".to_owned(),
+            stmts: vec![MirStmt {
+                dst: Some(has_chunk),
+                inst: Inst::IterNextChunk { query_idx: 0 },
+            }],
+            terminator: Terminator::Branch {
+                cond: has_chunk,
+                then_bb: chunk_body,
+                else_bb: exit_bb,
+            },
+        });
+        func.blocks.push(BasicBlock {
+            id: chunk_body,
+            label: "chunk_body".to_owned(),
+            stmts: vec![
+                MirStmt {
+                    dst: Some(chunk_len),
+                    inst: Inst::IterChunkLen { query_idx: 0 },
+                },
+                MirStmt {
+                    dst: Some(ents_ptr),
+                    inst: Inst::IterEntities { query_idx: 0 },
+                },
+                MirStmt {
+                    dst: Some(col_ptr),
+                    inst: Inst::IterColRead {
+                        query_idx: 0,
+                        term_idx: 0,
+                        storage_key: slot_short,
+                    },
+                },
+                MirStmt {
+                    dst: Some(rslot),
+                    inst: Inst::SlotAlloc { ty: MirType::U32 },
+                },
+                MirStmt {
+                    dst: Some(zero),
+                    inst: Inst::ConstInt { value: 0 },
+                },
+                MirStmt {
+                    dst: None,
+                    inst: Inst::SlotStore {
+                        slot: rslot,
+                        val: zero,
+                    },
+                },
+            ],
+            terminator: Terminator::Goto(row_hdr),
+        });
+        func.blocks.push(BasicBlock {
+            id: row_hdr,
+            label: "row_hdr".to_owned(),
+            stmts: vec![
+                MirStmt {
+                    dst: Some(ridx),
+                    inst: Inst::SlotLoad { slot: rslot },
+                },
+                MirStmt {
+                    dst: Some(rcond),
+                    inst: Inst::BinOp {
+                        op: "<".to_owned(),
+                        lhs: ridx,
+                        rhs: chunk_len,
+                        allow_fma: false,
+                    },
+                },
+            ],
+            terminator: Terminator::Branch {
+                cond: rcond,
+                then_bb: row_body,
+                else_bb: chunk_hdr,
+            },
+        });
+
+        let mut row_stmts = vec![
+            MirStmt {
+                dst: Some(ent),
+                inst: Inst::EntityAtRow {
+                    entities_ptr: ents_ptr,
+                    row_idx: ridx,
+                },
+            },
+            MirStmt {
+                dst: Some(rptr),
+                inst: Inst::RowPtr {
+                    col_ptr,
+                    row_idx: ridx,
+                    stride_bytes: slot_size,
+                    is_sparse: false,
+                },
+            },
+        ];
+        if let Some(pl) = payload_local {
+            row_stmts.push(MirStmt {
+                dst: Some(pl),
+                inst: Inst::FieldPtr {
+                    base_ptr: rptr,
+                    layout_key: slot_canon,
+                    field: "payload".to_owned(),
+                    offset_bytes: payload_off,
+                },
+            });
+        }
+        if let Some(dpl) = dummy_payload {
+            row_stmts.push(MirStmt {
+                dst: Some(dpl),
+                inst: Inst::ConstInt { value: 0 },
+            });
+        }
+        if has_observer {
+            row_stmts.push(MirStmt {
+                dst: None,
+                inst: Inst::CmdTrigger {
+                    event: rpc.canonical_name.clone(),
+                    target: None,
+                    payload: payload_local,
+                    propagate: false,
+                },
+            });
+        }
+        if has_stream_reader {
+            let emit_pl = payload_local.or(dummy_payload).unwrap();
+            row_stmts.push(MirStmt {
+                dst: None,
+                inst: Inst::StreamEmit {
+                    stream: rpc.canonical_name.clone(),
+                    payload: emit_pl,
+                },
+            });
+        }
+        row_stmts.push(MirStmt {
+            dst: None,
+            inst: Inst::CmdDespawn { entity: ent },
+        });
+        row_stmts.push(MirStmt {
+            dst: Some(one),
+            inst: Inst::ConstInt { value: 1 },
+        });
+        row_stmts.push(MirStmt {
+            dst: Some(nxt),
+            inst: Inst::BinOp {
+                op: "+".to_owned(),
+                lhs: ridx,
+                rhs: one,
+                allow_fma: false,
+            },
+        });
+        row_stmts.push(MirStmt {
+            dst: None,
+            inst: Inst::SlotStore {
+                slot: rslot,
+                val: nxt,
+            },
+        });
+
+        func.blocks.push(BasicBlock {
+            id: row_body,
+            label: "row_body".to_owned(),
+            stmts: row_stmts,
+            terminator: Terminator::Goto(row_hdr),
+        });
+        func.blocks.push(BasicBlock {
+            id: exit_bb,
+            label: "exit".to_owned(),
+            stmts: Vec::new(),
+            terminator: Terminator::Return(None),
+        });
+
+        mir.functions.push(func);
+        dispatch_leaves.push(HirScheduleGroup {
+            kind: "leaf".to_owned(),
+            name: sys_name,
+            before: Vec::new(),
+            after: Vec::new(),
+            children: Vec::new(),
+        });
+    }
+
+    if !dispatch_leaves.is_empty() {
+        if let Some(fixed) = mir.schedules.iter_mut().find(|s| s.label == "FixedUpdate") {
+            let mut merged = dispatch_leaves;
+            merged.extend(std::mem::take(&mut fixed.nodes));
+            fixed.nodes = merged;
+        } else {
+            mir.schedules.push(HirSchedule {
+                label: "FixedUpdate".to_owned(),
+                run_if: None,
+                run_if_expr: None,
+                nodes: dispatch_leaves,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn compile_role_artifacts(
     mir: &MirModule,
     source_stem: &str,
     out_dir: &Path,
 ) -> Result<CompiledNetArtifacts, String> {
     if !has_role_restricted_systems(mir) {
-        let (aug_mir, dispatch) = augment_mir_for_sim_tests(mir)?;
+        let mut role_mir = mir.clone();
+        augment_mir_for_rpc_dispatch(&mut role_mir)?;
+        let (aug_mir, dispatch) = augment_mir_for_sim_tests(&role_mir)?;
         let art = compile_module_to_dylib(
             &aug_mir,
             &JitCompileOptions {
@@ -222,7 +743,8 @@ fn compile_role_artifacts(
         });
     }
 
-    let srv_raw = filter_mir_for_role(mir, NetWorldRole::Server);
+    let mut srv_raw = filter_mir_for_role(mir, NetWorldRole::Server);
+    augment_mir_for_rpc_dispatch(&mut srv_raw)?;
     if let Err(errs) = verify_mir(&srv_raw) {
         let msg = errs
             .into_iter()
@@ -242,7 +764,8 @@ fn compile_role_artifacts(
     )
     .map_err(|e| format!("server JIT compile failed: {e}"))?;
 
-    let cli_raw = filter_mir_for_role(mir, NetWorldRole::Client);
+    let mut cli_raw = filter_mir_for_role(mir, NetWorldRole::Client);
+    augment_mir_for_rpc_dispatch(&mut cli_raw)?;
     if let Err(errs) = verify_mir(&cli_raw) {
         let msg = errs
             .into_iter()
@@ -298,12 +821,14 @@ impl NetWorld {
         });
         dispatch.schedule.init_on_app(&mut app);
         app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
+        ensure_child_of_registered(app.world_mut());
         app.register_strata_net_transport()
             .map_err(|err| format!("failed registering strata net transport: {err:?}"))?;
 
         let mod_id = app
             .load_mod_with(dylib_path, LoadOptions::default())
             .map_err(|err| format!("bamabi_host failed loading compiled mod: {err}"))?;
+        configure_dedicated_dispatch(&mut app, mir, mod_id, dispatch);
 
         app.world_mut().run_schedule(Startup);
         app.world_mut().run_schedule(PostStartup);
@@ -459,7 +984,6 @@ struct InFlightPacket {
     src: NetWorldTarget,
     dst: NetWorldTarget,
     packet: StrataNetPacket,
-    reliable: bool,
 }
 
 #[derive(Clone)]
@@ -469,6 +993,24 @@ struct RetryPacket {
     src: NetWorldTarget,
     dst: NetWorldTarget,
     packet: StrataNetPacket,
+}
+
+#[derive(Clone)]
+struct InFlightRemoval {
+    seq: u64,
+    deliver_tick: u64,
+    dst: NetWorldTarget,
+    s_ent_bits: u64,
+    comp_canonical: String,
+}
+
+#[derive(Clone)]
+struct RetryRemoval {
+    seq: u64,
+    retry_tick: u64,
+    dst: NetWorldTarget,
+    s_ent_bits: u64,
+    comp_canonical: String,
 }
 
 struct SimulatedChannel {
@@ -481,7 +1023,9 @@ struct SimulatedChannel {
     next_rpc_seq: u32,
     in_flight: Vec<InFlightPacket>,
     retry_queue: Vec<RetryPacket>,
-    highest_state_seq: HashMap<(NetWorldTarget, u8, u64, u64), u64>,
+    in_flight_removals: Vec<InFlightRemoval>,
+    retry_removals: Vec<RetryRemoval>,
+    highest_state_seq: HashMap<(NetWorldTarget, NetWorldTarget, u8, u64, u64), u64>,
 }
 
 impl SimulatedChannel {
@@ -496,6 +1040,8 @@ impl SimulatedChannel {
             next_rpc_seq: 1,
             in_flight: Vec::new(),
             retry_queue: Vec::new(),
+            in_flight_removals: Vec::new(),
+            retry_removals: Vec::new(),
             highest_state_seq: HashMap::new(),
         }
     }
@@ -535,6 +1081,40 @@ impl SimulatedChannel {
         self.enqueue_attempt(seq, src, dst, packet);
     }
 
+    fn enqueue_removal(&mut self, dst: NetWorldTarget, s_ent_bits: u64, comp_canonical: String) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.enqueue_removal_attempt(seq, dst, s_ent_bits, comp_canonical);
+    }
+
+    fn enqueue_removal_attempt(
+        &mut self,
+        seq: u64,
+        dst: NetWorldTarget,
+        s_ent_bits: u64,
+        comp_canonical: String,
+    ) {
+        if self.should_deliver() {
+            let delay = self.sample_delay_ticks();
+            self.in_flight_removals.push(InFlightRemoval {
+                seq,
+                deliver_tick: self.current_tick + delay,
+                dst,
+                s_ent_bits,
+                comp_canonical,
+            });
+        } else if self.loss < 1.0 {
+            let retry_delay = self.retransmit_delay_ticks();
+            self.retry_removals.push(RetryRemoval {
+                seq,
+                retry_tick: self.current_tick + retry_delay,
+                dst,
+                s_ent_bits,
+                comp_canonical,
+            });
+        }
+    }
+
     fn enqueue_attempt(
         &mut self,
         seq: u64,
@@ -551,7 +1131,6 @@ impl SimulatedChannel {
                 src,
                 dst,
                 packet,
-                reliable,
             });
         } else if reliable && self.loss < 1.0 {
             let retry_delay = self.retransmit_delay_ticks();
@@ -580,6 +1159,20 @@ impl SimulatedChannel {
         for item in due {
             self.enqueue_attempt(item.seq, item.src, item.dst, item.packet);
         }
+
+        let mut rem_removals = Vec::with_capacity(self.retry_removals.len());
+        let mut due_removals = Vec::new();
+        for item in self.retry_removals.drain(..) {
+            if item.retry_tick <= cur {
+                due_removals.push(item);
+            } else {
+                rem_removals.push(item);
+            }
+        }
+        self.retry_removals = rem_removals;
+        for item in due_removals {
+            self.enqueue_removal_attempt(item.seq, item.dst, item.s_ent_bits, item.comp_canonical);
+        }
     }
 
     fn take_due_packets(&mut self, dst: NetWorldTarget) -> Vec<(NetWorldTarget, StrataNetPacket)> {
@@ -603,8 +1196,9 @@ impl SimulatedChannel {
                 item.packet.kind,
                 PACKET_KIND_COMPONENT_DELTA | PACKET_KIND_RESOURCE_DELTA
             );
-            if is_state_snapshot && item.reliable {
+            if is_state_snapshot {
                 let key = (
+                    item.src,
                     dst,
                     item.packet.kind,
                     item.packet.target_id,
@@ -619,6 +1213,22 @@ impl SimulatedChannel {
             out.push((item.src, item.packet));
         }
         out
+    }
+
+    fn take_due_removals(&mut self, dst: NetWorldTarget) -> Vec<InFlightRemoval> {
+        let cur = self.current_tick;
+        let mut remaining = Vec::with_capacity(self.in_flight_removals.len());
+        let mut due = Vec::new();
+        for item in self.in_flight_removals.drain(..) {
+            if item.dst == dst && item.deliver_tick <= cur {
+                due.push(item);
+            } else {
+                remaining.push(item);
+            }
+        }
+        self.in_flight_removals = remaining;
+        due.sort_by_key(|r| r.seq);
+        due
     }
 }
 
@@ -731,6 +1341,9 @@ struct NetSimRunner<'a> {
     c_to_s: Vec<HashMap<u64, u64>>,
     net_comps_by_id: HashMap<u64, &'a MirNetComponent>,
     rpcs_by_id: HashMap<u64, &'a MirRpc>,
+    rpc_slot_indices: HashMap<u64, usize>,
+    known_server_replicated: HashSet<(u64, String)>,
+    clients_initialized: bool,
     channel: SimulatedChannel,
     scopes: Vec<HashMap<String, NetSimVal>>,
 }
@@ -756,8 +1369,10 @@ impl<'a> NetSimRunner<'a> {
             net_comps_by_id.insert(fnv1a_64_str(&nc.canonical_name), nc);
         }
         let mut rpcs_by_id = HashMap::new();
-        for rpc in &base_mir.rpcs {
+        let mut rpc_slot_indices = HashMap::new();
+        for (ri, rpc) in base_mir.rpcs.iter().enumerate() {
             rpcs_by_id.insert(rpc.rpc_id, rpc);
+            rpc_slot_indices.insert(rpc.rpc_id, ri);
         }
 
         let mut runner = Self {
@@ -769,15 +1384,207 @@ impl<'a> NetSimRunner<'a> {
             c_to_s: Vec::new(),
             net_comps_by_id,
             rpcs_by_id,
+            rpc_slot_indices,
+            known_server_replicated: HashSet::new(),
+            clients_initialized: false,
             channel: SimulatedChannel::new(latency_ms, jitter_ms, loss, seed),
             scopes: vec![HashMap::new()],
         };
         runner.ensure_clients(initial_clients as usize)?;
+        runner.clients_initialized = true;
+        runner.known_server_replicated = runner.collect_server_replicated_pairs();
         Ok(runner)
+    }
+
+    fn is_server_replicated_nc(nc: &MirNetComponent) -> bool {
+        nc.is_replicated
+            && !nc.is_predicted
+            && matches!(
+                nc.authority,
+                AuthorityKind::Server | AuthorityKind::Shared | AuthorityKind::Unspecified
+            )
+    }
+
+    fn is_client_replicated_nc(nc: &MirNetComponent) -> bool {
+        nc.is_replicated
+            && (nc.is_predicted
+                || matches!(
+                    nc.authority,
+                    AuthorityKind::Client | AuthorityKind::Predicted | AuthorityKind::Shared
+                ))
+    }
+
+    fn collect_server_replicated_pairs(&mut self) -> HashSet<(u64, String)> {
+        let mut pairs = HashSet::new();
+        let mut comps = Vec::new();
+        for nc in &self.base_mir.net_components {
+            if !nc.is_resource
+                && Self::is_server_replicated_nc(nc)
+                && let Some(reg) = find_registry_component(
+                    self.server.app.world(),
+                    &self.base_mir.module_path,
+                    &nc.canonical_name,
+                )
+            {
+                comps.push((nc.canonical_name.clone(), reg.component_id));
+            }
+        }
+        if comps.is_empty() {
+            return pairs;
+        }
+        let world = self.server.app.world_mut();
+        let entities: Vec<Entity> = {
+            let mut q = world.query::<Entity>();
+            q.iter(world).collect()
+        };
+        for ent in entities {
+            if let Ok(er) = world.get_entity(ent) {
+                for (cname, cid) in &comps {
+                    if er.contains_id(*cid) {
+                        pairs.insert((ent.to_bits(), cname.clone()));
+                    }
+                }
+            }
+        }
+        pairs
+    }
+
+    fn reconcile_server_removals(&mut self) {
+        let current = self.collect_server_replicated_pairs();
+        let mut removed: Vec<(u64, String)> = self
+            .known_server_replicated
+            .difference(&current)
+            .cloned()
+            .collect();
+        removed.sort();
+        for (s_ent_bits, comp_canonical) in removed {
+            for cid in 0..self.clients.len() {
+                self.channel.enqueue_removal(
+                    NetWorldTarget::Client(cid),
+                    s_ent_bits,
+                    comp_canonical.clone(),
+                );
+            }
+        }
+        self.known_server_replicated = current;
+    }
+
+    fn encode_net_component_packet(
+        &mut self,
+        nc: &MirNetComponent,
+        s_ent: Option<Entity>,
+        cid: usize,
+    ) -> Result<StrataNetPacket, String> {
+        if nc.packed_bytes as usize > STRATA_NET_MAX_PAYLOAD_BYTES {
+            return Err(format!(
+                "component `{}` payload ({} bytes) exceeds max packet size ({} bytes)",
+                nc.name, nc.packed_bytes, STRATA_NET_MAX_PAYLOAD_BYTES
+            ));
+        }
+        let layout = find_layout_in_slice(
+            &self.base_mir.layouts,
+            &self.base_mir.module_path,
+            &nc.canonical_name,
+        )
+        .cloned();
+        let mut payload = [0u8; STRATA_NET_MAX_PAYLOAD_BYTES];
+        for wf in &nc.wire_fields {
+            let target_comp = wf.stratum_layout.as_deref().unwrap_or(&nc.canonical_name);
+            let seg: Vec<String> = wf.field_name.split('.').map(str::to_owned).collect();
+            let sv = self.with_target_runner(NetWorldTarget::Server, |r| {
+                if nc.is_resource {
+                    r.read_resource_field(target_comp, &seg)
+                } else {
+                    let ent = s_ent.ok_or_else(|| {
+                        format!(
+                            "missing server entity for component `{}`",
+                            nc.canonical_name
+                        )
+                    })?;
+                    r.read_component_field(ent, target_comp, &seg)
+                }
+            })?;
+            let field_ty = layout
+                .as_ref()
+                .and_then(|l| resolve_layout_field_ty(self.base_mir, l, &seg))
+                .unwrap_or_else(|| mir_type_to_ty(&wf.ty));
+            pack_wire_field_value(wf, Some(&sv), &field_ty, self.base_mir, &mut payload)?;
+        }
+        let mut flags = FLAG_IS_RELIABLE;
+        if nc.is_resource {
+            flags |= FLAG_IS_RESOURCE;
+        }
+        if nc.is_predicted || nc.authority == AuthorityKind::Predicted {
+            flags |= FLAG_IS_PREDICTED;
+        }
+        Ok(StrataNetPacket {
+            module_net_fingerprint: self.base_mir.net_handshake.module_net_fingerprint,
+            item_schema_fingerprint: nc.schema_fingerprint,
+            target_id: fnv1a_64_str(&nc.canonical_name),
+            entity_bits: s_ent.map_or(0, |e| e.to_bits()),
+            magic: STRATA_NET_PACKET_MAGIC,
+            tick_or_seq: self.server.frames_simulated as u32,
+            version: STRATA_NET_WIRE_VERSION,
+            payload_bits: nc.packed_bits as u16,
+            flags,
+            kind: if nc.is_resource {
+                PACKET_KIND_RESOURCE_DELTA
+            } else {
+                PACKET_KIND_COMPONENT_DELTA
+            },
+            channel: nc.channel,
+            payload_bytes: nc.packed_bytes as u8,
+            client_id: cid as u8,
+            _pad: [0; 6],
+            payload,
+        })
+    }
+
+    fn send_baseline_state_to_client(&mut self, cid: usize) -> Result<(), String> {
+        let server_ncs: Vec<MirNetComponent> = self
+            .base_mir
+            .net_components
+            .iter()
+            .filter(|nc| Self::is_server_replicated_nc(nc))
+            .cloned()
+            .collect();
+        for nc in &server_ncs {
+            if nc.is_resource {
+                let pkt = self.encode_net_component_packet(nc, None, cid)?;
+                self.channel
+                    .enqueue(NetWorldTarget::Server, NetWorldTarget::Client(cid), pkt);
+                continue;
+            }
+            let Some(reg) = find_registry_component(
+                self.server.app.world(),
+                &self.base_mir.module_path,
+                &nc.canonical_name,
+            ) else {
+                continue;
+            };
+            let world = self.server.app.world_mut();
+            let matching_entities: Vec<Entity> = {
+                let mut q = world.query::<Entity>();
+                q.iter(world)
+                    .filter(|&ent| {
+                        world
+                            .get_entity(ent)
+                            .is_ok_and(|er| er.contains_id(reg.component_id))
+                    })
+                    .collect()
+            };
+            for ent in matching_entities {
+                let pkt = self.encode_net_component_packet(nc, Some(ent), cid)?;
+                self.channel
+                    .enqueue(NetWorldTarget::Server, NetWorldTarget::Client(cid), pkt);
+            }
+        }
+        Ok(())
     }
 
     fn ensure_clients(&mut self, count: usize) -> Result<(), String> {
         while self.clients.len() < count {
+            let cid = self.clients.len();
             let client = NetWorld::spawn(
                 &self.artifacts.client_mir,
                 &self.artifacts.client_dispatch,
@@ -797,6 +1604,9 @@ impl<'a> NetSimRunner<'a> {
             self.clients.push(client);
             self.s_to_c.push(s2c);
             self.c_to_s.push(c2s);
+            if self.clients_initialized {
+                self.send_baseline_state_to_client(cid)?;
+            }
         }
         Ok(())
     }
@@ -896,7 +1706,7 @@ impl<'a> NetSimRunner<'a> {
     }
 
     fn verify_and_translate_packet(
-        &self,
+        &mut self,
         src: NetWorldTarget,
         dst: NetWorldTarget,
         mut pkt: StrataNetPacket,
@@ -911,25 +1721,347 @@ impl<'a> NetSimRunner<'a> {
             return None;
         }
         if pkt.kind == PACKET_KIND_COMPONENT_DELTA {
-            let mapped = match (src, dst) {
-                (NetWorldTarget::Server, NetWorldTarget::Client(cid)) => self
-                    .s_to_c
-                    .get(cid)
-                    .and_then(|m| m.get(&pkt.entity_bits))
-                    .copied(),
-                (NetWorldTarget::Client(cid), NetWorldTarget::Server) => self
-                    .c_to_s
-                    .get(cid)
-                    .and_then(|m| m.get(&pkt.entity_bits))
-                    .copied(),
-                _ => None,
-            }?;
-            pkt.entity_bits = mapped;
+            let nc = *self.net_comps_by_id.get(&pkt.target_id)?;
+            let nc_canon = nc.canonical_name.clone();
+            let layout_size = find_layout_in_slice(
+                &self.base_mir.layouts,
+                &self.base_mir.module_path,
+                &nc_canon,
+            )
+            .map_or(0, |l| l.size);
+            match (src, dst) {
+                (NetWorldTarget::Server, NetWorldTarget::Client(cid)) => {
+                    if !Self::is_server_replicated_nc(nc) || cid >= self.clients.len() {
+                        return None;
+                    }
+                    let c_ent = if let Some(&c_bits) =
+                        self.s_to_c.get(cid).and_then(|m| m.get(&pkt.entity_bits))
+                    {
+                        let ent = Entity::from_bits(c_bits);
+                        if self.clients[cid].app.world().get_entity(ent).is_ok() {
+                            ent
+                        } else {
+                            let spawned = self.clients[cid].app.world_mut().spawn_empty().id();
+                            self.s_to_c[cid].insert(pkt.entity_bits, spawned.to_bits());
+                            self.c_to_s[cid].insert(spawned.to_bits(), pkt.entity_bits);
+                            spawned
+                        }
+                    } else {
+                        let spawned = self.clients[cid].app.world_mut().spawn_empty().id();
+                        self.s_to_c[cid].insert(pkt.entity_bits, spawned.to_bits());
+                        self.c_to_s[cid].insert(spawned.to_bits(), pkt.entity_bits);
+                        spawned
+                    };
+                    if let Some(reg) = find_registry_component(
+                        self.clients[cid].app.world(),
+                        &self.base_mir.module_path,
+                        &nc_canon,
+                    ) {
+                        let has_comp = self.clients[cid]
+                            .app
+                            .world()
+                            .get_entity(c_ent)
+                            .is_ok_and(|er| er.contains_id(reg.component_id));
+                        if !has_comp && reg.is_abi_pod {
+                            let _ = write_entity_pod_bytes(
+                                self.clients[cid].app.world_mut(),
+                                c_ent,
+                                reg.handle,
+                                &vec![0u8; layout_size],
+                            );
+                        }
+                    }
+                    pkt.entity_bits = c_ent.to_bits();
+                }
+                (NetWorldTarget::Client(cid), NetWorldTarget::Server) => {
+                    if !Self::is_client_replicated_nc(nc) || cid >= self.clients.len() {
+                        return None;
+                    }
+                    let s_ent = if let Some(&s_bits) =
+                        self.c_to_s.get(cid).and_then(|m| m.get(&pkt.entity_bits))
+                    {
+                        let ent = Entity::from_bits(s_bits);
+                        if self.server.app.world().get_entity(ent).is_ok() {
+                            ent
+                        } else {
+                            let spawned = self.server.app.world_mut().spawn_empty().id();
+                            self.c_to_s[cid].insert(pkt.entity_bits, spawned.to_bits());
+                            self.s_to_c[cid].insert(spawned.to_bits(), pkt.entity_bits);
+                            spawned
+                        }
+                    } else {
+                        let spawned = self.server.app.world_mut().spawn_empty().id();
+                        self.c_to_s[cid].insert(pkt.entity_bits, spawned.to_bits());
+                        self.s_to_c[cid].insert(spawned.to_bits(), pkt.entity_bits);
+                        spawned
+                    };
+                    if let Some(reg) = find_registry_component(
+                        self.server.app.world(),
+                        &self.base_mir.module_path,
+                        &nc_canon,
+                    ) {
+                        let has_comp = self
+                            .server
+                            .app
+                            .world()
+                            .get_entity(s_ent)
+                            .is_ok_and(|er| er.contains_id(reg.component_id));
+                        if !has_comp && reg.is_abi_pod {
+                            let _ = write_entity_pod_bytes(
+                                self.server.app.world_mut(),
+                                s_ent,
+                                reg.handle,
+                                &vec![0u8; layout_size],
+                            );
+                        }
+                    }
+                    pkt.entity_bits = s_ent.to_bits();
+                }
+                _ => return None,
+            }
+        } else if pkt.kind == PACKET_KIND_RPC {
+            let rpc = *self.rpcs_by_id.get(&pkt.target_id)?;
+            if !verify_handshake_fingerprint(rpc.schema_fingerprint, pkt.item_schema_fingerprint) {
+                return None;
+            }
+            let dir_ok = matches!(
+                (src, dst, rpc.direction),
+                (
+                    NetWorldTarget::Client(_),
+                    NetWorldTarget::Server,
+                    NetDirection::ClientToServer | NetDirection::Bidirectional,
+                ) | (
+                    NetWorldTarget::Server,
+                    NetWorldTarget::Client(_),
+                    NetDirection::ServerToClient | NetDirection::Bidirectional,
+                )
+            );
+            if !dir_ok {
+                return None;
+            }
         }
         Some(pkt)
     }
 
+    fn apply_due_removal(&mut self, cid: usize, s_ent_bits: u64, comp_canonical: &str) {
+        if cid >= self.clients.len() {
+            return;
+        }
+        let Some(&c_bits) = self.s_to_c.get(cid).and_then(|m| m.get(&s_ent_bits)) else {
+            return;
+        };
+        let c_ent = Entity::from_bits(c_bits);
+        if let Some(reg) = find_registry_component(
+            self.clients[cid].app.world(),
+            &self.base_mir.module_path,
+            comp_canonical,
+        ) && let Ok(mut em) = self.clients[cid].app.world_mut().get_entity_mut(c_ent)
+        {
+            em.remove_by_id(reg.component_id);
+        }
+
+        let s_alive = self
+            .server
+            .app
+            .world()
+            .get_entity(Entity::from_bits(s_ent_bits))
+            .is_ok();
+        let is_static_object = self.base_mir.objects.iter().any(|o| {
+            self.server
+                .named_entities
+                .get(&o.name)
+                .is_some_and(|e| e.to_bits() == s_ent_bits)
+        });
+        if !s_alive && !is_static_object {
+            let mut has_remaining_replicated = false;
+            for nc in &self.base_mir.net_components {
+                if !nc.is_resource
+                    && Self::is_server_replicated_nc(nc)
+                    && let Some(reg) = find_registry_component(
+                        self.clients[cid].app.world(),
+                        &self.base_mir.module_path,
+                        &nc.canonical_name,
+                    )
+                    && self.clients[cid]
+                        .app
+                        .world()
+                        .get_entity(c_ent)
+                        .is_ok_and(|er| er.contains_id(reg.component_id))
+                {
+                    has_remaining_replicated = true;
+                    break;
+                }
+            }
+            if !has_remaining_replicated {
+                let _ = self.clients[cid].app.world_mut().despawn(c_ent);
+                self.s_to_c[cid].remove(&s_ent_bits);
+                self.c_to_s[cid].remove(&c_bits);
+            }
+        }
+    }
+
+    fn inject_rpc_dispatch_slot(&mut self, dst: NetWorldTarget, pkt: &StrataNetPacket) {
+        let Some(&rpc) = self.rpcs_by_id.get(&pkt.target_id) else {
+            return;
+        };
+        let Some(&slot_idx) = self.rpc_slot_indices.get(&pkt.target_id) else {
+            return;
+        };
+        let slot_short = rpc_slot_name(slot_idx);
+        let slot_canon = if self.base_mir.module_path.is_empty() {
+            slot_short
+        } else {
+            format!("{}::{slot_short}", self.base_mir.module_path)
+        };
+        let rpc_mir = match dst {
+            NetWorldTarget::Server => &self.artifacts.server_mir,
+            NetWorldTarget::Client(_) => &self.artifacts.client_mir,
+        };
+        let Some(slot_layout) =
+            find_layout_in_slice(&rpc_mir.layouts, &rpc_mir.module_path, &slot_canon).cloned()
+        else {
+            return;
+        };
+        let mut slot_bytes = vec![0u8; slot_layout.size];
+        let payload_off = slot_layout
+            .fields
+            .iter()
+            .find(|f| f.name == "payload")
+            .map_or(0, |f| f.offset);
+        if slot_bytes.len() >= 4 {
+            slot_bytes[0..4].copy_from_slice(&pkt.tick_or_seq.to_le_bytes());
+        }
+        let rpc_layout = find_layout_in_slice(
+            &self.world_mir_dispatch(dst).0.layouts,
+            &self.base_mir.module_path,
+            &rpc.canonical_name,
+        )
+        .or_else(|| {
+            find_layout_in_slice(
+                &self.base_mir.layouts,
+                &self.base_mir.module_path,
+                &rpc.canonical_name,
+            )
+        });
+        for wf in &rpc.wire_fields {
+            if let Some(ref q) = wf.quantize {
+                let seg: Vec<String> = wf.field_name.split('.').map(str::to_owned).collect();
+                let mut f_off = wf.byte_offset as usize;
+                let mut f_ty = mir_type_to_ty(&wf.ty);
+                if let Some(rl) = rpc_layout
+                    && let Some((resolved_off, resolved_ty)) =
+                        resolve_layout_field_offset_ty(self.base_mir, rl, &seg)
+                {
+                    f_off = resolved_off;
+                    f_ty = resolved_ty;
+                }
+                let val = if q.lane_count == 1 {
+                    let raw = unpack_bits_le(&pkt.payload, wf.bit_offset, q.bits);
+                    let f = dequantize_scalar_f64(raw, q.min, q.max, q.bits, q.step);
+                    match &f_ty {
+                        Ty::Bool => SimVal::Bool(f >= 0.5),
+                        Ty::U8
+                        | Ty::I8
+                        | Ty::U16
+                        | Ty::I16
+                        | Ty::U32
+                        | Ty::I32
+                        | Ty::U64
+                        | Ty::I64
+                        | Ty::Sym
+                        | Ty::Rgba8 => SimVal::Int(f.round() as i64),
+                        _ => SimVal::Float(f),
+                    }
+                } else {
+                    let mut vals = [0.0f64; 4];
+                    for (li, slot) in vals
+                        .iter_mut()
+                        .enumerate()
+                        .take(usize::from(q.lane_count).min(4))
+                    {
+                        let boff = wf.bit_offset + (li as u32) * u32::from(q.bits);
+                        let raw = unpack_bits_le(&pkt.payload, boff, q.bits);
+                        *slot = dequantize_scalar_f64(raw, q.min, q.max, q.bits, q.step);
+                    }
+                    match &f_ty {
+                        Ty::IVec2 | Ty::IVec3 => SimVal::IVec(
+                            [
+                                vals[0].round() as i32,
+                                vals[1].round() as i32,
+                                vals[2].round() as i32,
+                                vals[3].round() as i32,
+                            ],
+                            q.lane_count,
+                        ),
+                        Ty::UVec2 => SimVal::UVec(
+                            [
+                                vals[0].round().max(0.0) as u32,
+                                vals[1].round().max(0.0) as u32,
+                                vals[2].round().max(0.0) as u32,
+                                vals[3].round().max(0.0) as u32,
+                            ],
+                            q.lane_count,
+                        ),
+                        _ => SimVal::Vec(
+                            [
+                                vals[0] as f32,
+                                vals[1] as f32,
+                                vals[2] as f32,
+                                vals[3] as f32,
+                            ],
+                            q.lane_count,
+                        ),
+                    }
+                };
+                let _ = encode_ty_to_bytes_with_layouts(
+                    &mut slot_bytes,
+                    payload_off + f_off,
+                    &f_ty,
+                    &val,
+                    &self.base_mir.enums,
+                    &self.base_mir.layouts,
+                    &self.base_mir.module_path,
+                );
+            } else if wf.byte_size > 0 {
+                let dst_start = payload_off + wf.byte_offset as usize;
+                let dst_end = dst_start + wf.byte_size as usize;
+                if dst_end <= slot_bytes.len() {
+                    for (bi, byte) in slot_bytes[dst_start..dst_end].iter_mut().enumerate() {
+                        *byte =
+                            unpack_bits_le(&pkt.payload, wf.bit_offset + (bi as u32) * 8, 8) as u8;
+                    }
+                }
+            }
+        }
+
+        let target_world = match dst {
+            NetWorldTarget::Server => &mut self.server,
+            NetWorldTarget::Client(cid) => {
+                let Some(c) = self.clients.get_mut(cid) else {
+                    return;
+                };
+                c
+            }
+        };
+        let Some(reg) = find_registry_component(
+            target_world.app.world(),
+            &self.base_mir.module_path,
+            &slot_canon,
+        ) else {
+            return;
+        };
+        let ent = target_world.app.world_mut().spawn_empty().id();
+        let _ = write_entity_pod_bytes(target_world.app.world_mut(), ent, reg.handle, &slot_bytes);
+    }
+
     fn deliver_due_to(&mut self, dst: NetWorldTarget) {
+        let due_removals = self.channel.take_due_removals(dst);
+        if let NetWorldTarget::Client(cid) = dst {
+            for rem in due_removals {
+                self.apply_due_removal(cid, rem.s_ent_bits, &rem.comp_canonical);
+            }
+        }
+
         let due = self.channel.take_due_packets(dst);
         if due.is_empty() {
             return;
@@ -937,6 +2069,9 @@ impl<'a> NetSimRunner<'a> {
         let mut translated = Vec::with_capacity(due.len());
         for (src, pkt) in due {
             if let Some(t) = self.verify_and_translate_packet(src, dst, pkt) {
+                if t.kind == PACKET_KIND_RPC {
+                    self.inject_rpc_dispatch_slot(dst, &t);
+                }
                 translated.push(t);
             }
         }
@@ -1053,6 +2188,7 @@ impl<'a> NetSimRunner<'a> {
 
             self.deliver_due_to(NetWorldTarget::Server);
             let srv_out = self.server.step_tick()?;
+            self.reconcile_server_removals();
             self.route_server_outbound(srv_out);
 
             for cid in 0..self.clients.len() {
@@ -1070,6 +2206,7 @@ impl<'a> NetSimRunner<'a> {
             self.channel.process_due_retries();
             self.deliver_due_to(NetWorldTarget::Server);
             let srv_out = self.server.step_tick()?;
+            self.reconcile_server_removals();
             self.route_server_outbound(srv_out);
         }
         Ok(())
@@ -1970,6 +3107,7 @@ impl<'a> NetSimRunner<'a> {
                 let ent = self.with_target_runner(NetWorldTarget::Server, |r| {
                     r.spawn_entity_with_components(&comps)
                 })?;
+                self.known_server_replicated = self.collect_server_replicated_pairs();
                 Ok(NetSimVal::Entity {
                     world: NetWorldTarget::Server,
                     entity: Some(ent),
@@ -2270,82 +3408,35 @@ impl<'a> NetSimRunner<'a> {
             evaluated_fields.insert(fname.clone(), net_val_to_sim_val(&self.eval_expr(fexpr)?)?);
         }
 
+        let rpc_layout = find_layout_in_slice(
+            &self.base_mir.layouts,
+            &self.base_mir.module_path,
+            &rpc.canonical_name,
+        )
+        .or_else(|| {
+            find_layout_in_slice(
+                &self.artifacts.server_mir.layouts,
+                &self.base_mir.module_path,
+                &rpc.canonical_name,
+            )
+        })
+        .or_else(|| {
+            find_layout_in_slice(
+                &self.artifacts.client_mir.layouts,
+                &self.base_mir.module_path,
+                &rpc.canonical_name,
+            )
+        })
+        .cloned();
         let mut payload = [0u8; STRATA_NET_MAX_PAYLOAD_BYTES];
         for wf in &rpc.wire_fields {
-            let val = evaluated_fields.get(&wf.field_name);
-            if let Some(ref q) = wf.quantize {
-                match val {
-                    Some(SimVal::Vec(v, dims)) => {
-                        for li in 0..q.lane_count {
-                            let fval = if li < *dims {
-                                f64::from(v[usize::from(li)])
-                            } else {
-                                0.0
-                            };
-                            let qval = quantize_scalar_f64(fval, q.min, q.max, q.bits, q.step);
-                            let boff = wf.bit_offset + u32::from(li) * u32::from(q.bits);
-                            pack_bits_le(&mut payload, boff, q.bits, qval);
-                        }
-                    }
-                    Some(SimVal::IVec(v, dims)) => {
-                        for li in 0..q.lane_count {
-                            let fval = if li < *dims {
-                                f64::from(v[usize::from(li)])
-                            } else {
-                                0.0
-                            };
-                            let qval = quantize_scalar_f64(fval, q.min, q.max, q.bits, q.step);
-                            let boff = wf.bit_offset + u32::from(li) * u32::from(q.bits);
-                            pack_bits_le(&mut payload, boff, q.bits, qval);
-                        }
-                    }
-                    Some(SimVal::UVec(v, dims)) => {
-                        for li in 0..q.lane_count {
-                            let fval = if li < *dims {
-                                f64::from(v[usize::from(li)])
-                            } else {
-                                0.0
-                            };
-                            let qval = quantize_scalar_f64(fval, q.min, q.max, q.bits, q.step);
-                            let boff = wf.bit_offset + u32::from(li) * u32::from(q.bits);
-                            pack_bits_le(&mut payload, boff, q.bits, qval);
-                        }
-                    }
-                    Some(sv) => {
-                        let fval = as_float(sv)?;
-                        let qval = quantize_scalar_f64(fval, q.min, q.max, q.bits, q.step);
-                        pack_bits_le(&mut payload, wf.bit_offset, q.bits, qval);
-                    }
-                    None => {
-                        let qval = quantize_scalar_f64(0.0, q.min, q.max, q.bits, q.step);
-                        for li in 0..q.lane_count {
-                            let boff = wf.bit_offset + u32::from(li) * u32::from(q.bits);
-                            pack_bits_le(&mut payload, boff, q.bits, qval);
-                        }
-                    }
-                }
-            } else if wf.byte_size > 0 {
-                let mut raw = vec![0u8; wf.byte_size as usize];
-                if let Some(sv) = val {
-                    let ty = mir_type_to_ty(&wf.ty);
-                    encode_ty_to_bytes(
-                        &mut raw,
-                        0,
-                        &ty,
-                        sv,
-                        &self.base_mir.enums,
-                        &self.base_mir.module_path,
-                    )?;
-                }
-                for (bi, &b) in raw.iter().enumerate() {
-                    pack_bits_le(
-                        &mut payload,
-                        wf.bit_offset + (bi as u32) * 8,
-                        8,
-                        u64::from(b),
-                    );
-                }
-            }
+            let val = lookup_sim_val_path(&evaluated_fields, &wf.field_name);
+            let seg: Vec<String> = wf.field_name.split('.').map(str::to_owned).collect();
+            let field_ty = rpc_layout
+                .as_ref()
+                .and_then(|l| resolve_layout_field_ty(self.base_mir, l, &seg))
+                .unwrap_or_else(|| mir_type_to_ty(&wf.ty));
+            pack_wire_field_value(wf, val, &field_ty, self.base_mir, &mut payload)?;
         }
 
         let seq = self.channel.next_rpc_seq;
@@ -2382,6 +3473,33 @@ impl<'a> NetSimRunner<'a> {
         Ok(())
     }
 
+    fn assert_entity_component_fields_converged(
+        &mut self,
+        cid: usize,
+        nc: &MirNetComponent,
+        s_ent: Entity,
+        c_ent: Entity,
+        entity_label: &str,
+        explicit_tol: Option<f64>,
+    ) -> Result<(), String> {
+        for wf in &nc.wire_fields {
+            let seg: Vec<String> = wf.field_name.split('.').map(str::to_owned).collect();
+            let s_val = self.with_target_runner(NetWorldTarget::Server, |r| {
+                r.read_component_field(s_ent, &nc.canonical_name, &seg)
+            })?;
+            let c_val = self.with_target_runner(NetWorldTarget::Client(cid), |r| {
+                r.read_component_field(c_ent, &nc.canonical_name, &seg)
+            })?;
+            if !net_field_converged(&s_val, &c_val, wf, explicit_tol) {
+                return Err(format!(
+                    "assert_converged failed at tick {}: client {cid} {entity_label} component `{}`.`{}` mismatch (server={s_val:?}, client={c_val:?})",
+                    self.channel.current_tick, nc.name, wf.field_name
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn exec_assert_converged(&mut self, args: &[HirExpr]) -> Result<(), String> {
         let (target_clients, explicit_tol): (Vec<usize>, Option<f64>) = match args.len() {
             0 => ((0..self.clients.len()).collect(), None),
@@ -2404,7 +3522,12 @@ impl<'a> NetSimRunner<'a> {
                     ));
                 }
                 let tol = as_float(&net_val_to_sim_val(&self.eval_expr(&args[1])?)?)?;
-                (vec![cid as usize], Some(tol.abs()))
+                if !tol.is_finite() || tol < 0.0 {
+                    return Err(format!(
+                        "assert_converged tolerance must be finite and non-negative, got `{tol}`"
+                    ));
+                }
+                (vec![cid as usize], Some(tol))
             }
         };
 
@@ -2498,36 +3621,41 @@ impl<'a> NetSimRunner<'a> {
                     continue;
                 }
 
+                let s_reg = find_registry_component(
+                    self.server.app.world(),
+                    &self.base_mir.module_path,
+                    &nc.canonical_name,
+                );
+                let c_reg = find_registry_component(
+                    self.clients[cid].app.world(),
+                    &self.base_mir.module_path,
+                    &nc.canonical_name,
+                );
+                let mut checked_s_bits: HashSet<u64> = HashSet::new();
+                let mut checked_c_bits: HashSet<u64> = HashSet::new();
+
                 for obj_name in &object_names {
                     let s_ent_opt = self.server.named_entities.get(obj_name).copied();
                     let c_ent_opt = self.clients[cid].named_entities.get(obj_name).copied();
                     let (Some(s_ent), Some(c_ent)) = (s_ent_opt, c_ent_opt) else {
                         continue;
                     };
-                    let s_has = find_registry_component(
-                        self.server.app.world(),
-                        &self.base_mir.module_path,
-                        &nc.canonical_name,
-                    )
-                    .is_some_and(|reg| {
+                    let s_has = s_reg.as_ref().is_some_and(|reg| {
                         self.server
                             .app
                             .world()
                             .get_entity(s_ent)
                             .is_ok_and(|er| er.contains_id(reg.component_id))
                     });
-                    let c_has = find_registry_component(
-                        self.clients[cid].app.world(),
-                        &self.base_mir.module_path,
-                        &nc.canonical_name,
-                    )
-                    .is_some_and(|reg| {
+                    let c_has = c_reg.as_ref().is_some_and(|reg| {
                         self.clients[cid]
                             .app
                             .world()
                             .get_entity(c_ent)
                             .is_ok_and(|er| er.contains_id(reg.component_id))
                     });
+                    checked_s_bits.insert(s_ent.to_bits());
+                    checked_c_bits.insert(c_ent.to_bits());
                     if !s_has && !c_has {
                         continue;
                     }
@@ -2538,21 +3666,92 @@ impl<'a> NetSimRunner<'a> {
                         ));
                     }
 
-                    for wf in &nc.wire_fields {
-                        let seg = vec![wf.field_name.clone()];
-                        let s_val = self.with_target_runner(NetWorldTarget::Server, |r| {
-                            r.read_component_field(s_ent, &nc.canonical_name, &seg)
-                        })?;
-                        let c_val = self.with_target_runner(NetWorldTarget::Client(cid), |r| {
-                            r.read_component_field(c_ent, &nc.canonical_name, &seg)
-                        })?;
-                        if !net_field_converged(&s_val, &c_val, wf, explicit_tol) {
-                            return Err(format!(
-                                "assert_converged failed at tick {}: client {cid} object `{obj_name}` component `{}`.`{}` mismatch (server={s_val:?}, client={c_val:?})",
-                                self.channel.current_tick, nc.name, wf.field_name
-                            ));
-                        }
+                    self.assert_entity_component_fields_converged(
+                        cid,
+                        nc,
+                        s_ent,
+                        c_ent,
+                        &format!("object `{obj_name}`"),
+                        explicit_tol,
+                    )?;
+                }
+
+                // Also verify all dynamically spawned/attached/removed entities holding `nc`.
+                let s_live: Vec<Entity> = if let Some(ref reg) = s_reg {
+                    let world = self.server.app.world_mut();
+                    let entities: Vec<Entity> = {
+                        let mut q = world.query::<Entity>();
+                        q.iter(world).collect()
+                    };
+                    entities
+                        .into_iter()
+                        .filter(|&ent| {
+                            world
+                                .get_entity(ent)
+                                .is_ok_and(|er| er.contains_id(reg.component_id))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let c_live: Vec<Entity> = if let Some(ref reg) = c_reg {
+                    let world = self.clients[cid].app.world_mut();
+                    let entities: Vec<Entity> = {
+                        let mut q = world.query::<Entity>();
+                        q.iter(world).collect()
+                    };
+                    entities
+                        .into_iter()
+                        .filter(|&ent| {
+                            world
+                                .get_entity(ent)
+                                .is_ok_and(|er| er.contains_id(reg.component_id))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let c_live_bits: HashSet<u64> = c_live.iter().map(|e| e.to_bits()).collect();
+
+                for s_ent in s_live {
+                    let s_bits = s_ent.to_bits();
+                    if checked_s_bits.contains(&s_bits) {
+                        continue;
                     }
+                    let Some(&c_bits) = self.s_to_c.get(cid).and_then(|m| m.get(&s_bits)) else {
+                        return Err(format!(
+                            "assert_converged failed at tick {}: client {cid} missing replicated entity for server entity {s_ent:?} component `{}`",
+                            self.channel.current_tick, nc.name
+                        ));
+                    };
+                    if !c_live_bits.contains(&c_bits) {
+                        return Err(format!(
+                            "assert_converged failed at tick {}: client {cid} missing replicated component `{}` on proxy entity (server={s_ent:?})",
+                            self.channel.current_tick, nc.name
+                        ));
+                    }
+                    let c_ent = Entity::from_bits(c_bits);
+                    checked_s_bits.insert(s_bits);
+                    checked_c_bits.insert(c_bits);
+                    self.assert_entity_component_fields_converged(
+                        cid,
+                        nc,
+                        s_ent,
+                        c_ent,
+                        &format!("entity {s_ent:?}"),
+                        explicit_tol,
+                    )?;
+                }
+
+                for c_ent in c_live {
+                    let c_bits = c_ent.to_bits();
+                    if checked_c_bits.contains(&c_bits) {
+                        continue;
+                    }
+                    return Err(format!(
+                        "assert_converged failed at tick {}: client {cid} still holds unreplicated/stale component `{}` on entity {c_ent:?}",
+                        self.channel.current_tick, nc.name
+                    ));
                 }
             }
         }
@@ -2775,6 +3974,127 @@ impl<'a> NetSimRunner<'a> {
     }
 }
 
+fn lookup_sim_val_path<'v>(fields: &'v HashMap<String, SimVal>, path: &str) -> Option<&'v SimVal> {
+    if let Some(direct) = fields.get(path) {
+        return Some(direct);
+    }
+    let mut segs = path.split('.');
+    let first = segs.next()?;
+    let mut cur = fields.get(first)?;
+    for seg in segs {
+        match cur {
+            SimVal::Struct { fields: inner, .. } => {
+                cur = inner.iter().find(|(name, _)| name == seg).map(|(_, v)| v)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(cur)
+}
+
+fn resolve_layout_field_offset_ty(
+    base_mir: &MirModule,
+    base_layout: &strata_sema::layout::SolvedLayout,
+    segments: &[String],
+) -> Option<(usize, Ty)> {
+    let mut cur_layout = base_layout;
+    let mut offset = 0usize;
+    let mut cur_ty = Ty::Unknown;
+    for (i, seg) in segments.iter().enumerate() {
+        let sf = cur_layout
+            .fields
+            .iter()
+            .find(|f| !f.is_padding && f.name == *seg)?;
+        offset += sf.offset;
+        cur_ty = sf.ty.clone();
+        if i + 1 < segments.len() {
+            let Ty::Named(ref inner) = sf.ty else {
+                return None;
+            };
+            cur_layout = find_layout_in_slice(&base_mir.layouts, &base_mir.module_path, inner)?;
+        }
+    }
+    Some((offset, cur_ty))
+}
+
+fn resolve_layout_field_ty(
+    base_mir: &MirModule,
+    base_layout: &strata_sema::layout::SolvedLayout,
+    segments: &[String],
+) -> Option<Ty> {
+    resolve_layout_field_offset_ty(base_mir, base_layout, segments).map(|(_, ty)| ty)
+}
+
+fn pack_wire_field_value(
+    wf: &strata_mir::MirNetFieldSpec,
+    val: Option<&SimVal>,
+    field_ty: &Ty,
+    base_mir: &MirModule,
+    payload: &mut [u8; STRATA_NET_MAX_PAYLOAD_BYTES],
+) -> Result<(), String> {
+    if let Some(ref q) = wf.quantize {
+        let pack_lanes =
+            |payload: &mut [u8; STRATA_NET_MAX_PAYLOAD_BYTES], lanes: &[f64; 4], count: usize| {
+                for li in 0..q.lane_count {
+                    let idx = usize::from(li);
+                    let fval = if idx < count { lanes[idx] } else { 0.0 };
+                    let qval = quantize_scalar_f64(fval, q.min, q.max, q.bits, q.step);
+                    let boff = wf.bit_offset + u32::from(li) * u32::from(q.bits);
+                    pack_bits_le(payload, boff, q.bits, qval);
+                }
+            };
+        match val {
+            Some(SimVal::Vec(v, dims)) => {
+                let n = usize::from((*dims).min(4));
+                let mut lanes = [0.0f64; 4];
+                for i in 0..n {
+                    lanes[i] = f64::from(v[i]);
+                }
+                pack_lanes(payload, &lanes, n);
+            }
+            Some(SimVal::IVec(v, dims)) => {
+                let n = usize::from((*dims).min(4));
+                let mut lanes = [0.0f64; 4];
+                for i in 0..n {
+                    lanes[i] = f64::from(v[i]);
+                }
+                pack_lanes(payload, &lanes, n);
+            }
+            Some(SimVal::UVec(v, dims)) => {
+                let n = usize::from((*dims).min(4));
+                let mut lanes = [0.0f64; 4];
+                for i in 0..n {
+                    lanes[i] = f64::from(v[i]);
+                }
+                pack_lanes(payload, &lanes, n);
+            }
+            Some(sv) => {
+                let fval = as_float(sv)?;
+                let qval = quantize_scalar_f64(fval, q.min, q.max, q.bits, q.step);
+                pack_bits_le(payload, wf.bit_offset, q.bits, qval);
+            }
+            None => pack_lanes(payload, &[0.0; 4], 0),
+        }
+    } else if wf.byte_size > 0 {
+        let mut raw = vec![0u8; wf.byte_size as usize];
+        if let Some(sv) = val {
+            encode_ty_to_bytes_with_layouts(
+                &mut raw,
+                0,
+                field_ty,
+                sv,
+                &base_mir.enums,
+                &base_mir.layouts,
+                &base_mir.module_path,
+            )?;
+        }
+        for (bi, &b) in raw.iter().enumerate() {
+            pack_bits_le(payload, wf.bit_offset + (bi as u32) * 8, 8, u64::from(b));
+        }
+    }
+    Ok(())
+}
+
 fn collect_net_field_leaf_paths(
     base_mir: &MirModule,
     layout: &strata_sema::layout::SolvedLayout,
@@ -2799,6 +4119,75 @@ fn collect_net_field_leaf_paths(
     }
 }
 
+fn float_within_tol(a: f64, b: f64, tol: f64) -> bool {
+    if !a.is_finite() || !b.is_finite() || !tol.is_finite() || tol < 0.0 {
+        return false;
+    }
+    let diff = a - b;
+    if diff.is_finite() {
+        diff.abs() <= tol
+    } else {
+        ((a * 0.5) - (b * 0.5)).abs() <= (tol * 0.5)
+    }
+}
+
+fn sim_vals_converged(
+    s_val: &SimVal,
+    c_val: &SimVal,
+    tol: f64,
+    int_tol: f64,
+    has_quantize: bool,
+) -> bool {
+    if !tol.is_finite() || tol < 0.0 || !int_tol.is_finite() || int_tol < 0.0 {
+        return false;
+    }
+    match (s_val, c_val) {
+        (SimVal::Float(a), SimVal::Float(b)) => float_within_tol(*a, *b, tol),
+        (SimVal::Vec(a, da), SimVal::Vec(b, db)) if da == db => {
+            (0..usize::from(*da)).all(|i| float_within_tol(f64::from(a[i]), f64::from(b[i]), tol))
+        }
+        (SimVal::IVec(a, da), SimVal::IVec(b, db)) if da == db => (0..usize::from(*da)).all(|i| {
+            if has_quantize {
+                ((i64::from(a[i]) - i64::from(b[i])).abs() as f64) <= int_tol
+            } else {
+                a[i] == b[i]
+            }
+        }),
+        (SimVal::UVec(a, da), SimVal::UVec(b, db)) if da == db => (0..usize::from(*da)).all(|i| {
+            if has_quantize {
+                ((i64::from(a[i]) - i64::from(b[i])).abs() as f64) <= int_tol
+            } else {
+                a[i] == b[i]
+            }
+        }),
+        (SimVal::Int(a), SimVal::Int(b)) => {
+            if has_quantize {
+                ((*a as f64) - (*b as f64)).abs() <= int_tol
+            } else {
+                a == b
+            }
+        }
+        (SimVal::Bool(a), SimVal::Bool(b)) => a == b,
+        (SimVal::Int(a), SimVal::Float(b)) => float_within_tol(*a as f64, *b, tol),
+        (SimVal::Float(a), SimVal::Int(b)) => float_within_tol(*a, *b as f64, tol),
+        (SimVal::Array(a), SimVal::Array(b)) | (SimVal::Tuple(a), SimVal::Tuple(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| sim_vals_converged(x, y, tol, int_tol, has_quantize))
+        }
+        (SimVal::Struct { fields: fa, .. }, SimVal::Struct { fields: fb, .. }) => {
+            fa.len() == fb.len()
+                && fa.iter().all(|(name, va)| {
+                    fb.iter().find(|(nb, _)| nb == name).is_some_and(|(_, vb)| {
+                        sim_vals_converged(va, vb, tol, int_tol, has_quantize)
+                    })
+                })
+        }
+        _ => sim_val_eq(s_val, c_val),
+    }
+}
+
 fn net_field_converged(
     s_val: &SimVal,
     c_val: &SimVal,
@@ -2807,44 +4196,38 @@ fn net_field_converged(
 ) -> bool {
     let tol = match &wf.quantize {
         Some(q) => {
-            let q_tol = q.effective_step() * 1.01 + 1e-4;
+            let q_step = q.effective_step();
+            let q_tol = if q_step.is_finite() {
+                let scaled = q_step * 1.01;
+                if scaled.is_finite() {
+                    let with_eps = scaled + 1e-4;
+                    if with_eps.is_finite() {
+                        with_eps
+                    } else {
+                        scaled
+                    }
+                } else {
+                    q_step
+                }
+            } else {
+                return explicit_tol.is_some_and(|t| t.is_finite() && t >= 0.0)
+                    && sim_vals_converged(
+                        s_val,
+                        c_val,
+                        explicit_tol.unwrap(),
+                        explicit_tol.unwrap(),
+                        true,
+                    );
+            };
             explicit_tol.unwrap_or(q_tol)
         }
         None => explicit_tol.unwrap_or(1e-4),
     };
-    let int_tol = explicit_tol.unwrap_or_else(|| tol.max(1.0));
-
-    match (s_val, c_val) {
-        (SimVal::Float(a), SimVal::Float(b)) => (a - b).abs() <= tol,
-        (SimVal::Vec(a, da), SimVal::Vec(b, db)) if da == db => {
-            (0..usize::from(*da)).all(|i| (f64::from(a[i]) - f64::from(b[i])).abs() <= tol)
-        }
-        (SimVal::IVec(a, da), SimVal::IVec(b, db)) if da == db => (0..usize::from(*da)).all(|i| {
-            if wf.quantize.is_some() {
-                ((i64::from(a[i]) - i64::from(b[i])).abs() as f64) <= int_tol
-            } else {
-                a[i] == b[i]
-            }
-        }),
-        (SimVal::UVec(a, da), SimVal::UVec(b, db)) if da == db => (0..usize::from(*da)).all(|i| {
-            if wf.quantize.is_some() {
-                ((i64::from(a[i]) - i64::from(b[i])).abs() as f64) <= int_tol
-            } else {
-                a[i] == b[i]
-            }
-        }),
-        (SimVal::Int(a), SimVal::Int(b)) => {
-            if wf.quantize.is_some() {
-                ((a - b).abs() as f64) <= int_tol
-            } else {
-                a == b
-            }
-        }
-        (SimVal::Bool(a), SimVal::Bool(b)) => a == b,
-        (SimVal::Int(a), SimVal::Float(b)) => ((*a as f64) - b).abs() <= tol,
-        (SimVal::Float(a), SimVal::Int(b)) => (a - (*b as f64)).abs() <= tol,
-        _ => sim_val_eq(s_val, c_val),
+    if !tol.is_finite() || tol < 0.0 {
+        return false;
     }
+    let int_tol = explicit_tol.unwrap_or_else(|| tol.max(1.0));
+    sim_vals_converged(s_val, c_val, tol, int_tol, wf.quantize.is_some())
 }
 
 fn mir_type_to_ty(mty: &MirType) -> Ty {
@@ -2870,11 +4253,27 @@ fn mir_type_to_ty(mty: &MirType) -> Ty {
         MirType::IVec3 => Ty::IVec3,
         MirType::UVec2 => Ty::UVec2,
         MirType::Entity => Ty::Ref("Entity".to_owned()),
+        MirType::Array { elem, len } => Ty::Array {
+            elem: Box::new(mir_type_to_ty(elem)),
+            len: *len,
+        },
+        MirType::Tuple(elems) => Ty::Tuple(elems.iter().map(mir_type_to_ty).collect()),
         MirType::Named(n) if n == "IVec2" => Ty::IVec2,
         MirType::Named(n) if n == "IVec3" => Ty::IVec3,
         MirType::Named(n) if n == "UVec2" => Ty::UVec2,
         MirType::Named(n) if n == "Vec3a" => Ty::Vec3a,
-        MirType::Named(n) => Ty::Named(n.clone()),
+        MirType::Named(n) if n == "Rgba8" => Ty::Rgba8,
+        MirType::Named(n) => {
+            if let Some(cap) = n
+                .strip_prefix("InlineStr<")
+                .and_then(|rest| rest.strip_suffix('>'))
+                .and_then(|digits| digits.parse::<usize>().ok())
+            {
+                Ty::InlineStr(cap)
+            } else {
+                Ty::Named(n.clone())
+            }
+        }
         _ => Ty::U32,
     }
 }
@@ -2931,5 +4330,178 @@ fn run_single_net_sim_test(
             steady_state_allocs: runner.steady_state_allocs(),
             detail,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim_runner::decode_ty_from_bytes_with_layouts;
+    use strata_mir::lower_to_mir;
+    use strata_sema::analyze_source;
+    use strata_sema::layout::SolvedLayout;
+
+    #[test]
+    fn rpc_wire_roundtrip_wide_quantize_and_composite_struct_array_inline_str() {
+        let _guard = SIM_EXEC_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let src = r#"
+module test::rpc_wire_ut @version(1.0.0);
+
+struct PayloadMeta {
+    tier: u32 = 0,
+    label: InlineStr<16> = "init",
+}
+
+@authority(server)
+resource Audit {
+    calls: u32 = 0,
+}
+
+@net_rpc(direction = client_to_server, reliability = reliable, channel = 0)
+rpc WideRpc {
+    @quantize(min = -1.0e308, max = 1.0e308, bits = 16)
+    val: f64,
+}
+
+@net_rpc(direction = client_to_server, reliability = reliable, channel = 0)
+rpc ComplexCmd {
+    meta: PayloadMeta,
+    codes: [u32; 3],
+}
+
+obs on_wide(trg: &Trigger<WideRpc>, a: &mut res Audit) {
+    a.calls += 1_u32;
+}
+
+obs on_complex(trg: &Trigger<ComplexCmd>, a: &mut res Audit) {
+    a.calls += 1_u32;
+}
+
+net_sim_test "ut_wire"(latency: 16ms, jitter: 0ms, loss: 0.0, seed: 1, clients: 1) {
+    send_rpc(0, WideRpc { val: 1.0e307_f64 });
+    send_rpc(0, ComplexCmd {
+        meta: PayloadMeta { tier: 7_u32, label: "alpha" },
+        codes: [10_u32, 20_u32, 30_u32],
+    });
+}
+"#;
+        let analyzed = analyze_source("rpc_wire_ut.strata", src);
+        assert!(analyzed.ok(), "diagnostics: {:?}", analyzed.diagnostics);
+        let mir = lower_to_mir(&analyzed);
+        let tmp = TempDir::new().expect("tempdir");
+        let artifacts =
+            compile_role_artifacts(&mir, "rpc_wire_ut", tmp.path()).expect("compile artifacts");
+        let mut runner = NetSimRunner::new(&mir, &artifacts, 16.0, 0.0, 0.0, 1, 1).expect("new");
+        let body = mir.net_sim_tests[0].body.clone();
+        runner.exec_stmts(&body).expect("exec send_rpc calls");
+        // Advance channel to tick 1 so packets queued with 16ms latency become due,
+        // deliver directly into server's RPC dispatch slots, and inspect raw slot bytes
+        // before `server.step_tick()` consumes and despawns the transient slot entities.
+        runner.channel.current_tick = 1;
+        runner.deliver_due_to(NetWorldTarget::Server);
+
+        let mut inspect_slot = |slot_idx: usize, rpc_name: &str| -> (Vec<u8>, SolvedLayout) {
+            let slot_canon = format!("test::rpc_wire_ut::{}", rpc_slot_name(slot_idx));
+            let reg =
+                find_registry_component(runner.server.app.world(), &mir.module_path, &slot_canon)
+                    .expect("slot component registered");
+            let world = runner.server.app.world_mut();
+            let entities: Vec<Entity> = {
+                let mut q = world.query::<Entity>();
+                q.iter(world).collect()
+            };
+            let ent = entities
+                .into_iter()
+                .find(|&e| {
+                    world
+                        .get_entity(e)
+                        .is_ok_and(|er| er.contains_id(reg.component_id))
+                })
+                .unwrap_or_else(|| panic!("missing injected slot entity for {rpc_name}"));
+            let bytes = bamabi_host::read_entity_pod_bytes(world, ent, reg.handle)
+                .expect("read slot bytes");
+            let rpc_layout = find_layout_in_slice(
+                &artifacts.server_mir.layouts,
+                &mir.module_path,
+                &format!("test::rpc_wire_ut::{rpc_name}"),
+            )
+            .expect("rpc layout")
+            .clone();
+            let slot_layout =
+                find_layout_in_slice(&artifacts.server_mir.layouts, &mir.module_path, &slot_canon)
+                    .expect("slot layout")
+                    .clone();
+            let payload_off = slot_layout
+                .fields
+                .iter()
+                .find(|f| f.name == "payload")
+                .map_or(0, |f| f.offset);
+            (bytes[payload_off..].to_vec(), rpc_layout)
+        };
+
+        let (wide_bytes, wide_layout) = inspect_slot(0, "WideRpc");
+        let wide_val_f = wide_layout.fields.iter().find(|f| f.name == "val").unwrap();
+        let wide_sv = decode_ty_from_bytes_with_layouts(
+            &wide_bytes,
+            wide_val_f.offset,
+            &wide_val_f.ty,
+            &mir.enums,
+            &artifacts.server_mir.layouts,
+            &mir.module_path,
+        )
+        .expect("decode wide f64");
+        let SimVal::Float(got_wide) = wide_sv else {
+            panic!("expected Float, got {wide_sv:?}");
+        };
+        assert!(
+            got_wide.is_finite() && got_wide > 5.0e306 && got_wide < 2.0e307,
+            "got={got_wide}"
+        );
+
+        let (cplx_bytes, cplx_layout) = inspect_slot(1, "ComplexCmd");
+        let meta_f = cplx_layout
+            .fields
+            .iter()
+            .find(|f| f.name == "meta")
+            .unwrap();
+        let meta_sv = decode_ty_from_bytes_with_layouts(
+            &cplx_bytes,
+            meta_f.offset,
+            &meta_f.ty,
+            &mir.enums,
+            &artifacts.server_mir.layouts,
+            &mir.module_path,
+        )
+        .expect("decode PayloadMeta");
+        assert!(
+            matches!(
+                &meta_sv,
+                SimVal::Struct { fields, .. }
+                    if fields.iter().any(|(k, v)| k == "tier" && sim_val_eq(v, &SimVal::Int(7)))
+                        && fields.iter().any(|(k, v)| k == "label" && sim_val_eq(v, &SimVal::String("alpha".to_owned())))
+            ),
+            "unexpected decoded meta: {meta_sv:?}"
+        );
+        let codes_f = cplx_layout
+            .fields
+            .iter()
+            .find(|f| f.name == "codes")
+            .unwrap();
+        let codes_sv = decode_ty_from_bytes_with_layouts(
+            &cplx_bytes,
+            codes_f.offset,
+            &codes_f.ty,
+            &mir.enums,
+            &artifacts.server_mir.layouts,
+            &mir.module_path,
+        )
+        .expect("decode codes array");
+        assert!(
+            sim_val_eq(
+                &codes_sv,
+                &SimVal::Array(vec![SimVal::Int(10), SimVal::Int(20), SimVal::Int(30)])
+            ),
+            "unexpected decoded codes: {codes_sv:?}"
+        );
     }
 }

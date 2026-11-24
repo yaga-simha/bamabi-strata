@@ -18,9 +18,9 @@ use stratac::cli::{BuildTarget, OnboardTarget, OutputFormat};
 #[cfg(feature = "sim-runner")]
 use stratac::commands::cmd_test;
 use stratac::commands::{
-    ScheduleDeltaArtifact, ScheduleDeltaMode, WatchReport, cmd_build, cmd_build_with_key,
-    cmd_check, cmd_explain_par, cmd_fmt, cmd_layout, cmd_onboard, cmd_watch, cmd_watch_bounded,
-    cmd_watch_with_key,
+    ScheduleDeltaArtifact, ScheduleDeltaMode, WatchReport, WatchSession, cmd_build,
+    cmd_build_with_key, cmd_check, cmd_explain_par, cmd_fmt, cmd_layout, cmd_onboard, cmd_watch,
+    cmd_watch_bounded, cmd_watch_with_key,
 };
 use stratac::{EXIT_COMPILE_ERROR, EXIT_OK};
 use tempfile::TempDir;
@@ -550,4 +550,219 @@ fn cookbooks_07_and_08_headless_tests_pass() {
     let v8: serde_json::Value = serde_json::from_str(&out8).unwrap();
     assert_eq!(v8["all_passed"], true);
     assert!(v8["tests"].as_array().unwrap().len() >= 2);
+}
+
+#[test]
+fn bug_sw_02a_watch_delta_emits_module_path_and_preserves_spatial_grid() {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("arena_delta.strata");
+    let s1 = r#"
+module game::arena_demo @version(1.2.3);
+component Pos2 { xy: vec2 = vec2(0.0, 0.0) }
+tag Target2D;
+spatial_grid Grid2D(
+    cell_size: 4.0_m,
+    bounds: vec2(-32.0_m, -32.0_m)..vec2(32.0_m, 32.0_m),
+    capacity: 64,
+) over Target2D by Pos2.xy;
+object Unit { Pos2 { xy: vec2(1.0, 1.0) }, Target2D }
+sys sys_a() {
+    for e in query(p: &mut Pos2) { e.p.xy += vec2(1.0, 0.0); }
+}
+sys sys_b() {
+    for e in query(p: &mut Pos2) { e.p.xy += vec2(0.0, 1.0); }
+}
+schedule FixedUpdate {
+    seq MainSeq { sys_a, sys_b }
+}
+"#;
+    fs::write(&src_path, s1).unwrap();
+
+    let mut session = WatchSession::new(&src_path, false, None, false).unwrap();
+    let r1 = session.rebuild_from_source(s1).expect("cycle 1 succeeds");
+    assert!(!r1.schedule_delta_only);
+
+    let s2 = s1.replace(
+        "seq MainSeq { sys_a, sys_b }",
+        "seq MainSeq { sys_b, sys_a }",
+    );
+    let r2 = session.rebuild_from_source(&s2).expect("cycle 2 succeeds");
+    assert!(
+        r2.schedule_delta_only,
+        "schedule-only reorder with spatial_grid must stay on delta fast-path: {r2:?}"
+    );
+    let delta_path = PathBuf::from(r2.schedule_delta_path.as_ref().unwrap());
+    let delta: ScheduleDeltaArtifact =
+        serde_json::from_slice(&fs::read(&delta_path).unwrap()).unwrap();
+    assert_eq!(delta.mod_name, "game::arena_demo");
+    assert!(
+        delta
+            .sets
+            .iter()
+            .any(|s| s.mounted_systems == vec!["sys_b", "sys_a"]),
+        "unexpected delta sets: {:?}",
+        delta.sets
+    );
+}
+
+#[test]
+fn gf_08_cmd_check_and_build_reject_verify_mir_violations() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("bad_atomic_loop.strata");
+    fs::write(
+        &p,
+        r#"
+module test::gf08 @version(1.0.0);
+component Hp { val: i32 = 10 }
+sys bad_tx() {
+    atomic {
+        for e in query(h: &mut Hp) {
+            e.h.val -= 1;
+        }
+    }
+}
+schedule FixedUpdate { bad_tx }
+"#,
+    )
+    .unwrap();
+
+    let (check_rc, check_out) = cmd_check(&p, OutputFormat::Json);
+    assert_eq!(
+        check_rc, EXIT_COMPILE_ERROR,
+        "cmd_check must reject verify_mir failure: {check_out}"
+    );
+    assert!(
+        check_out.contains("single-slot") || check_out.contains("MIR verification"),
+        "expected MIR verification diagnostic in cmd_check output: {check_out}"
+    );
+
+    let out_dir = tmp.path().join("build_out");
+    let (build_rc, build_out) = cmd_build(
+        &p,
+        false,
+        BuildTarget::Jit,
+        Some(&out_dir),
+        false,
+        false,
+        OutputFormat::Json,
+    );
+    assert_eq!(
+        build_rc, EXIT_COMPILE_ERROR,
+        "cmd_build must reject verify_mir failure: {build_out}"
+    );
+}
+
+#[test]
+fn nt_12b_version_in_mod_toml_and_signing_flag_validation() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("ver_test.strata");
+    fs::write(
+        &p,
+        r#"
+module game::ver_check @version(2.4.7);
+component TagVal { x: u32 = 1 }
+object Obj { TagVal { x: 1 } }
+"#,
+    )
+    .unwrap();
+
+    let out_dir = tmp.path().join("out_ok");
+    let (rc, msg) = cmd_build(
+        &p,
+        false,
+        BuildTarget::Jit,
+        Some(&out_dir),
+        false,
+        false,
+        OutputFormat::Json,
+    );
+    assert_eq!(rc, EXIT_OK, "build failed: {msg}");
+    let mod_toml = fs::read_to_string(out_dir.join("mod.toml")).expect("read mod.toml");
+    assert!(
+        mod_toml.contains("version = \"2.4.7\""),
+        "expected module @version(2.4.7) in mod.toml, got:\n{mod_toml}"
+    );
+
+    let dummy_key = tmp.path().join("unused.key");
+    fs::write(&dummy_key, "unused").unwrap();
+    let (rc_k, msg_k) = cmd_build_with_key(
+        &p,
+        false,
+        BuildTarget::Jit,
+        Some(&tmp.path().join("out_k")),
+        false,
+        false,
+        Some(&dummy_key),
+        false,
+        OutputFormat::Json,
+    );
+    assert_ne!(
+        rc_k, EXIT_OK,
+        "--key without --sign/--bampack must error: {msg_k}"
+    );
+
+    let (rc_e, msg_e) = cmd_build_with_key(
+        &p,
+        false,
+        BuildTarget::Jit,
+        Some(&tmp.path().join("out_e")),
+        false,
+        false,
+        None,
+        true,
+        OutputFormat::Json,
+    );
+    assert_ne!(
+        rc_e, EXIT_OK,
+        "--ephemeral-key without --sign/--bampack must error: {msg_e}"
+    );
+}
+
+#[cfg(feature = "sim-runner")]
+#[test]
+fn bug_sw_08_sim_test_with_all_schedules_does_not_hijack_update() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("all_schedules.strata");
+    fs::write(
+        &p,
+        r#"
+module test::all_scheds @version(1.0.0);
+
+resource TickState {
+    update_ticks: u32 = 0,
+    fixed_ticks: u32 = 0,
+}
+
+sys on_start() {}
+sys on_pre_update() {}
+sys on_update(st: &mut res TickState) {
+    st.update_ticks += 1_u32;
+}
+sys on_fixed(st: &mut res TickState) {
+    st.fixed_ticks += 1_u32;
+}
+sys on_post_update() {}
+sys on_last() {}
+
+schedule Startup { on_start }
+schedule PreUpdate { on_pre_update }
+schedule Update { on_update }
+schedule FixedUpdate { on_fixed }
+schedule PostUpdate { on_post_update }
+schedule Last { on_last }
+
+sim_test "all_schedules_no_update_hijack" {
+    assert_eq(res<TickState>().update_ticks, 0_u32);
+    step_fixed(3);
+    assert_eq(res<TickState>().fixed_ticks, 3_u32);
+    assert_eq(res<TickState>().update_ticks, 0_u32);
+}
+"#,
+    )
+    .unwrap();
+
+    let (rc, out) = cmd_test(&p, OutputFormat::Json);
+    assert_eq!(rc, EXIT_OK, "all-schedules sim_test failed:\n{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["all_passed"], true);
 }
