@@ -157,15 +157,49 @@ static BAM_UNUSED inline StrataVec4 strata_vec4_mul(StrataVec4 a, StrataVec4 b) 
 static BAM_UNUSED inline StrataVec4 strata_vec4_scale(StrataVec4 a, float s) {
     return strata_vec4(a.x * s, a.y * s, a.z * s, a.w * s);
 }
+static BAM_UNUSED inline StrataVec2 strata_vec2_div(StrataVec2 a, StrataVec2 b) {
+    return strata_vec2(a.x / b.x, a.y / b.y);
+}
+static BAM_UNUSED inline StrataVec3 strata_vec3_div(StrataVec3 a, StrataVec3 b) {
+    return strata_vec3(a.x / b.x, a.y / b.y, a.z / b.z);
+}
+static BAM_UNUSED inline StrataVec4 strata_vec4_div(StrataVec4 a, StrataVec4 b) {
+    return strata_vec4(a.x / b.x, a.y / b.y, a.z / b.z, a.w / b.w);
+}
 static BAM_UNUSED inline float strata_vec4_dot(StrataVec4 a, StrataVec4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
+static BAM_UNUSED inline float strata_vec4_len_sq(StrataVec4 a) {
+    return strata_vec4_dot(a, a);
+}
 static BAM_UNUSED inline float strata_vec4_len(StrataVec4 a) {
-    return sqrtf(strata_vec4_dot(a, a));
+    return sqrtf(strata_vec4_len_sq(a));
+}
+static BAM_UNUSED inline float strata_vec4_dist(StrataVec4 a, StrataVec4 b) {
+    return strata_vec4_len(strata_vec4_sub(a, b));
+}
+static BAM_UNUSED inline float strata_vec4_dist_sq(StrataVec4 a, StrataVec4 b) {
+    return strata_vec4_len_sq(strata_vec4_sub(a, b));
 }
 static BAM_UNUSED inline StrataVec4 strata_vec4_norm(StrataVec4 a) {
     float l = strata_vec4_len(a);
     return (l > 1e-6f) ? strata_vec4_scale(a, 1.0f / l) : strata_vec4(0.0f, 0.0f, 0.0f, 1.0f);
+}
+static BAM_UNUSED inline StrataVec4 strata_vec4_lerp(StrataVec4 a, StrataVec4 b, float t) {
+    return strata_vec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t);
+}
+static BAM_UNUSED inline StrataVec4 strata_quat_mul(StrataVec4 a, StrataVec4 b) {
+    return strata_vec4(
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    );
+}
+static BAM_UNUSED inline StrataVec3 strata_quat_mul_vec3(StrataVec4 q, StrataVec3 v) {
+    StrataVec3 u = strata_vec3(q.x, q.y, q.z);
+    StrataVec3 c = strata_vec3_add(strata_vec3_cross(u, v), strata_vec3_scale(v, q.w));
+    return strata_vec3_add(v, strata_vec3_scale(strata_vec3_cross(u, c), 2.0f));
 }
 static BAM_UNUSED inline StrataVec4 strata_quat_from_rotation_y(float angle_rad) {
     float half = 0.5f * angle_rad;
@@ -177,14 +211,53 @@ static BAM_UNUSED inline double strata_sqr_f64(double x) { return x * x; }
 static BAM_UNUSED inline float strata_clamp_f32(float v, float lo, float hi) {
     return (v < lo) ? lo : ((v > hi) ? hi : v);
 }
+static BAM_UNUSED inline double strata_clamp_f64(double v, double lo, double hi) {
+    return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
 static BAM_UNUSED inline int32_t strata_clamp_i32(int32_t v, int32_t lo, int32_t hi) {
     return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
+static BAM_UNUSED inline uint32_t strata_clamp_u32(uint32_t v, uint32_t lo, uint32_t hi) {
+    return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
+static BAM_UNUSED inline int64_t strata_clamp_i64(int64_t v, int64_t lo, int64_t hi) {
+    return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
+static BAM_UNUSED inline uint64_t strata_clamp_u64(uint64_t v, uint64_t lo, uint64_t hi) {
+    return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
+static BAM_UNUSED inline StrataVec2 strata_vec2_clamp(StrataVec2 v, StrataVec2 lo, StrataVec2 hi) {
+    return strata_vec2(strata_clamp_f32(v.x, lo.x, hi.x), strata_clamp_f32(v.y, lo.y, hi.y));
+}
+static BAM_UNUSED inline StrataVec3 strata_vec3_clamp(StrataVec3 v, StrataVec3 lo, StrataVec3 hi) {
+    return strata_vec3(strata_clamp_f32(v.x, lo.x, hi.x), strata_clamp_f32(v.y, lo.y, hi.y), strata_clamp_f32(v.z, lo.z, hi.z));
+}
+static BAM_UNUSED inline StrataVec4 strata_vec4_clamp(StrataVec4 v, StrataVec4 lo, StrataVec4 hi) {
+    return strata_vec4(strata_clamp_f32(v.x, lo.x, hi.x), strata_clamp_f32(v.y, lo.y, hi.y), strata_clamp_f32(v.z, lo.z, hi.z), strata_clamp_f32(v.w, lo.w, hi.w));
 }
 static BAM_UNUSED inline float strata_lerp_f32(float a, float b, float t) {
     return a + (b - a) * t;
 }
+static BAM_UNUSED inline double strata_lerp_f64(double a, double b, double t) {
+    return a + (b - a) * t;
+}
 static BAM_UNUSED inline float strata_signum_f32(float v) {
     return (v > 0.0f) ? 1.0f : ((v < 0.0f) ? -1.0f : 0.0f);
+}
+static BAM_UNUSED inline double strata_signum_f64(double v) {
+    return (v > 0.0) ? 1.0 : ((v < 0.0) ? -1.0 : 0.0);
+}
+static BAM_UNUSED inline int32_t strata_signum_i32(int32_t v) {
+    return (v > 0) ? 1 : ((v < 0) ? -1 : 0);
+}
+static BAM_UNUSED inline int64_t strata_signum_i64(int64_t v) {
+    return (v > 0ll) ? 1ll : ((v < 0ll) ? -1ll : 0ll);
+}
+static BAM_UNUSED inline int32_t strata_signum_fix32(int32_t v) {
+    return (v > 0) ? 65536 : ((v < 0) ? -65536 : 0);
+}
+static BAM_UNUSED inline int64_t strata_signum_fix64(int64_t v) {
+    return (v > 0ll) ? 4294967296ll : ((v < 0ll) ? -4294967296ll : 0ll);
 }
 
 /* Primitive runtime helpers matching bamabi_native_rt::primitives ABI layouts. */
@@ -302,30 +375,30 @@ static BAM_UNUSED inline void strata_input_tick(void* ptr, uint32_t cap, float d
 }
 
 static BAM_UNUSED inline BamBool strata_bitset_get(const void* ptr, uint32_t words, uint32_t bit) {
-    uint32_t w = bit >> 6u;
-    uint32_t b = bit & 63u;
+    uint32_t w = bit >> 5u;
+    uint32_t b = bit & 31u;
     if (ptr == NULL || w >= words) { return BAM_FALSE; }
-    uint64_t val = 0ull;
-    memcpy(&val, (const uint8_t*)ptr + (size_t)w * sizeof(uint64_t), sizeof(uint64_t));
-    return ((val & (1ull << b)) != 0ull) ? BAM_TRUE : BAM_FALSE;
+    uint32_t val = 0u;
+    memcpy(&val, (const uint8_t*)ptr + (size_t)w * sizeof(uint32_t), sizeof(uint32_t));
+    return ((val & (1u << b)) != 0u) ? BAM_TRUE : BAM_FALSE;
 }
 static BAM_UNUSED inline void strata_bitset_set(void* ptr, uint32_t words, uint32_t bit) {
-    uint32_t w = bit >> 6u;
-    uint32_t b = bit & 63u;
+    uint32_t w = bit >> 5u;
+    uint32_t b = bit & 31u;
     if (ptr == NULL || w >= words) { return; }
-    uint64_t val = 0ull;
-    memcpy(&val, (const uint8_t*)ptr + (size_t)w * sizeof(uint64_t), sizeof(uint64_t));
-    val |= (1ull << b);
-    memcpy((uint8_t*)ptr + (size_t)w * sizeof(uint64_t), &val, sizeof(uint64_t));
+    uint32_t val = 0u;
+    memcpy(&val, (const uint8_t*)ptr + (size_t)w * sizeof(uint32_t), sizeof(uint32_t));
+    val |= (1u << b);
+    memcpy((uint8_t*)ptr + (size_t)w * sizeof(uint32_t), &val, sizeof(uint32_t));
 }
 static BAM_UNUSED inline void strata_bitset_clear(void* ptr, uint32_t words, uint32_t bit) {
-    uint32_t w = bit >> 6u;
-    uint32_t b = bit & 63u;
+    uint32_t w = bit >> 5u;
+    uint32_t b = bit & 31u;
     if (ptr == NULL || w >= words) { return; }
-    uint64_t val = 0ull;
-    memcpy(&val, (const uint8_t*)ptr + (size_t)w * sizeof(uint64_t), sizeof(uint64_t));
-    val &= ~(1ull << b);
-    memcpy((uint8_t*)ptr + (size_t)w * sizeof(uint64_t), &val, sizeof(uint64_t));
+    uint32_t val = 0u;
+    memcpy(&val, (const uint8_t*)ptr + (size_t)w * sizeof(uint32_t), sizeof(uint32_t));
+    val &= ~(1u << b);
+    memcpy((uint8_t*)ptr + (size_t)w * sizeof(uint32_t), &val, sizeof(uint32_t));
 }
 
 typedef struct StrataSpatialHits {
@@ -478,21 +551,19 @@ static BAM_UNUSED inline int strata_spatial_csr_cell_range(
     return 1;
 }
 
-static BAM_UNUSED inline StrataSpatialHits strata_spatial_query_disc(
-    const void* grid_ptr,
-    StrataVec3 center,
+static BAM_UNUSED inline StrataSpatialHits strata_spatial_query_disc_coords(
+    const StrataSpatialHeader* h,
+    float cx_coord,
+    float cy_coord,
     float radius)
 {
     StrataSpatialHits hits;
-    const StrataSpatialHeader* h = (const StrataSpatialHeader*)grid_ptr;
     uint32_t f;
     uint32_t total;
     const uint32_t* off;
     uint32_t base;
     float r;
     float r2;
-    float cx_coord;
-    float cy_coord;
     int32_t min_cx;
     int32_t max_cx;
     int32_t min_cy;
@@ -510,8 +581,6 @@ static BAM_UNUSED inline StrataSpatialHits strata_spatial_query_disc(
     if (total > h->capacity) { total = h->capacity; }
     off = &h->cell_offsets[f * (h->cell_count + 1u)];
     base = f * h->capacity;
-    cx_coord = strata_spatial_axis3(center, h->plane_ax0);
-    cy_coord = strata_spatial_axis3(center, h->plane_ax1);
     min_cx = strata_spatial_clamp_cell_coord(cx_coord - r, h->bounds_min_x, h->inv_cell_size, h->cols);
     max_cx = strata_spatial_clamp_cell_coord(cx_coord + r, h->bounds_min_x, h->inv_cell_size, h->cols);
     min_cy = strata_spatial_clamp_cell_coord(cy_coord - r, h->bounds_min_y, h->inv_cell_size, h->rows);
@@ -525,10 +594,11 @@ static BAM_UNUSED inline StrataSpatialHits strata_spatial_query_disc(
                 uint32_t k;
                 for (k = start; k < end && hits.count < 64u; ++k) {
                     StrataVec4 p = h->positions[base + k];
-                    float dx = p.x - center.x;
-                    float dy = p.y - center.y;
-                    float dz = p.z - center.z;
-                    if (dx * dx + dy * dy + dz * dz <= r2) {
+                    float px = strata_spatial_axis4(p, h->plane_ax0);
+                    float py = strata_spatial_axis4(p, h->plane_ax1);
+                    float dx = px - cx_coord;
+                    float dy = py - cy_coord;
+                    if (dx * dx + dy * dy <= r2) {
                         hits.entities[hits.count++] = h->entities[base + k];
                     }
                 }
@@ -537,17 +607,44 @@ static BAM_UNUSED inline StrataSpatialHits strata_spatial_query_disc(
     }
     return hits;
 }
+static BAM_UNUSED inline StrataSpatialHits strata_spatial_query_disc(
+    const void* grid_ptr,
+    StrataVec3 center,
+    float radius)
+{
+    const StrataSpatialHeader* h = (const StrataSpatialHeader*)grid_ptr;
+    if (h == NULL) {
+        StrataSpatialHits empty;
+        memset(&empty, 0, sizeof(empty));
+        return empty;
+    }
+    return strata_spatial_query_disc_coords(
+        h,
+        strata_spatial_axis3(center, h->plane_ax0),
+        strata_spatial_axis3(center, h->plane_ax1),
+        radius);
+}
+static BAM_UNUSED inline StrataSpatialHits strata_spatial_query_disc_2d(
+    const void* grid_ptr,
+    StrataVec2 center,
+    float radius)
+{
+    return strata_spatial_query_disc_coords(
+        (const StrataSpatialHeader*)grid_ptr,
+        center.x,
+        center.y,
+        radius);
+}
 static BAM_UNUSED inline StrataSpatialHits strata_spatial_query_segment_at(
     const void* hist_ptr,
     StrataVec3 p0,
     StrataVec3 p1,
     float radius,
-    float tick_offset)
+    uint32_t tick_offset)
 {
     StrataSpatialHits hits;
     const StrataSpatialHeader* h = (const StrataSpatialHeader*)hist_ptr;
     uint32_t frames;
-    uint32_t toff;
     uint32_t f;
     uint32_t total;
     const uint32_t* off;
@@ -571,12 +668,14 @@ static BAM_UNUSED inline StrataSpatialHits strata_spatial_query_segment_at(
     StrataVec3 ab;
     float ab_sq;
     memset(&hits, 0, sizeof(hits));
-    if (h == NULL || h->counts == NULL || h->cell_offsets == NULL || h->entities == NULL || h->positions == NULL || h->cols == 0u || h->rows == 0u || h->cell_count == 0u) {
+    if (h == NULL || h->frames == 0u || h->counts == NULL || h->cell_offsets == NULL || h->entities == NULL || h->positions == NULL || h->cols == 0u || h->rows == 0u || h->cell_count == 0u) {
         return hits;
     }
-    frames = (h->frames > 0u) ? h->frames : 1u;
-    toff = (tick_offset > 0.0f) ? (uint32_t)tick_offset : 0u;
-    f = (h->head_tick + frames - (toff % frames)) % frames;
+    frames = h->frames;
+    if (tick_offset >= frames) {
+        return hits;
+    }
+    f = ((h->head_tick % frames) + frames - tick_offset) % frames;
     total = h->counts[f];
     if (total > h->capacity) { total = h->capacity; }
     off = &h->cell_offsets[f * (h->cell_count + 1u)];
@@ -814,6 +913,105 @@ static BAM_UNUSED inline int64_t strata_i64_rem(int64_t a, int64_t b) {
     if (b == 0ll) { return 0ll; }
     if (a == INT64_MIN && b == -1ll) { return 0ll; }
     return a % b;
+}
+static BAM_UNUSED inline int8_t strata_abs_i8(int8_t v) {
+    return (v < 0) ? (int8_t)(uint8_t)(0u - (uint8_t)v) : v;
+}
+static BAM_UNUSED inline int16_t strata_abs_i16(int16_t v) {
+    return (v < 0) ? (int16_t)(uint16_t)(0u - (uint16_t)v) : v;
+}
+static BAM_UNUSED inline int32_t strata_abs_i32(int32_t v) {
+    return (v < 0) ? (int32_t)(0u - (uint32_t)v) : v;
+}
+static BAM_UNUSED inline int64_t strata_abs_i64(int64_t v) {
+    return (v < 0ll) ? (int64_t)(0ull - (uint64_t)v) : v;
+}
+static BAM_UNUSED inline StrataIVec2 strata_ivec2_add(StrataIVec2 a, StrataIVec2 b) {
+    return strata_ivec2((int32_t)((uint32_t)a.x + (uint32_t)b.x), (int32_t)((uint32_t)a.y + (uint32_t)b.y));
+}
+static BAM_UNUSED inline StrataIVec2 strata_ivec2_sub(StrataIVec2 a, StrataIVec2 b) {
+    return strata_ivec2((int32_t)((uint32_t)a.x - (uint32_t)b.x), (int32_t)((uint32_t)a.y - (uint32_t)b.y));
+}
+static BAM_UNUSED inline StrataIVec2 strata_ivec2_mul(StrataIVec2 a, StrataIVec2 b) {
+    return strata_ivec2((int32_t)((uint32_t)a.x * (uint32_t)b.x), (int32_t)((uint32_t)a.y * (uint32_t)b.y));
+}
+static BAM_UNUSED inline StrataIVec2 strata_ivec2_scale(StrataIVec2 a, int32_t s) {
+    return strata_ivec2((int32_t)((uint32_t)a.x * (uint32_t)s), (int32_t)((uint32_t)a.y * (uint32_t)s));
+}
+static BAM_UNUSED inline StrataIVec2 strata_ivec2_div(StrataIVec2 a, StrataIVec2 b) {
+    return strata_ivec2(strata_i32_div(a.x, b.x), strata_i32_div(a.y, b.y));
+}
+static BAM_UNUSED inline StrataIVec2 strata_ivec2_rem(StrataIVec2 a, StrataIVec2 b) {
+    return strata_ivec2(strata_i32_rem(a.x, b.x), strata_i32_rem(a.y, b.y));
+}
+static BAM_UNUSED inline StrataIVec2 strata_ivec2_clamp(StrataIVec2 v, StrataIVec2 lo, StrataIVec2 hi) {
+    return strata_ivec2(strata_clamp_i32(v.x, lo.x, hi.x), strata_clamp_i32(v.y, lo.y, hi.y));
+}
+static BAM_UNUSED inline StrataIVec3 strata_ivec3_add(StrataIVec3 a, StrataIVec3 b) {
+    return strata_ivec3((int32_t)((uint32_t)a.x + (uint32_t)b.x), (int32_t)((uint32_t)a.y + (uint32_t)b.y), (int32_t)((uint32_t)a.z + (uint32_t)b.z));
+}
+static BAM_UNUSED inline StrataIVec3 strata_ivec3_sub(StrataIVec3 a, StrataIVec3 b) {
+    return strata_ivec3((int32_t)((uint32_t)a.x - (uint32_t)b.x), (int32_t)((uint32_t)a.y - (uint32_t)b.y), (int32_t)((uint32_t)a.z - (uint32_t)b.z));
+}
+static BAM_UNUSED inline StrataIVec3 strata_ivec3_mul(StrataIVec3 a, StrataIVec3 b) {
+    return strata_ivec3((int32_t)((uint32_t)a.x * (uint32_t)b.x), (int32_t)((uint32_t)a.y * (uint32_t)b.y), (int32_t)((uint32_t)a.z * (uint32_t)b.z));
+}
+static BAM_UNUSED inline StrataIVec3 strata_ivec3_scale(StrataIVec3 a, int32_t s) {
+    return strata_ivec3((int32_t)((uint32_t)a.x * (uint32_t)s), (int32_t)((uint32_t)a.y * (uint32_t)s), (int32_t)((uint32_t)a.z * (uint32_t)s));
+}
+static BAM_UNUSED inline StrataIVec3 strata_ivec3_div(StrataIVec3 a, StrataIVec3 b) {
+    return strata_ivec3(strata_i32_div(a.x, b.x), strata_i32_div(a.y, b.y), strata_i32_div(a.z, b.z));
+}
+static BAM_UNUSED inline StrataIVec3 strata_ivec3_rem(StrataIVec3 a, StrataIVec3 b) {
+    return strata_ivec3(strata_i32_rem(a.x, b.x), strata_i32_rem(a.y, b.y), strata_i32_rem(a.z, b.z));
+}
+static BAM_UNUSED inline StrataIVec3 strata_ivec3_clamp(StrataIVec3 v, StrataIVec3 lo, StrataIVec3 hi) {
+    return strata_ivec3(strata_clamp_i32(v.x, lo.x, hi.x), strata_clamp_i32(v.y, lo.y, hi.y), strata_clamp_i32(v.z, lo.z, hi.z));
+}
+static BAM_UNUSED inline StrataUVec2 strata_uvec2_add(StrataUVec2 a, StrataUVec2 b) {
+    return strata_uvec2(a.x + b.x, a.y + b.y);
+}
+static BAM_UNUSED inline StrataUVec2 strata_uvec2_sub(StrataUVec2 a, StrataUVec2 b) {
+    return strata_uvec2(a.x - b.x, a.y - b.y);
+}
+static BAM_UNUSED inline StrataUVec2 strata_uvec2_mul(StrataUVec2 a, StrataUVec2 b) {
+    return strata_uvec2(a.x * b.x, a.y * b.y);
+}
+static BAM_UNUSED inline StrataUVec2 strata_uvec2_scale(StrataUVec2 a, uint32_t s) {
+    return strata_uvec2(a.x * s, a.y * s);
+}
+static BAM_UNUSED inline StrataUVec2 strata_uvec2_div(StrataUVec2 a, StrataUVec2 b) {
+    return strata_uvec2(strata_u32_div(a.x, b.x), strata_u32_div(a.y, b.y));
+}
+static BAM_UNUSED inline StrataUVec2 strata_uvec2_rem(StrataUVec2 a, StrataUVec2 b) {
+    return strata_uvec2(strata_u32_rem(a.x, b.x), strata_u32_rem(a.y, b.y));
+}
+static BAM_UNUSED inline StrataUVec2 strata_uvec2_clamp(StrataUVec2 v, StrataUVec2 lo, StrataUVec2 hi) {
+    return strata_uvec2(strata_clamp_u32(v.x, lo.x, hi.x), strata_clamp_u32(v.y, lo.y, hi.y));
+}
+static BAM_UNUSED inline void strata_inlinestr_from_cstr(
+    void* dst, size_t dst_sz, size_t cap, const char* src
+) {
+    size_t raw_len;
+    size_t slen;
+    uint32_t len32;
+    if (dst == NULL || dst_sz < 4u) { return; }
+    memset(dst, 0, dst_sz);
+    if (src == NULL) { return; }
+    raw_len = strlen(src);
+    slen = raw_len;
+    if (slen > cap) { slen = cap; }
+    if (slen > dst_sz - 4u) { slen = dst_sz - 4u; }
+    if (slen < raw_len) {
+        while (slen > 0u && (((uint8_t)src[slen]) & 0xC0u) == 0x80u) {
+            --slen;
+        }
+    }
+    len32 = (uint32_t)slen;
+    memcpy(dst, &len32, sizeof(len32));
+    if (slen > 0u) {
+        memcpy((uint8_t*)dst + 4u, src, slen);
+    }
 }
 static BAM_UNUSED inline uint64_t strata_u64_div(uint64_t a, uint64_t b) {
     return (b == 0ull) ? 0ull : (a / b);

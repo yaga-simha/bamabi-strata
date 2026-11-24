@@ -21,11 +21,22 @@ pub(super) struct FnEmitCtx<'a, 'b> {
     pub(super) const_defs: HashMap<LocalId, MirConstVal>,
     pub(super) array_inits: HashMap<LocalId, Vec<LocalId>>,
     pub(super) field_ptr_arrays: HashMap<LocalId, (Ty, usize)>,
+    pub(super) array_index_strides: HashMap<LocalId, usize>,
+    pub(super) slot_mir_arrays: HashMap<LocalId, (MirType, usize)>,
+    pub(super) query_term_remaps: HashMap<(u32, u32), u32>,
+    pub(super) active_checkpoints: HashMap<(u32, usize), LocalId>,
     pub(super) last_checkpoint: Option<LocalId>,
     pub(super) par_query_idx: Option<u32>,
 }
 
 impl<'a, 'b> FnEmitCtx<'a, 'b> {
+    pub(super) fn eff_term_idx(&self, qi: u32, raw_ti: u32) -> u32 {
+        self.query_term_remaps
+            .get(&(qi, raw_ti))
+            .copied()
+            .unwrap_or(raw_ti)
+    }
+
     pub(super) fn local_expr(&self, id: LocalId) -> String {
         if self.restrict_cols.contains_key(&id) {
             format!("col_{}", id.0)
@@ -206,10 +217,178 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             (MirType::U16, _) => self.parent.c_const_val_for_ty(&Ty::U16, val),
             (MirType::U32 | MirType::Sym, _) => self.parent.c_const_val_for_ty(&Ty::U32, val),
             (MirType::U64, _) => self.parent.c_const_val_for_ty(&Ty::U64, val),
+            (MirType::Named(key), _) => {
+                if key == "mat3" || key == "Mat3" {
+                    return self.parent.c_const_val_for_ty(&Ty::Mat3, val);
+                }
+                if key == "mat4" || key == "Mat4" {
+                    return self.parent.c_const_val_for_ty(&Ty::Mat4, val);
+                }
+                if let Some(cap) = parse_inlinestr_cap(key) {
+                    if matches!(val, MirConstVal::String(_)) {
+                        return self.parent.c_const_val_for_ty(&Ty::InlineStr(cap), val);
+                    }
+                    let total = 4 + cap.div_ceil(4) * 4;
+                    return format!("((StrataBytes_{total}){{ {{ 0 }} }})");
+                }
+                if let Some(rest) = key
+                    .strip_prefix("BitSet<")
+                    .and_then(|s| s.strip_suffix('>'))
+                    && let Ok(bits) = rest.trim().parse::<usize>()
+                {
+                    let byte_len = bits.div_ceil(32).max(1) * 4;
+                    let packed = pack_bitset_bytes(val, byte_len);
+                    let bytes_c: Vec<String> =
+                        packed.iter().map(|b| format!("0x{b:02X}u")).collect();
+                    return format!(
+                        "((StrataBytes_{byte_len}){{ {{ {} }} }})",
+                        bytes_c.join(", ")
+                    );
+                }
+                self.parent.c_const_val(val)
+            }
             _ => self.parent.c_const_val(val),
         }
     }
 
+    fn is_u32_word_bitset_src(&self, val: LocalId, dst_sema: Option<&Ty>) -> bool {
+        if let Some(mut ty) = dst_sema {
+            while let Ty::Array { elem, .. } = ty {
+                ty = elem;
+            }
+            if !matches!(ty, Ty::BitSet(_)) {
+                return false;
+            }
+        }
+        let Some(mut cur_ty) = self.local_ty(val) else {
+            return false;
+        };
+        while let MirType::Array { elem, .. } = cur_ty {
+            if matches!(elem.as_ref(), MirType::U32) {
+                return true;
+            }
+            cur_ty = elem;
+        }
+        false
+    }
+
+    fn is_bitset_mir_dst(&self, dst_elem: &MirType) -> bool {
+        let mut cur = dst_elem;
+        while let MirType::Array { elem, .. } = cur {
+            cur = elem;
+        }
+        matches!(cur, MirType::Named(k) if k.starts_with("BitSet<"))
+    }
+}
+
+fn parse_inlinestr_cap(key: &str) -> Option<usize> {
+    key.strip_prefix("InlineStr<")
+        .and_then(|s| s.strip_suffix('>'))
+        .and_then(|s| s.trim().parse::<usize>().ok())
+}
+
+fn parse_vec_swizzle_lanes(s: &str) -> Option<Vec<&'static str>> {
+    if s.is_empty() || s.len() > 4 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        let lane = match c {
+            'x' | 'r' => "x",
+            'y' | 'g' => "y",
+            'z' | 'b' => "z",
+            'w' | 'a' => "w",
+            _ => return None,
+        };
+        out.push(lane);
+    }
+    Some(out)
+}
+
+fn sema_vec_kind(ty: &Ty) -> Option<MirType> {
+    match ty {
+        Ty::Vec2 => Some(MirType::Vec2),
+        Ty::Vec3 => Some(MirType::Vec3),
+        Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => Some(MirType::Vec4),
+        Ty::IVec2 => Some(MirType::IVec2),
+        Ty::IVec3 => Some(MirType::IVec3),
+        Ty::UVec2 => Some(MirType::UVec2),
+        _ => None,
+    }
+}
+
+fn vec_swizzle_read_expr(
+    base_mir_ty: &MirType,
+    base_expr: &str,
+    op: &str,
+    lanes: &[&str],
+) -> String {
+    if lanes.len() == 1 {
+        return format!("{base_expr}{op}{}", lanes[0]);
+    }
+    match (base_mir_ty, lanes.len()) {
+        (MirType::IVec2 | MirType::IVec3, 2) => {
+            format!(
+                "strata_ivec2({base_expr}{op}{}, {base_expr}{op}{})",
+                lanes[0], lanes[1]
+            )
+        }
+        (MirType::IVec2 | MirType::IVec3, 3) => format!(
+            "strata_ivec3({base_expr}{op}{}, {base_expr}{op}{}, {base_expr}{op}{})",
+            lanes[0], lanes[1], lanes[2]
+        ),
+        (MirType::UVec2, 2) => {
+            format!(
+                "strata_uvec2({base_expr}{op}{}, {base_expr}{op}{})",
+                lanes[0], lanes[1]
+            )
+        }
+        (_, 2) => format!(
+            "strata_vec2({base_expr}{op}{}, {base_expr}{op}{})",
+            lanes[0], lanes[1]
+        ),
+        (_, 3) => format!(
+            "strata_vec3({base_expr}{op}{}, {base_expr}{op}{}, {base_expr}{op}{})",
+            lanes[0], lanes[1], lanes[2]
+        ),
+        _ => format!(
+            "strata_vec4({base_expr}{op}{}, {base_expr}{op}{}, {base_expr}{op}{}, {base_expr}{op}{})",
+            lanes.first().copied().unwrap_or("x"),
+            lanes.get(1).copied().unwrap_or("x"),
+            lanes.get(2).copied().unwrap_or("x"),
+            lanes.get(3).copied().unwrap_or("x"),
+        ),
+    }
+}
+
+fn vec_swizzle_store_exprs(target_expr: &str, op: &str, val_expr: &str, lanes: &[&str]) -> String {
+    if lanes.len() == 1 {
+        return format!("{target_expr}{op}{} = {val_expr};", lanes[0]);
+    }
+    const SRC: [&str; 4] = ["x", "y", "z", "w"];
+    let mut parts = Vec::with_capacity(lanes.len());
+    for (i, dst_lane) in lanes.iter().enumerate() {
+        let src_lane = SRC[i];
+        parts.push(format!(
+            "{target_expr}{op}{dst_lane} = {val_expr}.{src_lane};"
+        ));
+    }
+    parts.join(" ")
+}
+
+fn vec_type_from_c_pointee(c_pointee: &str) -> Option<MirType> {
+    match c_pointee {
+        "StrataVec2" => Some(MirType::Vec2),
+        "StrataVec3" => Some(MirType::Vec3),
+        "StrataVec4" => Some(MirType::Vec4),
+        "StrataIVec2" => Some(MirType::IVec2),
+        "StrataIVec3" => Some(MirType::IVec3),
+        "StrataUVec2" => Some(MirType::UVec2),
+        _ => None,
+    }
+}
+
+impl<'a, 'b> FnEmitCtx<'a, 'b> {
     pub(super) fn emit_c_array_init_elem(
         &self,
         dst_lval: &str,
@@ -284,6 +463,17 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     };
                     let _ = writeln!(s, "    {dst_lval}.data[{j}] = {rhs};");
                 }
+            } else if self.local_ty(src_local) != Some(dst_ty)
+                && (self.parent.is_aggregate_mir_ty(dst_ty)
+                    || self
+                        .local_ty(src_local)
+                        .is_some_and(|st| self.parent.is_aggregate_mir_ty(st)))
+            {
+                let ev = self.local_expr(src_local);
+                let _ = writeln!(
+                    s,
+                    "    memset(&({dst_lval}), 0, sizeof({dst_lval}));\n    memcpy(&({dst_lval}), &({ev}), sizeof({dst_lval}) < sizeof({ev}) ? sizeof({dst_lval}) : sizeof({ev}));"
+                );
             } else {
                 let ev = self.local_expr(src_local);
                 let _ = writeln!(s, "    {dst_lval} = {ev};");
@@ -308,6 +498,17 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
         ) {
             let rhs = self.coerce_local_to_mir_scalar(src_local, dst_ty);
             let _ = writeln!(s, "    {dst_lval} = {rhs};");
+        } else if self.local_ty(src_local) != Some(dst_ty)
+            && (self.parent.is_aggregate_mir_ty(dst_ty)
+                || self
+                    .local_ty(src_local)
+                    .is_some_and(|st| self.parent.is_aggregate_mir_ty(st)))
+        {
+            let ev = self.local_expr(src_local);
+            let _ = writeln!(
+                s,
+                "    memset(&({dst_lval}), 0, sizeof({dst_lval}));\n    memcpy(&({dst_lval}), &({ev}), sizeof({dst_lval}) < sizeof({ev}) ? sizeof({dst_lval}) : sizeof({ev}));"
+            );
         } else {
             let ev = self.local_expr(src_local);
             let _ = writeln!(s, "    {dst_lval} = {ev};");
@@ -408,7 +609,9 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
         indent: &str,
         s: &mut String,
     ) {
-        if let Some(MirConstVal::Array(elems)) = self.const_defs.get(&fval) {
+        if !self.is_u32_word_bitset_src(fval, Some(f_ty))
+            && let Some(MirConstVal::Array(elems)) = self.const_defs.get(&fval)
+        {
             let _ = writeln!(s, "{indent}memset({target}, 0, sizeof({target}));");
             self.parent
                 .emit_c_array_field_init_to(s, indent, target, f_ty, Some(elems), 0);
@@ -459,6 +662,25 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                         s,
                         "{indent}if (({flat_ei}u + 1u) * {bs_bytes}u <= sizeof({target})) {{ memset(&({target})[{flat_ei}u * {bs_bytes}u], 0, {bs_bytes}u); memcpy(&({target})[{flat_ei}u * {bs_bytes}u], &{el_expr}, {bs_bytes}u < sizeof({el_expr}) ? {bs_bytes}u : sizeof({el_expr})); }}"
                     );
+                }
+            } else if let Ty::InlineStr(cap) = &**elem {
+                let is_bytes = 4 + (*cap).div_ceil(4) * 4;
+                for (ei, &el) in elem_locals.iter().take(*len).enumerate() {
+                    let flat_ei = flat_idx_base + ei;
+                    let el_expr = self.local_expr(el);
+                    let el_ty = self.local_ty(el);
+                    if matches!(el_ty, Some(MirType::Named(k)) if k == "InlineStr") {
+                        let tmp = format!("_ise_{}", indent.len());
+                        let _ = writeln!(
+                            s,
+                            "{indent}if (({flat_ei}u + 1u) * {is_bytes}u <= sizeof({target})) {{ StrataBytes_{is_bytes} {tmp}; strata_inlinestr_from_cstr(&{tmp}, sizeof({tmp}), {cap}u, (const char*)({el_expr})); memcpy(&({target})[{flat_ei}u * {is_bytes}u], &{tmp}, {is_bytes}u); }}"
+                        );
+                    } else {
+                        let _ = writeln!(
+                            s,
+                            "{indent}if (({flat_ei}u + 1u) * {is_bytes}u <= sizeof({target})) {{ memset(&({target})[{flat_ei}u * {is_bytes}u], 0, {is_bytes}u); memcpy(&({target})[{flat_ei}u * {is_bytes}u], &{el_expr}, {is_bytes}u < sizeof({el_expr}) ? {is_bytes}u : sizeof({el_expr})); }}"
+                        );
+                    }
                 }
             } else {
                 let elem_cty = self.parent.c_ty_from_sema(elem);
@@ -550,19 +772,19 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 return;
             }
         }
-        let elem_bytes = match &**elem {
-            Ty::Named(key) => self
-                .parent
-                .find_layout_idx(key)
-                .map_or(4usize, |li| self.parent.layouts[li].size.max(1)),
-            Ty::Fix64 | Ty::I64 | Ty::U64 | Ty::F64 | Ty::Vec2 | Ty::IVec2 | Ty::UVec2 => 8,
-            Ty::Vec3 | Ty::IVec3 => 12,
-            Ty::Vec4 | Ty::Vec3a | Ty::Quat | Ty::Rgba => 16,
-            Ty::Bool | Ty::I8 | Ty::U8 => 1,
-            Ty::I16 | Ty::U16 => 2,
-            Ty::BitSet(bits) => (*bits).div_ceil(32).max(1) * 4,
-            _ => 4,
-        };
+        let elem_bytes = self
+            .parent
+            .sema_ty_size_align(elem)
+            .map(|(es, ea)| es.div_ceil(ea) * ea)
+            .unwrap_or_else(|| match &**elem {
+                Ty::Fix64 | Ty::I64 | Ty::U64 | Ty::F64 | Ty::Vec2 | Ty::IVec2 | Ty::UVec2 => 8,
+                Ty::Vec3 | Ty::IVec3 => 12,
+                Ty::Vec4 | Ty::Vec3a | Ty::Quat | Ty::Rgba => 16,
+                Ty::Bool | Ty::I8 | Ty::U8 => 1,
+                Ty::I16 | Ty::U16 => 2,
+                Ty::BitSet(bits) => (*bits).div_ceil(32).max(1) * 4,
+                _ => 4,
+            });
         let byte_off = flat_idx_base * elem_bytes;
         let _ = writeln!(
             s,
@@ -579,7 +801,9 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
         indent: &str,
         s: &mut String,
     ) {
-        if let Some(MirConstVal::Array(elems)) = self.const_defs.get(&val) {
+        if !(self.is_bitset_mir_dst(dst_elem) && self.is_u32_word_bitset_src(val, None))
+            && let Some(MirConstVal::Array(elems)) = self.const_defs.get(&val)
+        {
             let _ = writeln!(s, "{indent}memset({ptr_expr}, 0, sizeof(*({ptr_expr})));");
             for (i, ev) in elems.iter().take(dst_len).enumerate() {
                 if let MirType::Array {
@@ -620,6 +844,25 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                         indent,
                         s,
                     );
+                } else if let MirType::Named(dst_k) = dst_elem
+                    && let Some(cap) = parse_inlinestr_cap(dst_k)
+                    && matches!(self.local_ty(el), Some(MirType::Named(sk)) if sk == "InlineStr")
+                {
+                    let el_expr = self.local_expr(el);
+                    let _ = writeln!(
+                        s,
+                        "{indent}strata_inlinestr_from_cstr(&({ptr_expr}->data[{i}]), sizeof({ptr_expr}->data[{i}]), {cap}u, (const char*)({el_expr}));"
+                    );
+                } else if self.parent.is_aggregate_mir_ty(dst_elem)
+                    || self
+                        .local_ty(el)
+                        .is_some_and(|t| self.parent.is_aggregate_mir_ty(t))
+                {
+                    let el_expr = self.local_expr(el);
+                    let _ = writeln!(
+                        s,
+                        "{indent}memcpy(&({ptr_expr}->data[{i}]), &{el_expr}, sizeof({ptr_expr}->data[{i}]) < sizeof({el_expr}) ? sizeof({ptr_expr}->data[{i}]) : sizeof({el_expr}));"
+                    );
                 } else {
                     let rhs = self.coerce_local_to_mir_scalar(el, dst_elem);
                     let _ = writeln!(s, "{indent}{ptr_expr}->data[{i}] = {rhs};");
@@ -642,6 +885,8 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
         }) = src_ty
             && !matches!(dst_elem, MirType::Array { .. })
             && !matches!(&*src_elem, MirType::Array { .. })
+            && !self.parent.is_aggregate_mir_ty(dst_elem)
+            && !self.parent.is_aggregate_mir_ty(&src_elem)
         {
             let copy_len = dst_len.min(src_len);
             let _ = writeln!(s, "{indent}memset({ptr_expr}, 0, sizeof(*({ptr_expr})));");
@@ -709,7 +954,27 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
         }
     }
 
-    pub(super) fn emit_stmt(&self, stmt: &MirStmt, s: &mut String) -> Result<(), CodegenError> {
+    pub(super) fn emit_stmt_at(
+        &self,
+        bb_id: u32,
+        stmt_idx: usize,
+        stmt: &MirStmt,
+        s: &mut String,
+    ) -> Result<(), CodegenError> {
+        let ckpt = self
+            .active_checkpoints
+            .get(&(bb_id, stmt_idx))
+            .copied()
+            .or(self.last_checkpoint);
+        self.emit_stmt_inner(stmt, ckpt, s)
+    }
+
+    fn emit_stmt_inner(
+        &self,
+        stmt: &MirStmt,
+        stmt_ckpt: Option<LocalId>,
+        s: &mut String,
+    ) -> Result<(), CodegenError> {
         let dst = stmt.dst;
         match &stmt.inst {
             Inst::ConstInt { value } => {
@@ -861,7 +1126,11 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 if let Some(d) = dst {
                     let de = self.local_expr(d);
                     let esc = c_escape(value);
-                    let _ = writeln!(s, "    {de} = (const void*)\"{esc}\";");
+                    if matches!(self.local_ty(d), Some(MirType::Named(k)) if k == "InlineStr") {
+                        let _ = writeln!(s, "    {de} = \"{esc}\";");
+                    } else {
+                        let _ = writeln!(s, "    {de} = (const void*)\"{esc}\";");
+                    }
                 }
             }
             Inst::Copy { val } => {
@@ -935,6 +1204,17 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                         let _ = writeln!(s, "    if ({se} != NULL) {{");
                         self.emit_c_slot_array_store(&se, &elem, len, *val, "        ", s);
                         let _ = writeln!(s, "    }}");
+                    }
+                    Some(MirType::Named(ref k))
+                        if parse_inlinestr_cap(k).is_some()
+                            && matches!(src_ty, MirType::Named(ref sk) if sk == "InlineStr") =>
+                    {
+                        let cap = parse_inlinestr_cap(k).unwrap_or(0);
+                        let total = 4 + cap.div_ceil(4) * 4;
+                        let _ = writeln!(
+                            s,
+                            "    if ({se} != NULL) {{ strata_inlinestr_from_cstr({se}, {total}u, {cap}u, (const char*)({ve})); }}"
+                        );
                     }
                     Some(ref st_ty)
                         if st_ty != &src_ty
@@ -1252,11 +1532,29 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                                             let _ = writeln!(s, "    {de}.{fc} = {vr};");
                                         }
                                     }
+                                    Ty::InlineStr(cap) => {
+                                        if matches!(src_ty, MirType::Named(ref k) if k == "InlineStr")
+                                        {
+                                            let _ = writeln!(
+                                                s,
+                                                "    strata_inlinestr_from_cstr(&{de}.{fc}, sizeof({de}.{fc}), {cap}u, (const char*)({vr}));"
+                                            );
+                                        } else if self.is_ptr_local(*fval) {
+                                            let _ = writeln!(
+                                                s,
+                                                "    if ({vr} != NULL) {{ memcpy(&{de}.{fc}, {vr}, sizeof({de}.{fc})); }}"
+                                            );
+                                        } else {
+                                            let _ = writeln!(
+                                                s,
+                                                "    memcpy(&{de}.{fc}, &{vr}, sizeof({de}.{fc}) < sizeof({vr}) ? sizeof({de}.{fc}) : sizeof({vr}));"
+                                            );
+                                        }
+                                    }
                                     Ty::IVec2
                                     | Ty::IVec3
                                     | Ty::UVec2
                                     | Ty::SmallVec { .. }
-                                    | Ty::InlineStr(_)
                                     | Ty::GraceWindow
                                     | Ty::InputBuffer { .. } => {
                                         if self.is_ptr_local(*fval) {
@@ -1322,12 +1620,122 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     let be = self.local_expr(*base);
                     let ie = self.local_expr(*index);
                     let bty = self.local_ty(*base);
-                    if matches!(bty, Some(MirType::Array { .. })) {
-                        let _ = writeln!(s, "    {de} = {be}.data[{ie}];");
+                    let idx_is_signed = matches!(
+                        self.local_ty(*index),
+                        Some(MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64)
+                    );
+                    let nonneg_guard = if idx_is_signed {
+                        format!("((int64_t)({ie}) >= 0ll) && ")
+                    } else {
+                        String::new()
+                    };
+                    if matches!(self.local_ty(d), Some(MirType::Ptr | MirType::MutPtr)) {
+                        let dst_cty = self.ptr_c_ty(d).unwrap_or_else(|| "void*".to_string());
+                        if let Some(MirType::Array { len, .. }) = bty {
+                            let _ = writeln!(
+                                s,
+                                "    {de} = ({nonneg_guard}(size_t)({ie}) < {len}u) ? ({dst_cty})&({be}.data[(size_t)({ie})]) : NULL;"
+                            );
+                        } else if let Some(MirType::Array { len, .. }) = self.slot_types.get(base) {
+                            let _ = writeln!(
+                                s,
+                                "    {de} = ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {len}u) ? ({dst_cty})&({be}->data[(size_t)({ie})]) : NULL;"
+                            );
+                        } else if let Some((sema_elem, arr_len)) =
+                            self.field_ptr_arrays.get(base).cloned()
+                        {
+                            let stride = self
+                                .array_index_strides
+                                .get(&d)
+                                .copied()
+                                .or_else(|| {
+                                    self.parent
+                                        .sema_ty_size_align(&sema_elem)
+                                        .map(|(es, ea)| es.div_ceil(ea) * ea)
+                                })
+                                .unwrap_or(4);
+                            let _ = writeln!(
+                                s,
+                                "    {de} = ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {arr_len}u) ? ({dst_cty})(((uint8_t*){be}) + ((size_t)({ie}) * {stride}u)) : NULL;"
+                            );
+                        } else if let Some((mir_elem, arr_len)) =
+                            self.slot_mir_arrays.get(base).cloned()
+                        {
+                            let elem_cty = self.parent.c_ty(&mir_elem);
+                            let _ = writeln!(
+                                s,
+                                "    {de} = ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {arr_len}u) ? ({dst_cty})(((uint8_t*){be}) + ((size_t)({ie}) * sizeof({elem_cty}))) : NULL;"
+                            );
+                        } else if let Some(stride) = self.array_index_strides.get(&d).copied() {
+                            let _ = writeln!(
+                                s,
+                                "    {de} = ({be} != NULL && {nonneg_guard}1) ? ({dst_cty})(((uint8_t*){be}) + ((size_t)({ie}) * {stride}u)) : NULL;"
+                            );
+                        } else {
+                            let stride_expr = match self.ptr_meta.get(&d) {
+                                Some(PtrKind::LayoutPtr { layout_idx, .. }) => {
+                                    format!("{}u", self.parent.layouts[*layout_idx].size.max(1))
+                                }
+                                Some(PtrKind::ScalarPtr { c_pointee, .. }) => {
+                                    format!("sizeof({c_pointee})")
+                                }
+                                _ => "1u".to_string(),
+                            };
+                            let _ = writeln!(
+                                s,
+                                "    {de} = ({be} != NULL && {nonneg_guard}1) ? ({dst_cty})(((uint8_t*){be}) + ((size_t)({ie}) * {stride_expr})) : NULL;"
+                            );
+                        }
+                    } else if let Some(MirType::Array { elem, len }) = bty {
+                        if self.local_ty(d).is_some_and(|dt| dt != elem.as_ref()) {
+                            let _ = writeln!(
+                                s,
+                                "    if ({nonneg_guard}(size_t)({ie}) < {len}u) {{ memcpy(&{de}, &({be}.data[(size_t)({ie})]), sizeof({de}) < sizeof({be}.data[0]) ? sizeof({de}) : sizeof({be}.data[0])); }}"
+                            );
+                        } else {
+                            let _ = writeln!(
+                                s,
+                                "    if ({nonneg_guard}(size_t)({ie}) < {len}u) {{ {de} = {be}.data[(size_t)({ie})]; }}"
+                            );
+                        }
+                    } else if let Some(MirType::Array { elem, len }) =
+                        self.slot_types.get(base).cloned()
+                    {
+                        if self.local_ty(d).is_some_and(|dt| *dt != *elem) {
+                            let _ = writeln!(
+                                s,
+                                "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {len}u) {{ memcpy(&{de}, &({be}->data[(size_t)({ie})]), sizeof({de}) < sizeof({be}->data[0]) ? sizeof({de}) : sizeof({be}->data[0])); }}"
+                            );
+                        } else {
+                            let _ = writeln!(
+                                s,
+                                "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {len}u) {{ {de} = {be}->data[(size_t)({ie})]; }}"
+                            );
+                        }
+                    } else if let Some((sema_elem, arr_len)) =
+                        self.field_ptr_arrays.get(base).cloned()
+                    {
+                        let stride = self
+                            .parent
+                            .sema_ty_size_align(&sema_elem)
+                            .map(|(es, ea)| es.div_ceil(ea) * ea)
+                            .unwrap_or(4);
+                        let _ = writeln!(
+                            s,
+                            "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {arr_len}u) {{ memcpy(&{de}, ((const uint8_t*){be}) + ((size_t)({ie}) * {stride}u), sizeof({de}) < {stride}u ? sizeof({de}) : {stride}u); }}"
+                        );
+                    } else if let Some((mir_elem, arr_len)) =
+                        self.slot_mir_arrays.get(base).cloned()
+                    {
+                        let elem_cty = self.parent.c_ty(&mir_elem);
+                        let _ = writeln!(
+                            s,
+                            "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {arr_len}u) {{ {elem_cty} _ais; memcpy(&_ais, ((const uint8_t*){be}) + ((size_t)({ie}) * sizeof({elem_cty})), sizeof(_ais)); memcpy(&{de}, &_ais, sizeof({de}) < sizeof(_ais) ? sizeof({de}) : sizeof(_ais)); }}"
+                        );
                     } else {
                         let _ = writeln!(
                             s,
-                            "    if ({be} != NULL) {{ memcpy(&{de}, ((const uint8_t*){be}) + ((size_t)({ie}) * sizeof({de})), sizeof({de})); }}"
+                            "    if ({be} != NULL && {nonneg_guard}1) {{ memcpy(&{de}, ((const uint8_t*){be}) + ((size_t)({ie}) * sizeof({de})), sizeof({de})); }}"
                         );
                     }
                 }
@@ -1355,39 +1763,128 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     String::new()
                 };
                 if let Some(MirType::Array { elem, len }) = self.slot_types.get(base_ptr).cloned() {
-                    let rhs = match &*elem {
-                        MirType::Fix32 => self.coerce_scalar_to_fix_expr(*val, &vty, false),
-                        MirType::Fix64 => self.coerce_scalar_to_fix_expr(*val, &vty, true),
-                        MirType::Bool => format!("({ve}) ? BAM_TRUE : BAM_FALSE"),
-                        _ if vty != *elem
-                            && !self.parent.is_aggregate_mir_ty(&elem)
-                            && !self.parent.is_aggregate_mir_ty(&vty) =>
-                        {
-                            self.coerce_local_to_mir_scalar(*val, &elem)
-                        }
-                        _ => ve,
-                    };
-                    let _ = writeln!(
-                        s,
-                        "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {len}u) {{ {be}->data[(size_t)({ie})] = {rhs}; }}"
-                    );
+                    if let MirType::Named(ref k) = *elem
+                        && let Some(cap) = parse_inlinestr_cap(k)
+                        && matches!(vty, MirType::Named(ref sk) if sk == "InlineStr")
+                    {
+                        let total = 4 + cap.div_ceil(4) * 4;
+                        let _ = writeln!(
+                            s,
+                            "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {len}u) {{ strata_inlinestr_from_cstr(&({be}->data[(size_t)({ie})]), {total}u, {cap}u, (const char*)({ve})); }}"
+                        );
+                    } else if self.parent.is_aggregate_mir_ty(&elem)
+                        || self.parent.is_aggregate_mir_ty(&vty)
+                    {
+                        let _ = writeln!(
+                            s,
+                            "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {len}u) {{ memcpy(&({be}->data[(size_t)({ie})]), &{ve}, sizeof({be}->data[0]) < sizeof({ve}) ? sizeof({be}->data[0]) : sizeof({ve})); }}"
+                        );
+                    } else {
+                        let rhs = match &*elem {
+                            MirType::Fix32 => self.coerce_scalar_to_fix_expr(*val, &vty, false),
+                            MirType::Fix64 => self.coerce_scalar_to_fix_expr(*val, &vty, true),
+                            MirType::Bool => format!("({ve}) ? BAM_TRUE : BAM_FALSE"),
+                            _ if vty != *elem
+                                && !self.parent.is_aggregate_mir_ty(&elem)
+                                && !self.parent.is_aggregate_mir_ty(&vty) =>
+                            {
+                                self.coerce_local_to_mir_scalar(*val, &elem)
+                            }
+                            _ => ve,
+                        };
+                        let _ = writeln!(
+                            s,
+                            "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {len}u) {{ {be}->data[(size_t)({ie})] = {rhs}; }}"
+                        );
+                    }
                 } else if let Some((sema_elem, arr_len)) =
                     self.field_ptr_arrays.get(base_ptr).cloned()
                 {
-                    let elem_cty = self.parent.c_ty_from_sema(&sema_elem);
-                    let rhs = match &sema_elem {
-                        Ty::Fix32 => self.coerce_scalar_to_fix_expr(*val, &vty, false),
-                        Ty::Fix64 => self.coerce_scalar_to_fix_expr(*val, &vty, true),
-                        Ty::F64 if !matches!(vty, MirType::F64) => format!("(double)({ve})"),
-                        Ty::Bool => format!("({ve}) ? BAM_TRUE : BAM_FALSE"),
-                        _ if !Self::is_sema_aggregate(self.parent, &sema_elem) => {
-                            format!("({elem_cty})({ve})")
+                    if let Ty::InlineStr(cap) = sema_elem
+                        && matches!(vty, MirType::Named(ref sk) if sk == "InlineStr")
+                    {
+                        let total = 4 + cap.div_ceil(4) * 4;
+                        let _ = writeln!(
+                            s,
+                            "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {arr_len}u) {{ strata_inlinestr_from_cstr(((uint8_t*){be}) + ((size_t)({ie}) * {total}u), {total}u, {cap}u, (const char*)({ve})); }}"
+                        );
+                    } else {
+                        let elem_cty = self.parent.c_ty_from_sema(&sema_elem);
+                        let rhs = match &sema_elem {
+                            Ty::Fix32 => self.coerce_scalar_to_fix_expr(*val, &vty, false),
+                            Ty::Fix64 => self.coerce_scalar_to_fix_expr(*val, &vty, true),
+                            Ty::F64 if !matches!(vty, MirType::F64) => format!("(double)({ve})"),
+                            Ty::Bool => format!("({ve}) ? BAM_TRUE : BAM_FALSE"),
+                            _ if !Self::is_sema_aggregate(self.parent, &sema_elem) => {
+                                format!("({elem_cty})({ve})")
+                            }
+                            _ => ve,
+                        };
+                        let stride = self
+                            .parent
+                            .sema_ty_size_align(&sema_elem)
+                            .map(|(es, ea)| es.div_ceil(ea) * ea);
+                        if matches!(sema_elem, Ty::BitSet(_))
+                            || (stride.is_some()
+                                && self.parent.is_aggregate_mir_ty(&vty)
+                                && !Self::is_sema_aggregate(self.parent, &sema_elem))
+                        {
+                            let es = stride.unwrap_or(4);
+                            let _ = writeln!(
+                                s,
+                                "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {arr_len}u) {{ memset(((uint8_t*){be}) + ((size_t)({ie}) * {es}u), 0, {es}u); memcpy(((uint8_t*){be}) + ((size_t)({ie}) * {es}u), &{rhs}, sizeof({rhs}) < {es}u ? sizeof({rhs}) : {es}u); }}"
+                            );
+                        } else {
+                            let _ = writeln!(
+                                s,
+                                "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {arr_len}u) {{ {elem_cty} _asv = {rhs}; memcpy(((uint8_t*){be}) + ((size_t)({ie}) * sizeof(_asv)), &_asv, sizeof(_asv)); }}"
+                            );
                         }
-                        _ => ve,
-                    };
+                    }
+                } else if let Some((mir_elem, arr_len)) =
+                    self.slot_mir_arrays.get(base_ptr).cloned()
+                {
+                    if let MirType::Named(ref k) = mir_elem
+                        && let Some(cap) = parse_inlinestr_cap(k)
+                        && matches!(vty, MirType::Named(ref sk) if sk == "InlineStr")
+                    {
+                        let total = 4 + cap.div_ceil(4) * 4;
+                        let _ = writeln!(
+                            s,
+                            "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {arr_len}u) {{ strata_inlinestr_from_cstr(((uint8_t*){be}) + ((size_t)({ie}) * {total}u), {total}u, {cap}u, (const char*)({ve})); }}"
+                        );
+                    } else if self.parent.is_aggregate_mir_ty(&mir_elem)
+                        || self.parent.is_aggregate_mir_ty(&vty)
+                    {
+                        let elem_cty = self.parent.c_ty(&mir_elem);
+                        let _ = writeln!(
+                            s,
+                            "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {arr_len}u) {{ {elem_cty} _asv; memset(&_asv, 0, sizeof(_asv)); memcpy(&_asv, &{ve}, sizeof(_asv) < sizeof({ve}) ? sizeof(_asv) : sizeof({ve})); memcpy(((uint8_t*){be}) + ((size_t)({ie}) * sizeof(_asv)), &_asv, sizeof(_asv)); }}"
+                        );
+                    } else {
+                        let elem_cty = self.parent.c_ty(&mir_elem);
+                        let rhs = match &mir_elem {
+                            MirType::Fix32 => self.coerce_scalar_to_fix_expr(*val, &vty, false),
+                            MirType::Fix64 => self.coerce_scalar_to_fix_expr(*val, &vty, true),
+                            MirType::Bool => format!("({ve}) ? BAM_TRUE : BAM_FALSE"),
+                            _ if vty != mir_elem => {
+                                self.coerce_local_to_mir_scalar(*val, &mir_elem)
+                            }
+                            _ => ve,
+                        };
+                        let _ = writeln!(
+                            s,
+                            "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {arr_len}u) {{ {elem_cty} _asv = {rhs}; memcpy(((uint8_t*){be}) + ((size_t)({ie}) * sizeof(_asv)), &_asv, sizeof(_asv)); }}"
+                        );
+                    }
+                } else if let MirType::Named(ref k) = *elem_ty
+                    && let Some(cap) = parse_inlinestr_cap(k)
+                    && matches!(vty, MirType::Named(ref sk) if sk == "InlineStr")
+                {
+                    let total = 4 + cap.div_ceil(4) * 4;
                     let _ = writeln!(
                         s,
-                        "    if ({be} != NULL && {nonneg_guard}(size_t)({ie}) < {arr_len}u) {{ {elem_cty} _asv = {rhs}; memcpy(((uint8_t*){be}) + ((size_t)({ie}) * sizeof(_asv)), &_asv, sizeof(_asv)); }}"
+                        "    if ({be} != NULL && {nonneg_guard}1) {{ strata_inlinestr_from_cstr(((uint8_t*){be}) + ((size_t)({ie}) * {total}u), {total}u, {cap}u, (const char*)({ve})); }}"
                     );
                 } else {
                     let elem_cty = self.parent.c_ty(elem_ty);
@@ -1547,6 +2044,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             } => {
                 if let Some(d) = dst {
                     let de = self.local_expr(d);
+                    let eff_ti = self.eff_term_idx(*query_idx, *term_idx);
                     let is_sparse = self
                         .func
                         .query_bindings
@@ -1557,7 +2055,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     if is_sparse {
                         let _ = writeln!(
                             s,
-                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_rows_readonly != NULL) ? (const void*)state->api->iter_column_rows_readonly(iter_{query_idx}, {term_idx}u) : NULL;"
+                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_rows_readonly != NULL) ? (const void*)state->api->iter_column_rows_readonly(iter_{query_idx}, {eff_ti}u) : NULL;"
                         );
                     } else {
                         let cty = self
@@ -1565,7 +2063,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                             .unwrap_or_else(|| "const void*".to_string());
                         let _ = writeln!(
                             s,
-                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_readonly != NULL) ? ({cty})state->api->iter_column_readonly(iter_{query_idx}, {term_idx}u) : NULL;"
+                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_readonly != NULL) ? ({cty})state->api->iter_column_readonly(iter_{query_idx}, {eff_ti}u) : NULL;"
                         );
                         if self.nonnull_cols.contains(&d) {
                             let _ = writeln!(
@@ -1583,6 +2081,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             } => {
                 if let Some(d) = dst {
                     let de = self.local_expr(d);
+                    let eff_ti = self.eff_term_idx(*query_idx, *term_idx);
                     let is_sparse = self
                         .func
                         .query_bindings
@@ -1593,13 +2092,13 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     if is_sparse {
                         let _ = writeln!(
                             s,
-                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_rows_mutable != NULL) ? (void*)state->api->iter_column_rows_mutable(iter_{query_idx}, {term_idx}u) : NULL;"
+                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_rows_mutable != NULL) ? (void*)state->api->iter_column_rows_mutable(iter_{query_idx}, {eff_ti}u) : NULL;"
                         );
                     } else {
                         let cty = self.ptr_c_ty(d).unwrap_or_else(|| "void*".to_string());
                         let _ = writeln!(
                             s,
-                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_mutable != NULL) ? ({cty})state->api->iter_column_mutable(iter_{query_idx}, {term_idx}u) : NULL;"
+                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_mutable != NULL) ? ({cty})state->api->iter_column_mutable(iter_{query_idx}, {eff_ti}u) : NULL;"
                         );
                         if self.nonnull_cols.contains(&d) {
                             let _ = writeln!(
@@ -1617,10 +2116,11 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             } => {
                 if let Some(d) = dst {
                     let de = self.local_expr(d);
+                    let eff_ti = self.eff_term_idx(*query_idx, *term_idx);
                     let cty = self.ptr_c_ty(d).unwrap_or_else(|| "void*".to_string());
                     let _ = writeln!(
                         s,
-                        "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_mutable_untracked != NULL) ? ({cty})state->api->iter_column_mutable_untracked(iter_{query_idx}, {term_idx}u) : NULL;"
+                        "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_mutable_untracked != NULL) ? ({cty})state->api->iter_column_mutable_untracked(iter_{query_idx}, {eff_ti}u) : NULL;"
                     );
                     if self.nonnull_cols.contains(&d) {
                         let _ = writeln!(
@@ -1638,9 +2138,10 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             } => {
                 let rs = self.local_expr(*run_start);
                 let rl = self.local_expr(*run_len);
+                let eff_ti = self.eff_term_idx(*query_idx, *term_idx);
                 let _ = writeln!(
                     s,
-                    "    if ({rl} > 0u && iter_{query_idx} != NULL && state->api->iter_mark_changed_range != NULL) {{\n        (void)state->api->iter_mark_changed_range(iter_{query_idx}, {term_idx}u, (size_t){rs}, (size_t){rl});\n    }}"
+                    "    if ({rl} > 0u && iter_{query_idx} != NULL && state->api->iter_mark_changed_range != NULL) {{\n        (void)state->api->iter_mark_changed_range(iter_{query_idx}, {eff_ti}u, (size_t){rs}, (size_t){rl});\n    }}"
                 );
             }
             Inst::IterColRowsRead {
@@ -1650,6 +2151,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             } => {
                 if let Some(d) = dst {
                     let de = self.local_expr(d);
+                    let eff_ti = self.eff_term_idx(*query_idx, *term_idx);
                     if self.parent.is_query_term_sparse(
                         self.func,
                         *query_idx,
@@ -1658,7 +2160,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     ) {
                         let _ = writeln!(
                             s,
-                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_rows_readonly != NULL) ? (const void*)state->api->iter_column_rows_readonly(iter_{query_idx}, {term_idx}u) : NULL;"
+                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_rows_readonly != NULL) ? (const void*)state->api->iter_column_rows_readonly(iter_{query_idx}, {eff_ti}u) : NULL;"
                         );
                     } else {
                         let cty = self
@@ -1666,7 +2168,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                             .unwrap_or_else(|| "const void*".to_string());
                         let _ = writeln!(
                             s,
-                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_readonly != NULL) ? ({cty})state->api->iter_column_readonly(iter_{query_idx}, {term_idx}u) : NULL;"
+                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_readonly != NULL) ? ({cty})state->api->iter_column_readonly(iter_{query_idx}, {eff_ti}u) : NULL;"
                         );
                     }
                 }
@@ -1678,6 +2180,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             } => {
                 if let Some(d) = dst {
                     let de = self.local_expr(d);
+                    let eff_ti = self.eff_term_idx(*query_idx, *term_idx);
                     if self.parent.is_query_term_sparse(
                         self.func,
                         *query_idx,
@@ -1686,13 +2189,13 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     ) {
                         let _ = writeln!(
                             s,
-                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_rows_mutable != NULL) ? (void*)state->api->iter_column_rows_mutable(iter_{query_idx}, {term_idx}u) : NULL;"
+                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_rows_mutable != NULL) ? (void*)state->api->iter_column_rows_mutable(iter_{query_idx}, {eff_ti}u) : NULL;"
                         );
                     } else {
                         let cty = self.ptr_c_ty(d).unwrap_or_else(|| "void*".to_string());
                         let _ = writeln!(
                             s,
-                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_mutable != NULL) ? ({cty})state->api->iter_column_mutable(iter_{query_idx}, {term_idx}u) : NULL;"
+                            "    {de} = (iter_{query_idx} != NULL && state->api->iter_column_mutable != NULL) ? ({cty})state->api->iter_column_mutable(iter_{query_idx}, {eff_ti}u) : NULL;"
                         );
                     }
                 }
@@ -1715,7 +2218,14 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 if let Some(d) = dst {
                     let de = self.local_expr(d);
                     let ee = self.local_expr(*entity);
-                    let rel_expr = if let Some(r_idx) = self.parent.find_rel_idx(relation) {
+                    let eff_ti = self.eff_term_idx(*query_idx, *term_idx);
+                    let rel_expr = if is_child_of_rel(relation) {
+                        "BAM_COMPONENT_INVALID".to_string()
+                    } else if let Some(pc_idx) =
+                        self.parent.find_comp_idx(&custom_rel_parent_comp(relation))
+                    {
+                        format!("state->components[{pc_idx}]")
+                    } else if let Some(r_idx) = self.parent.find_rel_idx(relation) {
                         format!("state->relations[{r_idx}]")
                     } else {
                         "BAM_COMPONENT_INVALID".to_string()
@@ -1725,7 +2235,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                         .unwrap_or_else(|| "const void*".to_string());
                     let _ = writeln!(
                         s,
-                        "    {{\n        const void* raw_up = NULL;\n        BamEntity up_owner = BAM_ENTITY_NULL;\n        if (iter_{query_idx} != NULL && state->api->iter_up_cascade != NULL) {{\n            (void)state->api->iter_up_cascade(iter_{query_idx}, {rel_expr}, {ee}, {term_idx}u, &raw_up, &up_owner);\n        }}\n        (void)up_owner;\n        {de} = ({cty})raw_up;\n    }}"
+                        "    {{\n        const void* raw_up = NULL;\n        BamEntity up_owner = BAM_ENTITY_NULL;\n        if (iter_{query_idx} != NULL && state->api->iter_up_cascade != NULL) {{\n            (void)state->api->iter_up_cascade(iter_{query_idx}, {rel_expr}, {ee}, {eff_ti}u, &raw_up, &up_owner);\n        }}\n        (void)up_owner;\n        {de} = ({cty})raw_up;\n    }}"
                     );
                 }
             }
@@ -1761,33 +2271,88 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 let aty = self.local_ty(*acc).cloned().unwrap_or(MirType::F32);
                 match op.as_str() {
                     "min" | "Min" => {
-                        if matches!(aty, MirType::F32) {
+                        if matches!(aty, MirType::F64) {
+                            let _ = writeln!(s, "    {ae} = fmin((double)({ae}), (double)({ve}));");
+                        } else if matches!(aty, MirType::F32) {
                             let _ = writeln!(s, "    {ae} = fminf({ae}, {ve});");
                         } else {
                             let _ = writeln!(s, "    {ae} = ({ae} < {ve}) ? {ae} : {ve};");
                         }
                     }
                     "max" | "Max" => {
-                        if matches!(aty, MirType::F32) {
+                        if matches!(aty, MirType::F64) {
+                            let _ = writeln!(s, "    {ae} = fmax((double)({ae}), (double)({ve}));");
+                        } else if matches!(aty, MirType::F32) {
                             let _ = writeln!(s, "    {ae} = fmaxf({ae}, {ve});");
                         } else {
                             let _ = writeln!(s, "    {ae} = ({ae} > {ve}) ? {ae} : {ve};");
                         }
                     }
-                    "prod" | "*" | "Mul" => {
-                        let _ = writeln!(s, "    {ae} = ({ae}) * ({ve});");
-                    }
-                    _ => {
-                        if matches!(aty, MirType::Vec2) {
+                    "prod" | "*" | "Mul" => match aty {
+                        MirType::Fix32 => {
+                            let _ = writeln!(s, "    {ae} = strata_fix32_mul({ae}, {ve});");
+                        }
+                        MirType::Fix64 => {
+                            let _ = writeln!(s, "    {ae} = strata_fix64_mul({ae}, {ve});");
+                        }
+                        MirType::I8 | MirType::I16 => {
+                            let cty = self.parent.c_ty(&aty);
+                            let _ = writeln!(
+                                s,
+                                "    {ae} = ({cty})((uint32_t)({ae}) * (uint32_t)({ve}));"
+                            );
+                        }
+                        MirType::I32 => {
+                            let _ = writeln!(
+                                s,
+                                "    {ae} = (int32_t)((uint32_t)({ae}) * (uint32_t)({ve}));"
+                            );
+                        }
+                        MirType::I64 => {
+                            let _ = writeln!(
+                                s,
+                                "    {ae} = (int64_t)((uint64_t)({ae}) * (uint64_t)({ve}));"
+                            );
+                        }
+                        MirType::Vec2 => {
+                            let _ = writeln!(s, "    {ae} = strata_vec2_mul({ae}, {ve});");
+                        }
+                        MirType::Vec3 => {
+                            let _ = writeln!(s, "    {ae} = strata_vec3_mul({ae}, {ve});");
+                        }
+                        MirType::Vec4 => {
+                            let _ = writeln!(s, "    {ae} = strata_vec4_mul({ae}, {ve});");
+                        }
+                        _ => {
+                            let _ = writeln!(s, "    {ae} = ({ae}) * ({ve});");
+                        }
+                    },
+                    _ => match aty {
+                        MirType::Vec2 => {
                             let _ = writeln!(s, "    {ae} = strata_vec2_add({ae}, {ve});");
-                        } else if matches!(aty, MirType::Vec3) {
+                        }
+                        MirType::Vec3 => {
                             let _ = writeln!(s, "    {ae} = strata_vec3_add({ae}, {ve});");
-                        } else if matches!(aty, MirType::Vec4) {
+                        }
+                        MirType::Vec4 => {
                             let _ = writeln!(s, "    {ae} = strata_vec4_add({ae}, {ve});");
-                        } else {
+                        }
+                        MirType::I32 | MirType::Fix32 => {
+                            let _ = writeln!(
+                                s,
+                                "    {ae} = (int32_t)((uint32_t)({ae}) + (uint32_t)({ve}));"
+                            );
+                        }
+                        MirType::I64 | MirType::Fix64 => {
+                            let _ = writeln!(
+                                s,
+                                "    {ae} = (int64_t)((uint64_t)({ae}) + (uint64_t)({ve}));"
+                            );
+                        }
+                        _ => {
                             let _ = writeln!(s, "    {ae} = ({ae}) + ({ve});");
                         }
-                    }
+                    },
                 }
                 if let Some(d) = dst {
                     let de = self.local_expr(d);
@@ -1849,12 +2414,13 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 if let Some(d) = dst {
                     let de = self.local_expr(d);
                     let ee = self.local_expr(*entity);
+                    let eff_ti = self.eff_term_idx(*query_idx, *term_idx);
                     let cty = self
                         .ptr_c_ty(d)
                         .unwrap_or_else(|| "const void*".to_string());
                     let _ = writeln!(
                         s,
-                        "    {de} = (sys_ctx != NULL && state->api->sys_entity_get != NULL && {ee} != BAM_ENTITY_NULL) ? ({cty})state->api->sys_entity_get(sys_ctx, {query_idx}u, {ee}, {term_idx}u) : NULL;"
+                        "    {de} = (sys_ctx != NULL && state->api->sys_entity_get != NULL && {ee} != BAM_ENTITY_NULL) ? ({cty})state->api->sys_entity_get(sys_ctx, {query_idx}u, {ee}, {eff_ti}u) : NULL;"
                     );
                 }
             }
@@ -1867,10 +2433,11 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 if let Some(d) = dst {
                     let de = self.local_expr(d);
                     let ee = self.local_expr(*entity);
+                    let eff_ti = self.eff_term_idx(*query_idx, *term_idx);
                     let cty = self.ptr_c_ty(d).unwrap_or_else(|| "void*".to_string());
                     let _ = writeln!(
                         s,
-                        "    {de} = (sys_ctx != NULL && state->api->sys_entity_get_mut != NULL && {ee} != BAM_ENTITY_NULL) ? ({cty})state->api->sys_entity_get_mut(sys_ctx, {query_idx}u, {ee}, {term_idx}u) : NULL;"
+                        "    {de} = (sys_ctx != NULL && state->api->sys_entity_get_mut != NULL && {ee} != BAM_ENTITY_NULL) ? ({cty})state->api->sys_entity_get_mut(sys_ctx, {query_idx}u, {ee}, {eff_ti}u) : NULL;"
                     );
                 }
             }
@@ -2082,10 +2649,15 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 if let Some(d) = dst {
                     let de = self.local_expr(d);
                     let p = self.local_expr(*ptr);
-                    let _ = writeln!(
-                        s,
-                        "    {de} = BAM_FALSE;\n    if ({p} != NULL) {{\n        uint32_t mask = 0u;\n        memcpy(&mask, ((const uint8_t*){p}) + sizeof(float) + sizeof(uint32_t), sizeof(uint32_t));\n        {de} = ((mask & (1u << {window_bit}u)) != 0u) ? BAM_TRUE : BAM_FALSE;\n    }}"
-                    );
+                    if *window_bit < 32 {
+                        let mask_lit = 1u32 << *window_bit;
+                        let _ = writeln!(
+                            s,
+                            "    {de} = BAM_FALSE;\n    if ({p} != NULL) {{\n        uint32_t mask = 0u;\n        memcpy(&mask, ((const uint8_t*){p}) + 4u, sizeof(uint32_t));\n        {de} = ((mask & {mask_lit}u) != 0u) ? BAM_TRUE : BAM_FALSE;\n    }}"
+                        );
+                    } else {
+                        let _ = writeln!(s, "    (void)({p});\n    {de} = BAM_FALSE;");
+                    }
                 }
             }
             Inst::TimelineAdvance {
@@ -2098,47 +2670,77 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             } => {
                 let p = self.local_expr(*cursor_ptr);
                 let dt = self.local_expr(*dt_sec);
+                let rate_safe = (*rate_hz).max(1);
+                let _ = writeln!(s, "    (void)({dt});");
                 let _ = writeln!(s, "    if ({p} != NULL) {{");
+                let _ = writeln!(s, "        uint16_t cur_f16 = 0u;");
+                let _ = writeln!(s, "        uint16_t cur_flags = 0u;");
                 let _ = writeln!(s, "        float elapsed = 0.0f;");
-                let _ = writeln!(s, "        memcpy(&elapsed, {p}, sizeof(float));");
-                let _ = writeln!(s, "        elapsed += {dt};");
                 let _ = writeln!(
                     s,
-                    "        uint32_t frame = (uint32_t)(elapsed * (float){rate_hz}u);"
+                    "        memcpy(&cur_f16, (const uint8_t*){p}, sizeof(uint16_t));"
                 );
                 let _ = writeln!(
                     s,
-                    "        if (frame > {duration_frames}u) {{ frame = {duration_frames}u; }}"
+                    "        memcpy(&cur_flags, ((const uint8_t*){p}) + 2u, sizeof(uint16_t));"
+                );
+                let _ = writeln!(
+                    s,
+                    "        memcpy(&elapsed, ((const uint8_t*){p}) + 8u, sizeof(float));"
+                );
+                let _ = writeln!(s, "        uint32_t frame = (uint32_t)cur_f16;");
+                let _ = writeln!(s, "        float frame_dt = 1.0f / (float){rate_safe}u;");
+                let _ = writeln!(
+                    s,
+                    "        while (elapsed >= frame_dt && frame < {duration_frames}u) {{\n            elapsed -= frame_dt;\n            frame += 1u;\n        }}"
+                );
+                let _ = writeln!(
+                    s,
+                    "        uint16_t final_f16 = (uint16_t)(frame & 0xFFFFu);"
                 );
                 let _ = writeln!(s, "        uint32_t mask = 0u;");
-                for (_, start_f, end_f, bit) in window_masks {
+                for (_, start_f, end_f, bit_mask) in window_masks {
+                    if *bit_mask == 0 {
+                        continue;
+                    }
                     if *start_f == 0 && *end_f == u32::MAX {
-                        let _ = writeln!(s, "        mask |= (1u << {bit}u);");
+                        let _ = writeln!(s, "        mask |= {bit_mask}u;");
                     } else if *start_f == 0 {
                         let _ = writeln!(
                             s,
-                            "        if (frame <= {end_f}u) {{ mask |= (1u << {bit}u); }}"
+                            "        if (frame < {end_f}u) {{ mask |= {bit_mask}u; }}"
                         );
                     } else if *end_f == u32::MAX {
                         let _ = writeln!(
                             s,
-                            "        if (frame >= {start_f}u) {{ mask |= (1u << {bit}u); }}"
+                            "        if (frame >= {start_f}u) {{ mask |= {bit_mask}u; }}"
                         );
                     } else {
                         let _ = writeln!(
                             s,
-                            "        if (frame >= {start_f}u && frame <= {end_f}u) {{ mask |= (1u << {bit}u); }}"
+                            "        if (frame >= {start_f}u && frame < {end_f}u) {{ mask |= {bit_mask}u; }}"
                         );
                     }
                 }
-                let _ = writeln!(s, "        memcpy({p}, &elapsed, sizeof(float));");
                 let _ = writeln!(
                     s,
-                    "        memcpy(((uint8_t*){p}) + sizeof(float), &frame, sizeof(uint32_t));"
+                    "        uint16_t next_flags = (frame >= {duration_frames}u) ? (uint16_t)(cur_flags & (uint16_t)~1u) : (uint16_t)(cur_flags | (uint16_t)1u);"
                 );
                 let _ = writeln!(
                     s,
-                    "        memcpy(((uint8_t*){p}) + sizeof(float) + sizeof(uint32_t), &mask, sizeof(uint32_t));"
+                    "        memcpy((uint8_t*){p}, &final_f16, sizeof(uint16_t));"
+                );
+                let _ = writeln!(
+                    s,
+                    "        memcpy(((uint8_t*){p}) + 2u, &next_flags, sizeof(uint16_t));"
+                );
+                let _ = writeln!(
+                    s,
+                    "        memcpy(((uint8_t*){p}) + 4u, &mask, sizeof(uint32_t));"
+                );
+                let _ = writeln!(
+                    s,
+                    "        memcpy(((uint8_t*){p}) + 8u, &elapsed, sizeof(float));"
                 );
                 let _ = writeln!(s, "    }}");
             }
@@ -2194,7 +2796,14 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                         }
                     })
                     .unwrap_or_else(|| "NULL".to_string());
-                let c_idx = self.parent.find_comp_idx(component).unwrap_or(0);
+                let c_idx = if is_child_of_rel(component) {
+                    self.parent
+                        .find_comp_idx(bamabi_sys::BAM_CHILD_OF_NAME)
+                        .or_else(|| self.parent.find_comp_idx(component))
+                        .unwrap_or(0)
+                } else {
+                    self.parent.find_comp_idx(component).unwrap_or(0)
+                };
                 let sz = self.parent.components.get(c_idx).map_or(0, |c| c.size);
                 let slot = if *if_new {
                     "cmd_insert_if_new"
@@ -2209,7 +2818,14 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             }
             Inst::CmdRemove { entity, component } => {
                 let e = self.local_expr(*entity);
-                let c_idx = self.parent.find_comp_idx(component).unwrap_or(0);
+                let c_idx = if is_child_of_rel(component) {
+                    self.parent
+                        .find_comp_idx(bamabi_sys::BAM_CHILD_OF_NAME)
+                        .or_else(|| self.parent.find_comp_idx(component))
+                        .unwrap_or(0)
+                } else {
+                    self.parent.find_comp_idx(component).unwrap_or(0)
+                };
                 self.ensure_cmds_snippet(s);
                 let _ = writeln!(
                     s,
@@ -2227,8 +2843,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     .map(|id| self.local_expr(id))
                     .unwrap_or_else(|| "BAM_ENTITY_NULL".to_string());
                 let (pp, psz, pp_is_addr_of) = if let Some(pid) = payload {
-                    let is_ptr =
-                        matches!(self.local_ty(*pid), Some(MirType::Ptr | MirType::MutPtr));
+                    let is_ptr = self.is_ptr_local(*pid);
                     let pe = self.local_expr(*pid);
                     let comp_sz = self.parent.components.get(c_idx).map_or(0, |c| c.size);
                     if is_ptr {
@@ -2249,12 +2864,12 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                         };
                         let _ = writeln!(
                             s,
-                            "    if (cmds_cache != NULL && state->api->cmd_trigger_ex != NULL) {{\n        uint8_t trg_buf[{psz}u];\n        memset(trg_buf, 0, sizeof(trg_buf));\n        {copy_stmt}\n        BamTriggerDesc tdesc = bam_trigger_desc(state->components[{c_idx}], {trg}, trg_buf, {psz}u);\n        tdesc.flags = BAM_TRIGGER_FLAG_PROPAGATE;\n        (void)state->api->cmd_trigger_ex(cmds_cache, &tdesc);\n    }}"
+                            "    if (cmds_cache != NULL && state->api->cmd_trigger_ex != NULL) {{\n        uint8_t trg_buf[{psz}u];\n        memset(trg_buf, 0, sizeof(trg_buf));\n        {copy_stmt}\n        BamTriggerDesc tdesc = bam_trigger_desc(state->components[{c_idx}], {trg}, trg_buf, {psz}u);\n        tdesc.flags = BAM_TRIGGER_FLAG_PROPAGATE;\n        tdesc.propagate_relationship = BAM_COMPONENT_INVALID;\n        (void)state->api->cmd_trigger_ex(cmds_cache, &tdesc);\n    }}"
                         );
                     } else {
                         let _ = writeln!(
                             s,
-                            "    if (cmds_cache != NULL && state->api->cmd_trigger_ex != NULL) {{\n        BamTriggerDesc tdesc = bam_trigger_desc(state->components[{c_idx}], {trg}, NULL, 0u);\n        tdesc.flags = BAM_TRIGGER_FLAG_PROPAGATE;\n        (void)state->api->cmd_trigger_ex(cmds_cache, &tdesc);\n    }}"
+                            "    if (cmds_cache != NULL && state->api->cmd_trigger_ex != NULL) {{\n        BamTriggerDesc tdesc = bam_trigger_desc(state->components[{c_idx}], {trg}, NULL, 0u);\n        tdesc.flags = BAM_TRIGGER_FLAG_PROPAGATE;\n        tdesc.propagate_relationship = BAM_COMPONENT_INVALID;\n        (void)state->api->cmd_trigger_ex(cmds_cache, &tdesc);\n    }}"
                         );
                     }
                 } else {
@@ -2267,11 +2882,13 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             Inst::StreamEmit { stream, payload } => {
                 let c_idx = self.parent.find_comp_idx(stream).unwrap_or(0);
                 let sz = self.parent.components.get(c_idx).map_or(0, |c| c.size);
-                let is_ptr = self.ptr_meta.contains_key(payload)
-                    || matches!(
-                        self.local_ty(*payload),
-                        Some(MirType::Ptr | MirType::MutPtr)
-                    );
+                let has_stream_last = self
+                    .parent
+                    .components
+                    .get(c_idx)
+                    .and_then(|c| c.layout_idx)
+                    .is_some_and(|l| self.parent.layouts[l].size > 0);
+                let is_ptr = self.is_ptr_local(*payload);
                 let pe = self.local_expr(*payload);
                 let ptr_expr = if is_ptr {
                     format!("(const uint8_t*){pe}")
@@ -2287,19 +2904,45 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                                 && (t.canonical_component == *stream
                                     || short_name(&t.canonical_component) == stream_short)
                         })
-                        .map(|t| (qb.query_idx, t.term_idx))
+                        .map(|t| (qb.query_idx, self.eff_term_idx(qb.query_idx, t.term_idx)))
                 });
+                let emit_mod_fallback = |s: &mut String| {
+                    if sz > 0 && has_stream_last {
+                        if is_ptr {
+                            let _ = writeln!(
+                                s,
+                                "        if ({pe} != NULL) {{ memcpy(&state->mod_stream_last_{c_idx}, {ptr_expr}, sizeof(state->mod_stream_last_{c_idx})); }}"
+                            );
+                        } else {
+                            let _ = writeln!(
+                                s,
+                                "        memcpy(&state->mod_stream_last_{c_idx}, {ptr_expr}, sizeof(state->mod_stream_last_{c_idx}));"
+                            );
+                        }
+                    } else {
+                        let _ = writeln!(s, "        (void){pe};");
+                    }
+                    let _ = writeln!(s, "        state->mod_stream_has_{c_idx} = 1u;");
+                };
                 if let Some((qi, ti)) = match_term {
                     let _ = writeln!(
                         s,
-                        "    if (sys_ctx != NULL && state->api->msg_send != NULL) {{\n        if (iter_{qi} == NULL && state->api->sys_query != NULL) {{ (void)state->api->sys_query(sys_ctx, {qi}u, &iter_{qi}); }}\n        if (iter_{qi} != NULL) {{ (void)state->api->msg_send(iter_{qi}, {ti}u, {ptr_expr}, {sz}u); }}\n    }}"
+                        "    if (state->res_flags[{c_idx}] == 2u && sys_ctx != NULL && state->api->msg_send != NULL) {{\n        if (iter_{qi} == NULL && state->api->sys_query != NULL) {{ (void)state->api->sys_query(sys_ctx, {qi}u, &iter_{qi}); }}\n        if (iter_{qi} != NULL) {{ (void)state->api->msg_send(iter_{qi}, {ti}u, {ptr_expr}, {sz}u); }}\n    }} else {{"
                     );
+                    emit_mod_fallback(s);
+                    let _ = writeln!(s, "    }}");
                 } else if let Some(s_idx) = self.sys_idx {
                     let comp_n = self.parent.components.len().max(1);
                     let _ = writeln!(
                         s,
-                        "    if (sys_ctx != NULL && state->res_flags[{c_idx}] == 2u && state->sys_msg_q[{s_idx}] != UINT32_MAX && state->sys_msg_ti[{s_idx}u * {comp_n}u + {c_idx}u] != UINT32_MAX && state->api->sys_query != NULL && state->api->msg_send != NULL) {{\n        BamIter* msg_it = NULL;\n        if (state->api->sys_query(sys_ctx, state->sys_msg_q[{s_idx}], &msg_it) == BAM_RESULT_OK && msg_it != NULL) {{\n            (void)state->api->msg_send(msg_it, state->sys_msg_ti[{s_idx}u * {comp_n}u + {c_idx}u], {ptr_expr}, {sz}u);\n        }}\n    }}"
+                        "    if (sys_ctx != NULL && state->res_flags[{c_idx}] == 2u && state->sys_msg_q[{s_idx}] != UINT32_MAX && state->sys_msg_ti[{s_idx}u * {comp_n}u + {c_idx}u] != UINT32_MAX && state->api->sys_query != NULL && state->api->msg_send != NULL) {{\n        BamIter* msg_it = NULL;\n        if (state->api->sys_query(sys_ctx, state->sys_msg_q[{s_idx}], &msg_it) == BAM_RESULT_OK && msg_it != NULL) {{\n            (void)state->api->msg_send(msg_it, state->sys_msg_ti[{s_idx}u * {comp_n}u + {c_idx}u], {ptr_expr}, {sz}u);\n        }}\n    }} else if (state->res_flags[{c_idx}] != 2u) {{"
                     );
+                    emit_mod_fallback(s);
+                    let _ = writeln!(s, "    }}");
+                } else {
+                    let _ = writeln!(s, "    if (state->res_flags[{c_idx}] != 2u) {{");
+                    emit_mod_fallback(s);
+                    let _ = writeln!(s, "    }}");
                 }
             }
             Inst::CmdCheckpoint => {
@@ -2326,37 +2969,80 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 target,
                 payload,
             } => {
-                let r_idx = self.parent.find_rel_idx(relation).unwrap_or(0);
                 let ch = self.local_expr(*entity);
                 let pa = self.local_expr(*target);
-                let sz = self.parent.relations.get(r_idx).map_or(0, |r| r.data_size);
-                let pp = if let Some(pid) = payload {
-                    let is_ptr =
-                        matches!(self.local_ty(*pid), Some(MirType::Ptr | MirType::MutPtr));
-                    let pe = self.local_expr(*pid);
-                    if is_ptr { pe } else { format!("&{pe}") }
-                } else {
-                    "NULL".to_string()
-                };
                 self.ensure_cmds_snippet(s);
-                let _ = writeln!(
-                    s,
-                    "    if (cmds_cache != NULL && state->api->cmd_insert_relation != NULL) {{\n        (void)state->api->cmd_insert_relation(cmds_cache, state->relations[{r_idx}], {ch}, {pa}, {pp}, {sz}u);\n    }}"
-                );
+                if is_child_of_rel(relation) {
+                    if let Some(pid) = payload {
+                        let pe = self.local_expr(*pid);
+                        let _ = writeln!(s, "    (void){pe};");
+                    }
+                    let c_idx = self
+                        .parent
+                        .find_comp_idx(bamabi_sys::BAM_CHILD_OF_NAME)
+                        .or_else(|| self.parent.find_comp_idx(relation))
+                        .unwrap_or(0);
+                    let _ = writeln!(
+                        s,
+                        "    if (cmds_cache != NULL && state->api->cmd_insert != NULL && {ch} != BAM_ENTITY_NULL && {pa} != BAM_ENTITY_NULL) {{\n        BamEntity parent_ent = {pa};\n        (void)state->api->cmd_insert(cmds_cache, {ch}, state->components[{c_idx}], (const uint8_t*)&parent_ent, (size_t)sizeof(BamEntity));\n    }}"
+                    );
+                } else {
+                    let r_idx = self.parent.find_rel_idx(relation).unwrap_or(0);
+                    let sz = self.parent.relations.get(r_idx).map_or(0, |r| r.data_size);
+                    let pp = if let Some(pid) = payload {
+                        let is_ptr = self.is_ptr_local(*pid);
+                        let pe = self.local_expr(*pid);
+                        if is_ptr { pe } else { format!("&{pe}") }
+                    } else {
+                        "NULL".to_string()
+                    };
+                    let _ = writeln!(
+                        s,
+                        "    if (cmds_cache != NULL && state->api->cmd_insert_relation != NULL && {ch} != BAM_ENTITY_NULL && {pa} != BAM_ENTITY_NULL) {{\n        (void)state->api->cmd_insert_relation(cmds_cache, {ch}, state->relations[{r_idx}], {pa}, {pp}, {sz}u);\n    }}"
+                    );
+                    if let Some(pc_idx) =
+                        self.parent.find_comp_idx(&custom_rel_parent_comp(relation))
+                    {
+                        let _ = writeln!(
+                            s,
+                            "    if (cmds_cache != NULL && state->api->cmd_insert != NULL && {ch} != BAM_ENTITY_NULL && {pa} != BAM_ENTITY_NULL) {{\n        BamEntity parent_ent = {pa};\n        (void)state->api->cmd_insert(cmds_cache, {ch}, state->components[{pc_idx}], (const uint8_t*)&parent_ent, (size_t)sizeof(BamEntity));\n    }}"
+                        );
+                    }
+                }
             }
             Inst::CmdRemoveRelation {
                 relation,
                 entity,
                 target,
             } => {
-                let r_idx = self.parent.find_rel_idx(relation).unwrap_or(0);
                 let ch = self.local_expr(*entity);
                 let pa = self.local_expr(*target);
                 self.ensure_cmds_snippet(s);
-                let _ = writeln!(
-                    s,
-                    "    if (cmds_cache != NULL && state->api->cmd_remove_relation != NULL) {{\n        (void)state->api->cmd_remove_relation(cmds_cache, state->relations[{r_idx}], {ch}, {pa});\n    }}"
-                );
+                if is_child_of_rel(relation) {
+                    let c_idx = self
+                        .parent
+                        .find_comp_idx(bamabi_sys::BAM_CHILD_OF_NAME)
+                        .or_else(|| self.parent.find_comp_idx(relation))
+                        .unwrap_or(0);
+                    let _ = writeln!(
+                        s,
+                        "    (void)({pa});\n    if (cmds_cache != NULL && state->api->cmd_remove != NULL && {ch} != BAM_ENTITY_NULL) {{\n        (void)state->api->cmd_remove(cmds_cache, {ch}, state->components[{c_idx}]);\n    }}"
+                    );
+                } else {
+                    let r_idx = self.parent.find_rel_idx(relation).unwrap_or(0);
+                    let _ = writeln!(
+                        s,
+                        "    if (cmds_cache != NULL && state->api->cmd_remove_relation != NULL && {ch} != BAM_ENTITY_NULL && {pa} != BAM_ENTITY_NULL) {{\n        (void)state->api->cmd_remove_relation(cmds_cache, {ch}, state->relations[{r_idx}], {pa});\n    }}"
+                    );
+                    if let Some(pc_idx) =
+                        self.parent.find_comp_idx(&custom_rel_parent_comp(relation))
+                    {
+                        let _ = writeln!(
+                            s,
+                            "    if (cmds_cache != NULL && state->api->cmd_remove != NULL && {ch} != BAM_ENTITY_NULL) {{\n        (void)state->api->cmd_remove(cmds_cache, {ch}, state->components[{pc_idx}]);\n    }}"
+                        );
+                    }
+                }
             }
             Inst::SpatialRebuildCsr { index_name, .. } => {
                 let _ = writeln!(s, "    /* Spatial CSR rebuilt for `{index_name}` */");
@@ -2426,11 +3112,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     let de = self.local_expr(d);
                     let sid = d.0;
                     let ce = self.local_expr(*center);
-                    let c3 = match self.local_ty(*center) {
-                        Some(MirType::Vec2) => format!("strata_spatial_c3_v2({ce})"),
-                        Some(MirType::Vec4) => format!("strata_spatial_c3_v4({ce})"),
-                        _ => ce,
-                    };
+                    let is_vec2 = matches!(self.local_ty(*center), Some(MirType::Vec2));
                     let re = self.local_expr(*radius);
                     let grid_ptr_expr = if let Some(sp_name) =
                         self.parent.find_spatial_name(self.func, grid_name)
@@ -2440,10 +3122,21 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     } else {
                         "NULL".to_string()
                     };
-                    let _ = writeln!(
-                        s,
-                        "    {{\n        const void* g_ptr = {grid_ptr_expr};\n        spatial_buf_{sid} = strata_spatial_query_disc(g_ptr, {c3}, (float){re});\n        {de} = (const BamEntity*)spatial_buf_{sid}.entities;\n    }}"
-                    );
+                    if is_vec2 {
+                        let _ = writeln!(
+                            s,
+                            "    {{\n        const void* g_ptr = {grid_ptr_expr};\n        spatial_buf_{sid} = strata_spatial_query_disc_2d(g_ptr, {ce}, (float){re});\n        {de} = (const BamEntity*)spatial_buf_{sid}.entities;\n    }}"
+                        );
+                    } else {
+                        let c3 = match self.local_ty(*center) {
+                            Some(MirType::Vec4) => format!("strata_spatial_c3_v4({ce})"),
+                            _ => ce,
+                        };
+                        let _ = writeln!(
+                            s,
+                            "    {{\n        const void* g_ptr = {grid_ptr_expr};\n        spatial_buf_{sid} = strata_spatial_query_disc(g_ptr, {c3}, (float){re});\n        {de} = (const BamEntity*)spatial_buf_{sid}.entities;\n    }}"
+                        );
+                    }
                 }
             }
             Inst::SpatialQuerySegmentAt {
@@ -2470,6 +3163,15 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     };
                     let r = self.local_expr(*radius);
                     let toff = self.local_expr(*tick_offset);
+                    let toff_u32 = match self.local_ty(*tick_offset) {
+                        Some(MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64) => format!(
+                            "(((int64_t)({toff}) < 0ll || (int64_t)({toff}) > (int64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)({toff}))"
+                        ),
+                        Some(MirType::U64) => format!(
+                            "(((uint64_t)({toff}) > (uint64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)({toff}))"
+                        ),
+                        _ => format!("(uint32_t)({toff})"),
+                    };
                     let hist_ptr_expr = if let Some(sp_name) =
                         self.parent.find_spatial_name(self.func, history_name)
                     {
@@ -2480,7 +3182,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     };
                     let _ = writeln!(
                         s,
-                        "    {{\n        const void* h_ptr = {hist_ptr_expr};\n        spatial_buf_{sid} = strata_spatial_query_segment_at(h_ptr, {a}, {b}, (float){r}, (float){toff});\n        {de} = (const BamEntity*)spatial_buf_{sid}.entities;\n    }}"
+                        "    {{\n        const void* h_ptr = {hist_ptr_expr};\n        spatial_buf_{sid} = strata_spatial_query_segment_at(h_ptr, {a}, {b}, (float){r}, {toff_u32});\n        {de} = (const BamEntity*)spatial_buf_{sid}.entities;\n    }}"
                     );
                 }
             }
@@ -2540,9 +3242,10 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 let _ = writeln!(s, "    }} else {{");
                 if let Some(owners) = self.dirty_owners.get(&(run_start.0, run_len.0)) {
                     for &(qi, ti) in owners {
+                        let eff_ti = self.eff_term_idx(qi, ti);
                         let _ = writeln!(
                             s,
-                            "        if (iter_{qi} != NULL && state->api->iter_mark_changed_range != NULL) {{\n            (void)state->api->iter_mark_changed_range(iter_{qi}, {ti}u, (size_t){rs}, (size_t){rl});\n        }}"
+                            "        if (iter_{qi} != NULL && state->api->iter_mark_changed_range != NULL) {{\n            (void)state->api->iter_mark_changed_range(iter_{qi}, {eff_ti}u, (size_t){rs}, (size_t){rl});\n        }}"
                         );
                     }
                 }
@@ -2575,7 +3278,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             }
             Inst::RequireTrue { cond } => {
                 let ce = self.local_expr(*cond);
-                if let Some(cp) = self.last_checkpoint {
+                if let Some(cp) = stmt_ckpt {
                     let cpe = self.local_expr(cp);
                     let _ = writeln!(
                         s,
@@ -2660,6 +3363,14 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
         };
 
         match (&lty, &rty, op) {
+            (MirType::Vec4, MirType::Vec4, "quat_mul") => {
+                let _ = writeln!(s, "    {d} = strata_quat_mul({l}, {r});");
+                return Ok(());
+            }
+            (MirType::Vec4, MirType::Vec3, "quat_mul_vec3") => {
+                let _ = writeln!(s, "    {d} = strata_quat_mul_vec3({l}, {r});");
+                return Ok(());
+            }
             (MirType::Vec2, MirType::Vec2, "+" | "Add") => {
                 let _ = writeln!(s, "    {d} = strata_vec2_add({l}, {r});");
                 return Ok(());
@@ -2670,6 +3381,24 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             }
             (MirType::Vec2, MirType::Vec2, "*" | "Mul") => {
                 let _ = writeln!(s, "    {d} = strata_vec2_mul({l}, {r});");
+                return Ok(());
+            }
+            (MirType::Vec2, MirType::Vec2, "/" | "Div") => {
+                let _ = writeln!(s, "    {d} = strata_vec2_div({l}, {r});");
+                return Ok(());
+            }
+            (MirType::Vec2, MirType::Vec2, "==" | "Eq" | "!=" | "Ne") => {
+                if matches!(op, "==" | "Eq") {
+                    let _ = writeln!(
+                        s,
+                        "    {d} = ({l}.x == {r}.x && {l}.y == {r}.y) ? BAM_TRUE : BAM_FALSE;"
+                    );
+                } else {
+                    let _ = writeln!(
+                        s,
+                        "    {d} = ({l}.x != {r}.x || {l}.y != {r}.y) ? BAM_TRUE : BAM_FALSE;"
+                    );
+                }
                 return Ok(());
             }
             (MirType::Vec2, MirType::F32 | MirType::F64, "*" | "Mul") => {
@@ -2696,6 +3425,24 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 let _ = writeln!(s, "    {d} = strata_vec3_mul({l}, {r});");
                 return Ok(());
             }
+            (MirType::Vec3, MirType::Vec3, "/" | "Div") => {
+                let _ = writeln!(s, "    {d} = strata_vec3_div({l}, {r});");
+                return Ok(());
+            }
+            (MirType::Vec3, MirType::Vec3, "==" | "Eq" | "!=" | "Ne") => {
+                if matches!(op, "==" | "Eq") {
+                    let _ = writeln!(
+                        s,
+                        "    {d} = ({l}.x == {r}.x && {l}.y == {r}.y && {l}.z == {r}.z) ? BAM_TRUE : BAM_FALSE;"
+                    );
+                } else {
+                    let _ = writeln!(
+                        s,
+                        "    {d} = ({l}.x != {r}.x || {l}.y != {r}.y || {l}.z != {r}.z) ? BAM_TRUE : BAM_FALSE;"
+                    );
+                }
+                return Ok(());
+            }
             (MirType::Vec3, MirType::F32 | MirType::F64, "*" | "Mul") => {
                 let _ = writeln!(s, "    {d} = strata_vec3_scale({l}, (float){r});");
                 return Ok(());
@@ -2720,8 +3467,34 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 let _ = writeln!(s, "    {d} = strata_vec4_mul({l}, {r});");
                 return Ok(());
             }
+            (MirType::Vec4, MirType::Vec4, "/" | "Div") => {
+                let _ = writeln!(s, "    {d} = strata_vec4_div({l}, {r});");
+                return Ok(());
+            }
+            (MirType::Vec4, MirType::Vec4, "==" | "Eq" | "!=" | "Ne") => {
+                if matches!(op, "==" | "Eq") {
+                    let _ = writeln!(
+                        s,
+                        "    {d} = ({l}.x == {r}.x && {l}.y == {r}.y && {l}.z == {r}.z && {l}.w == {r}.w) ? BAM_TRUE : BAM_FALSE;"
+                    );
+                } else {
+                    let _ = writeln!(
+                        s,
+                        "    {d} = ({l}.x != {r}.x || {l}.y != {r}.y || {l}.z != {r}.z || {l}.w != {r}.w) ? BAM_TRUE : BAM_FALSE;"
+                    );
+                }
+                return Ok(());
+            }
             (MirType::Vec4, MirType::F32 | MirType::F64, "*" | "Mul") => {
                 let _ = writeln!(s, "    {d} = strata_vec4_scale({l}, (float){r});");
+                return Ok(());
+            }
+            (MirType::F32 | MirType::F64, MirType::Vec4, "*" | "Mul") => {
+                let _ = writeln!(s, "    {d} = strata_vec4_scale({r}, (float){l});");
+                return Ok(());
+            }
+            (MirType::Vec4, MirType::F32 | MirType::F64, "/" | "Div") => {
+                let _ = writeln!(s, "    {d} = strata_vec4_scale({l}, 1.0f / (float)({r}));");
                 return Ok(());
             }
             (MirType::IVec2, MirType::IVec2, "+" | "Add" | "-" | "Sub" | "*" | "Mul") => {
@@ -2733,6 +3506,80 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 let _ = writeln!(
                     s,
                     "    {d} = strata_ivec2((int32_t)((uint32_t)({l}.x) {cop} (uint32_t)({r}.x)), (int32_t)((uint32_t)({l}.y) {cop} (uint32_t)({r}.y)));"
+                );
+                return Ok(());
+            }
+            (MirType::IVec2, MirType::IVec2, "/" | "Div") => {
+                let _ = writeln!(s, "    {d} = strata_ivec2_div({l}, {r});");
+                return Ok(());
+            }
+            (MirType::IVec2, MirType::IVec2, "%" | "Rem") => {
+                let _ = writeln!(s, "    {d} = strata_ivec2_rem({l}, {r});");
+                return Ok(());
+            }
+            (
+                MirType::IVec2,
+                MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64
+                | MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64,
+                "*" | "Mul",
+            ) => {
+                let _ = writeln!(s, "    {d} = strata_ivec2_scale({l}, (int32_t)({r}));");
+                return Ok(());
+            }
+            (
+                MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64
+                | MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64,
+                MirType::IVec2,
+                "*" | "Mul",
+            ) => {
+                let _ = writeln!(s, "    {d} = strata_ivec2_scale({r}, (int32_t)({l}));");
+                return Ok(());
+            }
+            (
+                MirType::IVec2,
+                MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64
+                | MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64,
+                "/" | "Div",
+            ) => {
+                let _ = writeln!(
+                    s,
+                    "    {d} = strata_ivec2_div({l}, strata_ivec2((int32_t)({r}), (int32_t)({r})));"
+                );
+                return Ok(());
+            }
+            (
+                MirType::IVec2,
+                MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64
+                | MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64,
+                "%" | "Rem",
+            ) => {
+                let _ = writeln!(
+                    s,
+                    "    {d} = strata_ivec2_rem({l}, strata_ivec2((int32_t)({r}), (int32_t)({r})));"
                 );
                 return Ok(());
             }
@@ -2762,6 +3609,80 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 );
                 return Ok(());
             }
+            (MirType::UVec2, MirType::UVec2, "/" | "Div") => {
+                let _ = writeln!(s, "    {d} = strata_uvec2_div({l}, {r});");
+                return Ok(());
+            }
+            (MirType::UVec2, MirType::UVec2, "%" | "Rem") => {
+                let _ = writeln!(s, "    {d} = strata_uvec2_rem({l}, {r});");
+                return Ok(());
+            }
+            (
+                MirType::UVec2,
+                MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64
+                | MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64,
+                "*" | "Mul",
+            ) => {
+                let _ = writeln!(s, "    {d} = strata_uvec2_scale({l}, (uint32_t)({r}));");
+                return Ok(());
+            }
+            (
+                MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64
+                | MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64,
+                MirType::UVec2,
+                "*" | "Mul",
+            ) => {
+                let _ = writeln!(s, "    {d} = strata_uvec2_scale({r}, (uint32_t)({l}));");
+                return Ok(());
+            }
+            (
+                MirType::UVec2,
+                MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64
+                | MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64,
+                "/" | "Div",
+            ) => {
+                let _ = writeln!(
+                    s,
+                    "    {d} = strata_uvec2_div({l}, strata_uvec2((uint32_t)({r}), (uint32_t)({r})));"
+                );
+                return Ok(());
+            }
+            (
+                MirType::UVec2,
+                MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64
+                | MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64,
+                "%" | "Rem",
+            ) => {
+                let _ = writeln!(
+                    s,
+                    "    {d} = strata_uvec2_rem({l}, strata_uvec2((uint32_t)({r}), (uint32_t)({r})));"
+                );
+                return Ok(());
+            }
             (MirType::UVec2, MirType::UVec2, "==" | "Eq" | "!=" | "Ne") => {
                 if matches!(op, "==" | "Eq") {
                     let _ = writeln!(
@@ -2785,6 +3706,80 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 let _ = writeln!(
                     s,
                     "    {d} = strata_ivec3((int32_t)((uint32_t)({l}.x) {cop} (uint32_t)({r}.x)), (int32_t)((uint32_t)({l}.y) {cop} (uint32_t)({r}.y)), (int32_t)((uint32_t)({l}.z) {cop} (uint32_t)({r}.z)));"
+                );
+                return Ok(());
+            }
+            (MirType::IVec3, MirType::IVec3, "/" | "Div") => {
+                let _ = writeln!(s, "    {d} = strata_ivec3_div({l}, {r});");
+                return Ok(());
+            }
+            (MirType::IVec3, MirType::IVec3, "%" | "Rem") => {
+                let _ = writeln!(s, "    {d} = strata_ivec3_rem({l}, {r});");
+                return Ok(());
+            }
+            (
+                MirType::IVec3,
+                MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64
+                | MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64,
+                "*" | "Mul",
+            ) => {
+                let _ = writeln!(s, "    {d} = strata_ivec3_scale({l}, (int32_t)({r}));");
+                return Ok(());
+            }
+            (
+                MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64
+                | MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64,
+                MirType::IVec3,
+                "*" | "Mul",
+            ) => {
+                let _ = writeln!(s, "    {d} = strata_ivec3_scale({r}, (int32_t)({l}));");
+                return Ok(());
+            }
+            (
+                MirType::IVec3,
+                MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64
+                | MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64,
+                "/" | "Div",
+            ) => {
+                let _ = writeln!(
+                    s,
+                    "    {d} = strata_ivec3_div({l}, strata_ivec3((int32_t)({r}), (int32_t)({r}), (int32_t)({r})));"
+                );
+                return Ok(());
+            }
+            (
+                MirType::IVec3,
+                MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64
+                | MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64,
+                "%" | "Rem",
+            ) => {
+                let _ = writeln!(
+                    s,
+                    "    {d} = strata_ivec3_rem({l}, strata_ivec3((int32_t)({r}), (int32_t)({r}), (int32_t)({r})));"
                 );
                 return Ok(());
             }
@@ -2984,7 +3979,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 matches!(ty, MirType::U64 | MirType::Entity)
                     || matches!(
                         self.projected_sema_ty(id),
-                        Some(Ty::U64 | Ty::BitSet(_) | Ty::Ref(_))
+                        Some(Ty::U64 | Ty::Ref(_)) | Some(Ty::BitSet(1..=64))
                     )
             };
             let is_scalar = |id: LocalId, ty: &MirType| {
@@ -3187,16 +4182,29 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 }
             }
             "abs" => {
-                if matches!(
-                    d_ty,
-                    MirType::I32 | MirType::I64 | MirType::I16 | MirType::I8
-                ) {
-                    let x = a(0);
-                    let _ = writeln!(s, "    {d} = ({x} < 0) ? -{x} : {x};");
-                } else if is_f64 {
-                    let _ = writeln!(s, "    {d} = fabs((double){});", a(0));
-                } else {
-                    let _ = writeln!(s, "    {d} = fabsf((float){});", a(0));
+                let x = a(0);
+                match d_ty {
+                    MirType::I8 => {
+                        let _ = writeln!(s, "    {d} = strata_abs_i8((int8_t)({x}));");
+                    }
+                    MirType::I16 => {
+                        let _ = writeln!(s, "    {d} = strata_abs_i16((int16_t)({x}));");
+                    }
+                    MirType::I32 | MirType::Fix32 => {
+                        let _ = writeln!(s, "    {d} = strata_abs_i32((int32_t)({x}));");
+                    }
+                    MirType::I64 | MirType::Fix64 => {
+                        let _ = writeln!(s, "    {d} = strata_abs_i64((int64_t)({x}));");
+                    }
+                    MirType::U8 | MirType::U16 | MirType::U32 | MirType::U64 => {
+                        let _ = writeln!(s, "    {d} = {x};");
+                    }
+                    _ if is_f64 => {
+                        let _ = writeln!(s, "    {d} = fabs((double){x});");
+                    }
+                    _ => {
+                        let _ = writeln!(s, "    {d} = fabsf((float){x});");
+                    }
                 }
             }
             "min" => {
@@ -3271,30 +4279,233 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 }
             }
             "clamp" => {
-                let x = a(0);
-                let lo = a(1);
-                let hi = a(2);
-                let _ = writeln!(
-                    s,
-                    "    {d} = ({x} < {lo}) ? {lo} : (({x} > {hi}) ? {hi} : {x});"
-                );
+                let clamp_vec = matches!(
+                    d_ty,
+                    MirType::Vec2
+                        | MirType::Vec3
+                        | MirType::Vec4
+                        | MirType::IVec2
+                        | MirType::IVec3
+                        | MirType::UVec2
+                )
+                .then_some(d_ty.clone());
+                let is_scalar_bound = |idx: usize| -> bool {
+                    args.get(idx)
+                        .and_then(|id| self.effective_vec_ty(*id))
+                        .is_none_or(|t| {
+                            !matches!(
+                                t,
+                                MirType::Vec2
+                                    | MirType::Vec3
+                                    | MirType::Vec4
+                                    | MirType::IVec2
+                                    | MirType::IVec3
+                                    | MirType::UVec2
+                            )
+                        })
+                };
+                match clamp_vec {
+                    Some(MirType::Vec2) => {
+                        let lo_e = if is_scalar_bound(1) {
+                            format!("strata_vec2((float)({}), (float)({}))", a(1), a(1))
+                        } else {
+                            av(1)
+                        };
+                        let hi_e = if is_scalar_bound(2) {
+                            format!("strata_vec2((float)({}), (float)({}))", a(2), a(2))
+                        } else {
+                            av(2)
+                        };
+                        let _ =
+                            writeln!(s, "    {d} = strata_vec2_clamp({}, {lo_e}, {hi_e});", av(0));
+                    }
+                    Some(MirType::Vec3) => {
+                        let lo_e = if is_scalar_bound(1) {
+                            format!(
+                                "strata_vec3((float)({}), (float)({}), (float)({}))",
+                                a(1),
+                                a(1),
+                                a(1)
+                            )
+                        } else {
+                            av(1)
+                        };
+                        let hi_e = if is_scalar_bound(2) {
+                            format!(
+                                "strata_vec3((float)({}), (float)({}), (float)({}))",
+                                a(2),
+                                a(2),
+                                a(2)
+                            )
+                        } else {
+                            av(2)
+                        };
+                        let _ =
+                            writeln!(s, "    {d} = strata_vec3_clamp({}, {lo_e}, {hi_e});", av(0));
+                    }
+                    Some(MirType::Vec4) => {
+                        let lo_e = if is_scalar_bound(1) {
+                            format!(
+                                "strata_vec4((float)({}), (float)({}), (float)({}), (float)({}))",
+                                a(1),
+                                a(1),
+                                a(1),
+                                a(1)
+                            )
+                        } else {
+                            av(1)
+                        };
+                        let hi_e = if is_scalar_bound(2) {
+                            format!(
+                                "strata_vec4((float)({}), (float)({}), (float)({}), (float)({}))",
+                                a(2),
+                                a(2),
+                                a(2),
+                                a(2)
+                            )
+                        } else {
+                            av(2)
+                        };
+                        let _ =
+                            writeln!(s, "    {d} = strata_vec4_clamp({}, {lo_e}, {hi_e});", av(0));
+                    }
+                    Some(MirType::IVec2) => {
+                        let lo_e = if is_scalar_bound(1) {
+                            format!("strata_ivec2((int32_t)({}), (int32_t)({}))", a(1), a(1))
+                        } else {
+                            av(1)
+                        };
+                        let hi_e = if is_scalar_bound(2) {
+                            format!("strata_ivec2((int32_t)({}), (int32_t)({}))", a(2), a(2))
+                        } else {
+                            av(2)
+                        };
+                        let _ = writeln!(
+                            s,
+                            "    {d} = strata_ivec2_clamp({}, {lo_e}, {hi_e});",
+                            av(0)
+                        );
+                    }
+                    Some(MirType::IVec3) => {
+                        let lo_e = if is_scalar_bound(1) {
+                            format!(
+                                "strata_ivec3((int32_t)({}), (int32_t)({}), (int32_t)({}))",
+                                a(1),
+                                a(1),
+                                a(1)
+                            )
+                        } else {
+                            av(1)
+                        };
+                        let hi_e = if is_scalar_bound(2) {
+                            format!(
+                                "strata_ivec3((int32_t)({}), (int32_t)({}), (int32_t)({}))",
+                                a(2),
+                                a(2),
+                                a(2)
+                            )
+                        } else {
+                            av(2)
+                        };
+                        let _ = writeln!(
+                            s,
+                            "    {d} = strata_ivec3_clamp({}, {lo_e}, {hi_e});",
+                            av(0)
+                        );
+                    }
+                    Some(MirType::UVec2) => {
+                        let lo_e = if is_scalar_bound(1) {
+                            format!("strata_uvec2((uint32_t)({}), (uint32_t)({}))", a(1), a(1))
+                        } else {
+                            av(1)
+                        };
+                        let hi_e = if is_scalar_bound(2) {
+                            format!("strata_uvec2((uint32_t)({}), (uint32_t)({}))", a(2), a(2))
+                        } else {
+                            av(2)
+                        };
+                        let _ = writeln!(
+                            s,
+                            "    {d} = strata_uvec2_clamp({}, {lo_e}, {hi_e});",
+                            av(0)
+                        );
+                    }
+                    _ => {
+                        let x = a(0);
+                        let lo = a(1);
+                        let hi = a(2);
+                        match d_ty {
+                            MirType::I32 | MirType::Fix32 => {
+                                let _ = writeln!(
+                                    s,
+                                    "    {d} = strata_clamp_i32((int32_t)({x}), (int32_t)({lo}), (int32_t)({hi}));"
+                                );
+                            }
+                            MirType::I64 | MirType::Fix64 => {
+                                let _ = writeln!(
+                                    s,
+                                    "    {d} = strata_clamp_i64((int64_t)({x}), (int64_t)({lo}), (int64_t)({hi}));"
+                                );
+                            }
+                            MirType::U32 => {
+                                let _ = writeln!(
+                                    s,
+                                    "    {d} = strata_clamp_u32((uint32_t)({x}), (uint32_t)({lo}), (uint32_t)({hi}));"
+                                );
+                            }
+                            MirType::U64 => {
+                                let _ = writeln!(
+                                    s,
+                                    "    {d} = strata_clamp_u64((uint64_t)({x}), (uint64_t)({lo}), (uint64_t)({hi}));"
+                                );
+                            }
+                            _ if is_f64 => {
+                                let _ = writeln!(
+                                    s,
+                                    "    {d} = strata_clamp_f64((double)({x}), (double)({lo}), (double)({hi}));"
+                                );
+                            }
+                            MirType::F32 => {
+                                let _ = writeln!(
+                                    s,
+                                    "    {d} = strata_clamp_f32((float)({x}), (float)({lo}), (float)({hi}));"
+                                );
+                            }
+                            _ => {
+                                let _ = writeln!(
+                                    s,
+                                    "    {d} = ({x} < {lo}) ? {lo} : (({x} > {hi}) ? {hi} : {x});"
+                                );
+                            }
+                        }
+                    }
+                }
             }
             "lerp" => match d_ty {
                 MirType::Vec2 => {
                     let _ = writeln!(
                         s,
-                        "    {d} = strata_vec2_lerp({}, {}, {});",
-                        a(0),
-                        a(1),
+                        "    {d} = strata_vec2_lerp({}, {}, (float)({}));",
+                        av(0),
+                        av(1),
                         a(2)
                     );
                 }
                 MirType::Vec3 => {
                     let _ = writeln!(
                         s,
-                        "    {d} = strata_vec3_lerp({}, {}, {});",
-                        a(0),
-                        a(1),
+                        "    {d} = strata_vec3_lerp({}, {}, (float)({}));",
+                        av(0),
+                        av(1),
+                        a(2)
+                    );
+                }
+                MirType::Vec4 => {
+                    let _ = writeln!(
+                        s,
+                        "    {d} = strata_vec4_lerp({}, {}, (float)({}));",
+                        av(0),
+                        av(1),
                         a(2)
                     );
                 }
@@ -3304,7 +4515,7 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     let t = a(2);
                     let _ = writeln!(
                         s,
-                        "    {d} = ((double){x0} + ((double){x1} - (double){x0}) * (double){t});"
+                        "    {d} = strata_lerp_f64((double)({x0}), (double)({x1}), (double)({t}));"
                     );
                 }
                 _ => {
@@ -3343,6 +4554,9 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 MirType::Vec3 => {
                     let _ = writeln!(s, "    {d} = strata_vec3_len_sq({});", av(0));
                 }
+                MirType::Vec4 => {
+                    let _ = writeln!(s, "    {d} = strata_vec4_len_sq({});", av(0));
+                }
                 _ => {
                     let _ = writeln!(s, "    {d} = strata_vec2_len_sq({});", av(0));
                 }
@@ -3351,6 +4565,9 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 MirType::Vec3 => {
                     let _ = writeln!(s, "    {d} = strata_vec3_dist({}, {});", av(0), av(1));
                 }
+                MirType::Vec4 => {
+                    let _ = writeln!(s, "    {d} = strata_vec4_dist({}, {});", av(0), av(1));
+                }
                 _ => {
                     let _ = writeln!(s, "    {d} = strata_vec2_dist({}, {});", av(0), av(1));
                 }
@@ -3358,6 +4575,9 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             "distance_sq" => match t0 {
                 MirType::Vec3 => {
                     let _ = writeln!(s, "    {d} = strata_vec3_dist_sq({}, {});", av(0), av(1));
+                }
+                MirType::Vec4 => {
+                    let _ = writeln!(s, "    {d} = strata_vec4_dist_sq({}, {});", av(0), av(1));
                 }
                 _ => {
                     let _ = writeln!(s, "    {d} = strata_vec2_dist_sq({}, {});", av(0), av(1));
@@ -3450,14 +4670,26 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 }
             }
             "signum" => {
-                if is_f64 {
-                    let x = a(0);
-                    let _ = writeln!(
-                        s,
-                        "    {d} = ((double){x} > 0.0) ? 1.0 : (((double){x} < 0.0) ? -1.0 : 0.0);"
-                    );
-                } else {
-                    let _ = writeln!(s, "    {d} = strata_signum_f32((float){});", a(0));
+                let x = a(0);
+                match d_ty {
+                    MirType::Fix32 => {
+                        let _ = writeln!(s, "    {d} = strata_signum_fix32((int32_t)({x}));");
+                    }
+                    MirType::Fix64 => {
+                        let _ = writeln!(s, "    {d} = strata_signum_fix64((int64_t)({x}));");
+                    }
+                    MirType::I8 | MirType::I16 | MirType::I32 => {
+                        let _ = writeln!(s, "    {d} = strata_signum_i32((int32_t)({x}));");
+                    }
+                    MirType::I64 => {
+                        let _ = writeln!(s, "    {d} = strata_signum_i64((int64_t)({x}));");
+                    }
+                    _ if is_f64 => {
+                        let _ = writeln!(s, "    {d} = strata_signum_f64((double)({x}));");
+                    }
+                    _ => {
+                        let _ = writeln!(s, "    {d} = strata_signum_f32((float)({x}));");
+                    }
                 }
             }
             _ => {
@@ -3752,6 +4984,22 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 return;
             }
             if let Some(bty) = self.local_ty(base_ptr).cloned()
+                && let Some(lanes) = parse_vec_swizzle_lanes(field)
+                && matches!(
+                    bty,
+                    MirType::Vec2
+                        | MirType::Vec3
+                        | MirType::Vec4
+                        | MirType::IVec2
+                        | MirType::IVec3
+                        | MirType::UVec2
+                )
+            {
+                let expr = vec_swizzle_read_expr(&bty, &p, ".", &lanes);
+                let _ = writeln!(s, "    {d} = {expr};");
+                return;
+            }
+            if let Some(bty) = self.local_ty(base_ptr).cloned()
                 && let Some(mem) = self.resolve_tuple_or_vec_member(&bty, field, offset_bytes)
             {
                 let dst_ty = self
@@ -3835,6 +5083,16 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 None
             };
             if let Some(ref lk) = effective_key {
+                if let Some((prefix, swiz)) = field.rsplit_once('.')
+                    && let Some(lanes) = parse_vec_swizzle_lanes(swiz)
+                    && let Some((_, _, path, fty, _)) =
+                        self.resolve_member_with_ty(lk, prefix, offset_bytes, None)
+                    && let Some(vty) = sema_vec_kind(&fty)
+                {
+                    let expr = vec_swizzle_read_expr(&vty, &format!("{p}.{path}"), ".", &lanes);
+                    let _ = writeln!(s, "    {d} = {expr};");
+                    return;
+                }
                 if let Some((_, _, path)) =
                     self.resolve_member_in_layout(lk, field, offset_bytes, Some(field_ty))
                 {
@@ -3868,6 +5126,62 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             return;
         }
 
+        if layout_key.is_empty()
+            && let Some(lanes) = parse_vec_swizzle_lanes(field)
+        {
+            let vec_ty_opt = self.slot_types.get(&base_ptr).cloned().or_else(|| {
+                self.ptr_meta.get(&base_ptr).and_then(|pk| match pk {
+                    PtrKind::ScalarPtr { c_pointee, .. } => vec_type_from_c_pointee(c_pointee),
+                    _ => None,
+                })
+            });
+            if let Some(ref vty) = vec_ty_opt
+                && matches!(
+                    vty,
+                    MirType::Vec2
+                        | MirType::Vec3
+                        | MirType::Vec4
+                        | MirType::IVec2
+                        | MirType::IVec3
+                        | MirType::UVec2
+                )
+            {
+                let expr = vec_swizzle_read_expr(vty, &p, "->", &lanes);
+                if self.nonnull_ptrs.contains(&base_ptr) {
+                    let _ = writeln!(s, "    {d} = {expr};");
+                } else {
+                    let _ = writeln!(s, "    if ({p} != NULL) {{ {d} = {expr}; }}");
+                }
+                return;
+            }
+        }
+
+        if let Some(MirType::Named(k)) = self
+            .slot_types
+            .get(&base_ptr)
+            .or_else(|| self.local_ty(base_ptr))
+            && let Some(tname) = k.strip_prefix("__strata_table_")
+            && let Some(tbl) = self.parent.mir.tables.iter().find(|tb| tb.name == tname)
+            && !field.is_empty()
+            && tbl.fields.iter().any(|(fnm, _)| fnm == field)
+        {
+            let fc = sanitize_c_field(field);
+            let t_ident = sanitize_ident(&tbl.name);
+            let tbl_cty = format!("StrataTable_{t_ident}");
+            if matches!(field_ty, MirType::Bool) {
+                let _ = writeln!(
+                    s,
+                    "    if ({p} != NULL) {{ {d} = (((const {tbl_cty}*){p})->{fc}) ? BAM_TRUE : BAM_FALSE; }}"
+                );
+            } else {
+                let _ = writeln!(
+                    s,
+                    "    if ({p} != NULL) {{ {d} = ((const {tbl_cty}*){p})->{fc}; }}"
+                );
+            }
+            return;
+        }
+
         let effective_key = if !layout_key.is_empty() {
             Some(layout_key.to_string())
         } else if let Some(PtrKind::LayoutPtr { layout_idx, .. }) = self.ptr_meta.get(&base_ptr) {
@@ -3876,6 +5190,30 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             None
         };
         if let Some(ref lk) = effective_key {
+            if let Some((prefix, swiz)) = field.rsplit_once('.')
+                && let Some(lanes) = parse_vec_swizzle_lanes(swiz)
+                && let Some((l_idx, _, path, fty, _)) =
+                    self.resolve_member_with_ty(lk, prefix, offset_bytes, None)
+                && let Some(vty) = sema_vec_kind(&fty)
+            {
+                let same_ptr = matches!(
+                    self.ptr_meta.get(&base_ptr),
+                    Some(PtrKind::LayoutPtr { layout_idx, .. }) if *layout_idx == l_idx
+                );
+                let access = if same_ptr {
+                    format!("{p}->{path}")
+                } else {
+                    let cty = &self.parent.layout_c_names[l_idx];
+                    format!("((const {cty}* BAM_RESTRICT){p})->{path}")
+                };
+                let expr = vec_swizzle_read_expr(&vty, &access, ".", &lanes);
+                if self.nonnull_ptrs.contains(&base_ptr) {
+                    let _ = writeln!(s, "    {d} = {expr};");
+                } else {
+                    let _ = writeln!(s, "    if ({p} != NULL) {{ {d} = {expr}; }}");
+                }
+                return;
+            }
             if let Some((l_idx, _, path)) =
                 self.resolve_member_in_layout(lk, field, offset_bytes, Some(field_ty))
             {
@@ -3969,6 +5307,22 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
 
         if !self.is_ptr_local(base_ptr) {
             if let Some(bty) = self.local_ty(base_ptr)
+                && let Some(lanes) = parse_vec_swizzle_lanes(field)
+                && matches!(
+                    bty,
+                    MirType::Vec2
+                        | MirType::Vec3
+                        | MirType::Vec4
+                        | MirType::IVec2
+                        | MirType::IVec3
+                        | MirType::UVec2
+                )
+            {
+                let stmts = vec_swizzle_store_exprs(&p, ".", &v, &lanes);
+                let _ = writeln!(s, "    {stmts}");
+                return;
+            }
+            if let Some(bty) = self.local_ty(base_ptr)
                 && let Some(mem) = self.resolve_tuple_or_vec_member(bty, field, offset_bytes)
             {
                 let _ = writeln!(s, "    {p}.{mem} = {v};");
@@ -3982,6 +5336,16 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 None
             };
             if let Some(ref lk) = effective_key {
+                if let Some((prefix, swiz)) = field.rsplit_once('.')
+                    && let Some(lanes) = parse_vec_swizzle_lanes(swiz)
+                    && let Some((_, _, path, fty, _)) =
+                        self.resolve_member_with_ty(lk, prefix, offset_bytes, None)
+                    && sema_vec_kind(&fty).is_some()
+                {
+                    let stmts = vec_swizzle_store_exprs(&format!("{p}.{path}"), ".", &v, &lanes);
+                    let _ = writeln!(s, "    {stmts}");
+                    return;
+                }
                 if let Some((_, _, path)) =
                     self.resolve_member_in_layout(lk, field, offset_bytes, Some(&vty))
                 {
@@ -4010,6 +5374,25 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                         self.emit_c_array_bytes_write(&format!("{p}.{path}"), &fty, val, "    ", s);
                         return;
                     }
+                    if let Ty::InlineStr(cap) = fty {
+                        if matches!(vty, MirType::Named(ref k) if k == "InlineStr") {
+                            let _ = writeln!(
+                                s,
+                                "    strata_inlinestr_from_cstr(&({p}.{path}), sizeof({p}.{path}), {cap}u, (const char*)({v}));"
+                            );
+                        } else if self.is_ptr_local(val) {
+                            let _ = writeln!(
+                                s,
+                                "    if ({v} != NULL) {{ memcpy(&({p}.{path}), {v}, sizeof({p}.{path})); }}"
+                            );
+                        } else {
+                            let _ = writeln!(
+                                s,
+                                "    memcpy(&({p}.{path}), &{v}, sizeof({p}.{path}) < sizeof({v}) ? sizeof({p}.{path}) : sizeof({v}));"
+                            );
+                        }
+                        return;
+                    }
                     if self.is_c_scalar_field(&fty, fsz) {
                         if matches!(fty, Ty::Bool) {
                             let _ = writeln!(s, "    {p}.{path} = ({v}) ? BAM_TRUE : BAM_FALSE;");
@@ -4019,8 +5402,14 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                         }
                         return;
                     }
+                    if self.is_ptr_local(val) {
+                        let _ = writeln!(
+                            s,
+                            "    if ({v} != NULL) {{ memcpy(&({p}.{path}), {v}, sizeof({p}.{path})); }}"
+                        );
+                        return;
+                    }
                     if matches!(&fty, Ty::Named(key) if self.parent.find_layout_idx(key).is_some_and(|li| self.parent.layouts[li].size == fsz))
-                        && !self.is_ptr_local(val)
                     {
                         let _ = writeln!(s, "    {p}.{path} = {v};");
                         return;
@@ -4039,6 +5428,36 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             return;
         }
 
+        if layout_key.is_empty()
+            && let Some(lanes) = parse_vec_swizzle_lanes(field)
+        {
+            let vec_ty_opt = self.slot_types.get(&base_ptr).cloned().or_else(|| {
+                self.ptr_meta.get(&base_ptr).and_then(|pk| match pk {
+                    PtrKind::ScalarPtr { c_pointee, .. } => vec_type_from_c_pointee(c_pointee),
+                    _ => None,
+                })
+            });
+            if let Some(ref vty) = vec_ty_opt
+                && matches!(
+                    vty,
+                    MirType::Vec2
+                        | MirType::Vec3
+                        | MirType::Vec4
+                        | MirType::IVec2
+                        | MirType::IVec3
+                        | MirType::UVec2
+                )
+            {
+                let stmts = vec_swizzle_store_exprs(&p, "->", &v, &lanes);
+                if self.nonnull_ptrs.contains(&base_ptr) {
+                    let _ = writeln!(s, "    {stmts}");
+                } else {
+                    let _ = writeln!(s, "    if ({p} != NULL) {{ {stmts} }}");
+                }
+                return;
+            }
+        }
+
         let effective_key = if !layout_key.is_empty() {
             Some(layout_key.to_string())
         } else if let Some(PtrKind::LayoutPtr { layout_idx, .. }) = self.ptr_meta.get(&base_ptr) {
@@ -4047,6 +5466,30 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             None
         };
         if let Some(ref lk) = effective_key {
+            if let Some((prefix, swiz)) = field.rsplit_once('.')
+                && let Some(lanes) = parse_vec_swizzle_lanes(swiz)
+                && let Some((l_idx, _, path, fty, _)) =
+                    self.resolve_member_with_ty(lk, prefix, offset_bytes, None)
+                && sema_vec_kind(&fty).is_some()
+            {
+                let same_ptr = matches!(
+                    self.ptr_meta.get(&base_ptr),
+                    Some(PtrKind::LayoutPtr { layout_idx, is_mut: true }) if *layout_idx == l_idx
+                );
+                let access = if same_ptr {
+                    format!("{p}->{path}")
+                } else {
+                    let cty = &self.parent.layout_c_names[l_idx];
+                    format!("(({cty}* BAM_RESTRICT){p})->{path}")
+                };
+                let stmts = vec_swizzle_store_exprs(&access, ".", &v, &lanes);
+                if self.nonnull_ptrs.contains(&base_ptr) {
+                    let _ = writeln!(s, "    {stmts}");
+                } else {
+                    let _ = writeln!(s, "    if ({p} != NULL) {{ {stmts} }}");
+                }
+                return;
+            }
             if let Some((l_idx, _, path)) =
                 self.resolve_member_in_layout(lk, field, offset_bytes, Some(&vty))
             {
@@ -4112,6 +5555,44 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     }
                     return;
                 }
+                if let Ty::InlineStr(cap) = fty {
+                    if matches!(vty, MirType::Named(ref k) if k == "InlineStr") {
+                        if self.nonnull_ptrs.contains(&base_ptr) {
+                            let _ = writeln!(
+                                s,
+                                "    strata_inlinestr_from_cstr(&({access}), sizeof({access}), {cap}u, (const char*)({v}));"
+                            );
+                        } else {
+                            let _ = writeln!(
+                                s,
+                                "    if ({p} != NULL) {{ strata_inlinestr_from_cstr(&({access}), sizeof({access}), {cap}u, (const char*)({v})); }}"
+                            );
+                        }
+                    } else if self.is_ptr_local(val) {
+                        if self.nonnull_ptrs.contains(&base_ptr) {
+                            let _ = writeln!(
+                                s,
+                                "    if ({v} != NULL) {{ memcpy(&({access}), {v}, sizeof({access})); }}"
+                            );
+                        } else {
+                            let _ = writeln!(
+                                s,
+                                "    if ({p} != NULL && {v} != NULL) {{ memcpy(&({access}), {v}, sizeof({access})); }}"
+                            );
+                        }
+                    } else if self.nonnull_ptrs.contains(&base_ptr) {
+                        let _ = writeln!(
+                            s,
+                            "    memcpy(&({access}), &{v}, sizeof({access}) < sizeof({v}) ? sizeof({access}) : sizeof({v}));"
+                        );
+                    } else {
+                        let _ = writeln!(
+                            s,
+                            "    if ({p} != NULL) {{ memcpy(&({access}), &{v}, sizeof({access}) < sizeof({v}) ? sizeof({access}) : sizeof({v})); }}"
+                        );
+                    }
+                    return;
+                }
                 if self.is_c_scalar_field(&fty, fsz) {
                     if self.nonnull_ptrs.contains(&base_ptr) {
                         if matches!(fty, Ty::Bool) {
@@ -4131,8 +5612,21 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     }
                     return;
                 }
+                if self.is_ptr_local(val) {
+                    if self.nonnull_ptrs.contains(&base_ptr) {
+                        let _ = writeln!(
+                            s,
+                            "    if ({v} != NULL) {{ memcpy(&({access}), {v}, sizeof({access})); }}"
+                        );
+                    } else {
+                        let _ = writeln!(
+                            s,
+                            "    if ({p} != NULL && {v} != NULL) {{ memcpy(&({access}), {v}, sizeof({access})); }}"
+                        );
+                    }
+                    return;
+                }
                 if matches!(&fty, Ty::Named(key) if self.parent.find_layout_idx(key).is_some_and(|li| self.parent.layouts[li].size == fsz))
-                    && !self.is_ptr_local(val)
                 {
                     if self.nonnull_ptrs.contains(&base_ptr) {
                         let _ = writeln!(s, "    {access} = {v};");
@@ -4220,6 +5714,25 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             let _ = writeln!(
                 s,
                 "    {d} = ({dst_cty})(((uint8_t*)&{p}) + {offset_bytes}u);"
+            );
+            return;
+        }
+
+        if let Some(MirType::Named(k)) = self
+            .slot_types
+            .get(&base_ptr)
+            .or_else(|| self.local_ty(base_ptr))
+            && let Some(tname) = k.strip_prefix("__strata_table_")
+            && let Some(tbl) = self.parent.mir.tables.iter().find(|tb| tb.name == tname)
+            && !field.is_empty()
+            && tbl.fields.iter().any(|(fnm, _)| fnm == field)
+        {
+            let fc = sanitize_c_field(field);
+            let t_ident = sanitize_ident(&tbl.name);
+            let tbl_cty = format!("StrataTable_{t_ident}");
+            let _ = writeln!(
+                s,
+                "    {d} = ({p} != NULL) ? ({dst_cty})&((({tbl_cty}*){p})->{fc}) : NULL;"
             );
             return;
         }
@@ -4518,9 +6031,22 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
             if let Some(&h_idx) = self.parent.helper_by_name.get(callee) {
                 let hf = &self.parent.mir_functions()[h_idx];
                 let h_name = format!("strata_fn_{}", sanitize_ident(&hf.name));
+                let resolved_params = self.parent.resolve_helper_param_tys(hf);
                 let mut call_args = vec!["state".to_string()];
-                for id in args {
-                    call_args.push(self.local_expr(*id));
+                for (pi, id) in args.iter().enumerate() {
+                    let arg_expr = if let Some(exp_ty) = resolved_params.get(pi)
+                        && !matches!(exp_ty, MirType::Ptr | MirType::MutPtr)
+                        && !self.parent.is_aggregate_mir_ty(exp_ty)
+                        && !self.is_ptr_local(*id)
+                        && self
+                            .local_ty(*id)
+                            .is_some_and(|at| at != exp_ty && !self.parent.is_aggregate_mir_ty(at))
+                    {
+                        self.coerce_local_to_mir_scalar(*id, exp_ty)
+                    } else {
+                        self.local_expr(*id)
+                    };
+                    call_args.push(arg_expr);
                 }
                 if matches!(hf.ret_ty, MirType::Unit) {
                     let _ = writeln!(s, "    {h_name}({});", call_args.join(", "));
@@ -4538,31 +6064,135 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                     }
                 }
                 "signum" => {
-                    let _ = writeln!(s, "    {de} = strata_signum_f32((float){});", a(0));
+                    let x = a(0);
+                    match dty {
+                        MirType::Fix32 => {
+                            let _ = writeln!(s, "    {de} = strata_signum_fix32((int32_t)({x}));");
+                        }
+                        MirType::Fix64 => {
+                            let _ = writeln!(s, "    {de} = strata_signum_fix64((int64_t)({x}));");
+                        }
+                        MirType::I8 | MirType::I16 | MirType::I32 => {
+                            let _ = writeln!(s, "    {de} = strata_signum_i32((int32_t)({x}));");
+                        }
+                        MirType::I64 => {
+                            let _ = writeln!(s, "    {de} = strata_signum_i64((int64_t)({x}));");
+                        }
+                        MirType::F64 => {
+                            let _ = writeln!(s, "    {de} = strata_signum_f64((double)({x}));");
+                        }
+                        _ => {
+                            let _ = writeln!(s, "    {de} = strata_signum_f32((float)({x}));");
+                        }
+                    }
                 }
                 "length_sq" => {
                     let t0 = args
                         .first()
-                        .and_then(|id| self.local_ty(*id))
-                        .cloned()
+                        .and_then(|id| self.effective_vec_ty(*id))
                         .unwrap_or(MirType::Vec2);
-                    if matches!(t0, MirType::Vec3) {
-                        let _ = writeln!(s, "    {de} = strata_vec3_len_sq({});", a(0));
-                    } else {
-                        let _ = writeln!(s, "    {de} = strata_vec2_len_sq({});", a(0));
+                    let x0 = args
+                        .first()
+                        .map(|id| self.unwrap_operand_expr(*id, Some(&t0)))
+                        .unwrap_or_else(|| "strata_vec2(0.0f, 0.0f)".to_string());
+                    match t0 {
+                        MirType::Vec3 => {
+                            let _ = writeln!(s, "    {de} = strata_vec3_len_sq({x0});");
+                        }
+                        MirType::Vec4 => {
+                            let _ = writeln!(s, "    {de} = strata_vec4_len_sq({x0});");
+                        }
+                        _ => {
+                            let _ = writeln!(s, "    {de} = strata_vec2_len_sq({x0});");
+                        }
                     }
                 }
                 "distance_sq" => {
                     let t0 = args
                         .first()
-                        .and_then(|id| self.local_ty(*id))
-                        .cloned()
+                        .and_then(|id| self.effective_vec_ty(*id))
                         .unwrap_or(MirType::Vec2);
-                    if matches!(t0, MirType::Vec3) {
-                        let _ = writeln!(s, "    {de} = strata_vec3_dist_sq({}, {});", a(0), a(1));
-                    } else {
-                        let _ = writeln!(s, "    {de} = strata_vec2_dist_sq({}, {});", a(0), a(1));
+                    let x0 = args
+                        .first()
+                        .map(|id| self.unwrap_operand_expr(*id, Some(&t0)))
+                        .unwrap_or_else(|| "strata_vec2(0.0f, 0.0f)".to_string());
+                    let x1 = args
+                        .get(1)
+                        .map(|id| self.unwrap_operand_expr(*id, Some(&t0)))
+                        .unwrap_or_else(|| "strata_vec2(0.0f, 0.0f)".to_string());
+                    match t0 {
+                        MirType::Vec3 => {
+                            let _ = writeln!(s, "    {de} = strata_vec3_dist_sq({x0}, {x1});");
+                        }
+                        MirType::Vec4 => {
+                            let _ = writeln!(s, "    {de} = strata_vec4_dist_sq({x0}, {x1});");
+                        }
+                        _ => {
+                            let _ = writeln!(s, "    {de} = strata_vec2_dist_sq({x0}, {x1});");
+                        }
                     }
+                }
+                "mat3" | "Mat3" => {
+                    let vals: Vec<String> = if args.len() == 9 {
+                        (0..9).map(|i| format!("(float)({})", a(i))).collect()
+                    } else if args.len() == 3 {
+                        (0..3)
+                            .flat_map(|i| {
+                                let c = args
+                                    .get(i)
+                                    .map(|id| self.unwrap_operand_expr(*id, Some(&MirType::Vec3)))
+                                    .unwrap_or_else(|| "strata_vec3(0.0f, 0.0f, 0.0f)".to_string());
+                                [format!("{c}.x"), format!("{c}.y"), format!("{c}.z")]
+                            })
+                            .collect()
+                    } else {
+                        vec![
+                            "1.0f", "0.0f", "0.0f", "0.0f", "1.0f", "0.0f", "0.0f", "0.0f", "1.0f",
+                        ]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                    };
+                    let _ = writeln!(
+                        s,
+                        "    {de} = ((StrataMat3){{ {{ {} }} }});",
+                        vals.join(", ")
+                    );
+                }
+                "mat4" | "Mat4" => {
+                    let vals: Vec<String> = if args.len() == 16 {
+                        (0..16).map(|i| format!("(float)({})", a(i))).collect()
+                    } else if args.len() == 4 {
+                        (0..4)
+                            .flat_map(|i| {
+                                let c = args
+                                    .get(i)
+                                    .map(|id| self.unwrap_operand_expr(*id, Some(&MirType::Vec4)))
+                                    .unwrap_or_else(|| {
+                                        "strata_vec4(0.0f, 0.0f, 0.0f, 0.0f)".to_string()
+                                    });
+                                [
+                                    format!("{c}.x"),
+                                    format!("{c}.y"),
+                                    format!("{c}.z"),
+                                    format!("{c}.w"),
+                                ]
+                            })
+                            .collect()
+                    } else {
+                        vec![
+                            "1.0f", "0.0f", "0.0f", "0.0f", "0.0f", "1.0f", "0.0f", "0.0f", "0.0f",
+                            "0.0f", "1.0f", "0.0f", "0.0f", "0.0f", "0.0f", "1.0f",
+                        ]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                    };
+                    let _ = writeln!(
+                        s,
+                        "    {de} = ((StrataMat4){{ {{ {} }} }});",
+                        vals.join(", ")
+                    );
                 }
                 "remap" => {
                     let v = a(0);
@@ -4627,13 +6257,24 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 }
             }
         } else if let Some(&h_idx) = self.parent.helper_by_name.get(callee) {
-            let h_name = format!(
-                "strata_fn_{}",
-                sanitize_ident(&self.parent.mir_functions()[h_idx].name)
-            );
+            let hf = &self.parent.mir_functions()[h_idx];
+            let h_name = format!("strata_fn_{}", sanitize_ident(&hf.name));
+            let resolved_params = self.parent.resolve_helper_param_tys(hf);
             let mut call_args = vec!["state".to_string()];
-            for id in args {
-                call_args.push(self.local_expr(*id));
+            for (pi, id) in args.iter().enumerate() {
+                let arg_expr = if let Some(exp_ty) = resolved_params.get(pi)
+                    && !matches!(exp_ty, MirType::Ptr | MirType::MutPtr)
+                    && !self.parent.is_aggregate_mir_ty(exp_ty)
+                    && !self.is_ptr_local(*id)
+                    && self
+                        .local_ty(*id)
+                        .is_some_and(|at| at != exp_ty && !self.parent.is_aggregate_mir_ty(at))
+                {
+                    self.coerce_local_to_mir_scalar(*id, exp_ty)
+                } else {
+                    self.local_expr(*id)
+                };
+                call_args.push(arg_expr);
             }
             let _ = writeln!(s, "    {h_name}({});", call_args.join(", "));
         }

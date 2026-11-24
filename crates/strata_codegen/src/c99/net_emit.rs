@@ -2,6 +2,16 @@
 
 use super::*;
 
+#[derive(Clone)]
+struct NetStratumSlot {
+    canonical: String,
+    comp_idx: usize,
+    layout_idx: usize,
+    cty: String,
+    is_sparse: bool,
+    is_zst: bool,
+}
+
 impl<'a> EmitCtx<'a> {
     pub(super) fn emit_net_protocol_and_codecs(&mut self) -> Result<(), CodegenError> {
         let mod_fp = self.mir.net_handshake.module_net_fingerprint;
@@ -62,14 +72,18 @@ static BAM_UNUSED inline uint64_t strata_net_quantize_scalar_f64(
     uint64_t max_q = (eff_bits == 32u)
         ? 0xFFFFFFFFull
         : ((eff_bits == 12u) ? 4095ull : ((1ull << eff_bits) - 1ull));
+    double levels = (double)(max_q > 0ull ? max_q : 1ull);
+    double diff = max_v - min_v;
     double eff_step = (has_step && isfinite(step_v) && step_v > 0.0)
         ? step_v
-        : ((max_v - min_v) / (double)(max_q > 0ull ? max_q : 1ull));
+        : (isfinite(diff) ? (diff / levels) : ((max_v / levels) - (min_v / levels)));
     if (!isfinite(eff_step) || eff_step <= 0.0) {{
         return 0ull;
     }}
     double clamped = isnan(val) ? min_v : ((val < min_v) ? min_v : ((val > max_v) ? max_v : val));
-    double rounded = round((clamped - min_v) / eff_step);
+    double span_val = clamped - min_v;
+    double q_f = isfinite(span_val) ? (span_val / eff_step) : ((clamped / eff_step) - (min_v / eff_step));
+    double rounded = round(q_f);
     if (!isfinite(rounded) || rounded <= 0.0) {{
         return 0ull;
     }}
@@ -91,13 +105,22 @@ static BAM_UNUSED inline double strata_net_dequantize_scalar_f64(
         ? 0xFFFFFFFFull
         : ((eff_bits == 12u) ? 4095ull : ((1ull << eff_bits) - 1ull));
     uint64_t q = raw & max_q;
+    double levels = (double)(max_q > 0ull ? max_q : 1ull);
+    double diff = max_v - min_v;
     double eff_step = (has_step && isfinite(step_v) && step_v > 0.0)
         ? step_v
-        : ((max_v - min_v) / (double)(max_q > 0ull ? max_q : 1ull));
+        : (isfinite(diff) ? (diff / levels) : ((max_v / levels) - (min_v / levels)));
     if (!isfinite(eff_step) || eff_step <= 0.0) {{
         return min_v;
     }}
-    double out = min_v + ((double)q * eff_step);
+    double step_off = (double)q * eff_step;
+    double out;
+    if (isfinite(step_off)) {{
+        out = min_v + step_off;
+    }} else {{
+        double half_off = (double)q * (eff_step * 0.5);
+        out = (min_v + half_off) + half_off;
+    }}
     if (out < min_v) {{ return min_v; }}
     if (out > max_v) {{ return max_v; }}
     return out;
@@ -259,6 +282,8 @@ static BAM_UNUSED inline bool strata_net_verify_handshake(
                     || key.contains("Rgba")
                 {
                     format!("StrataVec4 {field_name}")
+                } else if key.starts_with("BitSet<") || key.starts_with("InlineStr<") {
+                    format!("uint8_t {field_name}[{}]", byte_size.max(1))
                 } else if byte_size == 1 {
                     format!("uint8_t {field_name}")
                 } else if byte_size == 2 {
@@ -342,43 +367,47 @@ static BAM_UNUSED inline bool strata_net_verify_handshake(
             let cast_lane = |val_expr: &str| -> String {
                 match (&wf.ty, sema_ty) {
                     (MirType::F64, _) | (_, Some(Ty::F64)) => val_expr.to_string(),
-                    (MirType::I8, _) | (_, Some(Ty::I8)) => format!("(int8_t)round({val_expr})"),
-                    (MirType::I16, _) | (_, Some(Ty::I16)) => format!("(int16_t)round({val_expr})"),
+                    (MirType::I8, _) | (_, Some(Ty::I8)) => {
+                        format!("strata_f64_to_i8(round({val_expr}))")
+                    }
+                    (MirType::I16, _) | (_, Some(Ty::I16)) => {
+                        format!("strata_f64_to_i16(round({val_expr}))")
+                    }
                     (MirType::Fix32, _) | (_, Some(Ty::Fix32)) => {
-                        format!("(int32_t)round(({val_expr}) * 65536.0)")
+                        format!("strata_f64_to_fix32({val_expr})")
                     }
                     (MirType::I32, _) | (_, Some(Ty::I32)) => {
-                        format!("(int32_t)round({val_expr})")
+                        format!("strata_f64_to_i32(round({val_expr}))")
                     }
                     (MirType::Fix64, _) | (_, Some(Ty::Fix64)) => {
-                        format!("(int64_t)round(({val_expr}) * 4294967296.0)")
+                        format!("strata_f64_to_fix64({val_expr})")
                     }
                     (MirType::I64, _) | (_, Some(Ty::I64)) => {
-                        format!("(int64_t)round({val_expr})")
+                        format!("strata_f64_to_i64(round({val_expr}))")
                     }
                     (MirType::U8, _) | (_, Some(Ty::U8)) => {
-                        format!("(uint8_t)fmax(0.0, round({val_expr}))")
+                        format!("strata_f64_to_u8(round({val_expr}))")
                     }
                     (MirType::U16, _) | (_, Some(Ty::U16)) => {
-                        format!("(uint16_t)fmax(0.0, round({val_expr}))")
+                        format!("strata_f64_to_u16(round({val_expr}))")
                     }
                     (MirType::U32, _) | (_, Some(Ty::U32)) => {
-                        format!("(uint32_t)fmax(0.0, round({val_expr}))")
+                        format!("strata_f64_to_u32(round({val_expr}))")
                     }
                     (MirType::U64, _) | (_, Some(Ty::U64)) => {
-                        format!("(uint64_t)fmax(0.0, round({val_expr}))")
+                        format!("strata_f64_to_u64(round({val_expr}))")
                     }
                     (MirType::IVec2 | MirType::IVec3, _) | (_, Some(Ty::IVec2 | Ty::IVec3)) => {
-                        format!("(int32_t)round({val_expr})")
+                        format!("strata_f64_to_i32(round({val_expr}))")
                     }
                     (MirType::Named(k), _) if k.contains("IVec") => {
-                        format!("(int32_t)round({val_expr})")
+                        format!("strata_f64_to_i32(round({val_expr}))")
                     }
                     (MirType::Named(k), _) if k.contains("UVec") => {
-                        format!("(uint32_t)fmax(0.0, round({val_expr}))")
+                        format!("strata_f64_to_u32(round({val_expr}))")
                     }
                     (MirType::UVec2, _) | (_, Some(Ty::UVec2)) => {
-                        format!("(uint32_t)fmax(0.0, round({val_expr}))")
+                        format!("strata_f64_to_u32(round({val_expr}))")
                     }
                     _ => format!("(float)({val_expr})"),
                 }
@@ -411,17 +440,120 @@ static BAM_UNUSED inline bool strata_net_verify_handshake(
         }
     }
 
+    fn resolve_net_strata(&self, nc: &MirNetComponent) -> Option<Vec<NetStratumSlot>> {
+        let hot_c_idx = self.find_comp_idx(&nc.canonical_name)?;
+        let hot_l_idx = self.components[hot_c_idx].layout_idx?;
+        let mut strata = vec![NetStratumSlot {
+            canonical: nc.canonical_name.clone(),
+            comp_idx: hot_c_idx,
+            layout_idx: hot_l_idx,
+            cty: self.layout_c_names[hot_l_idx].clone(),
+            is_sparse: (self.layouts[hot_l_idx].component_flags
+                & bamabi_sys::BAM_COMPONENT_FLAG_SPARSE_SET)
+                != 0,
+            is_zst: self.layouts[hot_l_idx].size == 0,
+        }];
+        for wf in &nc.wire_fields {
+            if let Some(ref sname) = wf.stratum_layout
+                && !strata.iter().any(|s| s.canonical == *sname)
+                && let Some(c_idx) = self.find_comp_idx(sname)
+                && let Some(l_idx) = self.components[c_idx].layout_idx
+            {
+                strata.push(NetStratumSlot {
+                    canonical: sname.clone(),
+                    comp_idx: c_idx,
+                    layout_idx: l_idx,
+                    cty: self.layout_c_names[l_idx].clone(),
+                    is_sparse: (self.layouts[l_idx].component_flags
+                        & bamabi_sys::BAM_COMPONENT_FLAG_SPARSE_SET)
+                        != 0,
+                    is_zst: self.layouts[l_idx].size == 0,
+                });
+            }
+        }
+        Some(strata)
+    }
+
+    fn resolve_net_field_path(&self, root_l_idx: usize, field_name: &str) -> Option<(String, Ty)> {
+        let mut cur_l = root_l_idx;
+        let parts: Vec<&str> = field_name.split('.').collect();
+        let mut c_parts = Vec::with_capacity(parts.len());
+        for (pi, seg) in parts.iter().enumerate() {
+            let sf = self.layouts[cur_l]
+                .fields
+                .iter()
+                .find(|f| !f.is_padding && f.name == *seg)?;
+            c_parts.push(sanitize_c_field(seg));
+            if pi + 1 == parts.len() {
+                return Some((c_parts.join("."), sf.ty.clone()));
+            }
+            if let Ty::Named(ref inner) = sf.ty {
+                cur_l = self.find_layout_idx(inner)?;
+            } else {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn resolve_rpc_net_field(
+        &self,
+        rpc: &MirRpc,
+        field_name: &str,
+    ) -> Option<(String, Option<Ty>)> {
+        let parts: Vec<&str> = field_name.split('.').collect();
+        let first = *parts.first()?;
+        let (_, mty, _, _) = rpc.fields.iter().find(|(n, _, _, _)| n == first)?;
+        if parts.len() == 1 {
+            return Some((sanitize_c_field(first), None));
+        }
+        let MirType::Named(key) = mty else {
+            return None;
+        };
+        let sub_l_idx = self.find_layout_idx(key)?;
+        let (sub_path, sub_ty) = self.resolve_net_field_path(sub_l_idx, &parts[1..].join("."))?;
+        Some((
+            format!("{}.{sub_path}", sanitize_c_field(first)),
+            Some(sub_ty),
+        ))
+    }
+
+    fn net_comp_chunks(&self, rep_comps: &[MirNetComponent]) -> Vec<Vec<MirNetComponent>> {
+        let query_cap = MAX_QUERIES_PER_SYSTEM.saturating_sub(1).max(1);
+        let mut chunks: Vec<Vec<MirNetComponent>> = Vec::new();
+        let mut cur_chunk: Vec<MirNetComponent> = Vec::new();
+        let mut cur_queries = 0usize;
+        for nc in rep_comps {
+            let q_cost = if nc.is_resource {
+                0usize
+            } else {
+                self.resolve_net_strata(nc).map_or(1, |s| s.len().max(1))
+            };
+            if !cur_chunk.is_empty()
+                && (cur_queries + q_cost > query_cap || cur_chunk.len() >= query_cap)
+            {
+                chunks.push(std::mem::take(&mut cur_chunk));
+                cur_queries = 0;
+            }
+            cur_queries += q_cost;
+            cur_chunk.push(nc.clone());
+        }
+        if !cur_chunk.is_empty() {
+            chunks.push(cur_chunk);
+        }
+        chunks
+    }
+
     pub(super) fn emit_c99_net_component_codec(
         &mut self,
         nc: &MirNetComponent,
     ) -> Result<(), CodegenError> {
-        let Some(l_idx) = self.find_layout_idx(&nc.canonical_name) else {
+        let Some(strata) = self.resolve_net_strata(nc) else {
             return Err(CodegenError::Unsupported {
                 context: format!("c99::net_component({})", nc.canonical_name),
                 detail: "missing solved layout for network component".to_owned(),
             });
         };
-        let cty = self.layout_c_names[l_idx].clone();
         let ident = sanitize_ident(&nc.name);
         let fp = nc.schema_fingerprint;
         let target_id = fnv1a_64_str(&nc.canonical_name);
@@ -446,11 +578,33 @@ static BAM_UNUSED inline bool strata_net_verify_handshake(
             flags_parts.join(" | ")
         };
 
+        let is_soa = strata.len() > 1;
+        let enc_params = if is_soa {
+            strata
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("const {}* s_{i}", s.cty))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            format!("const {}* src", strata[0].cty)
+        };
+        let enc_null_guard = if is_soa {
+            strata
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("s_{i} == NULL"))
+                .collect::<Vec<_>>()
+                .join(" || ")
+        } else {
+            "src == NULL".to_string()
+        };
+
         let _ = writeln!(
             self.out,
             "\
 static BAM_UNUSED inline void strata_net_encode_{ident}(
-    const {cty}* src, uint64_t entity_bits, uint32_t tick_or_seq, uint8_t client_id, StrataNetPacket* out_pkt
+    {enc_params}, uint64_t entity_bits, uint32_t tick_or_seq, uint8_t client_id, StrataNetPacket* out_pkt
 ) {{
     if (out_pkt == NULL) {{ return; }}
     memset(out_pkt, 0, sizeof(*out_pkt));
@@ -467,34 +621,67 @@ static BAM_UNUSED inline void strata_net_encode_{ident}(
     out_pkt->channel = {ch}u;
     out_pkt->payload_bytes = {pbytes}u;
     out_pkt->client_id = client_id;
-    if (src == NULL) {{ return; }}",
+    if ({enc_null_guard}) {{ return; }}",
             pbits = nc.packed_bits,
             ch = nc.channel,
             pbytes = nc.packed_bytes,
         );
-        let layout_fields = self.layouts[l_idx].fields.clone();
         for wf in &nc.wire_fields {
-            if !layout_fields.iter().any(|sf| sf.name == wf.field_name) {
-                return Err(CodegenError::Unsupported {
+            let sname = wf.stratum_layout.as_deref().unwrap_or(&nc.canonical_name);
+            let (slot_idx, slot) = strata
+                .iter()
+                .enumerate()
+                .find(|(_, s)| s.canonical == sname)
+                .ok_or_else(|| CodegenError::Unsupported {
+                    context: format!("c99::net_component({})", nc.canonical_name),
+                    detail: format!("stratum layout `{sname}` missing from component strata"),
+                })?;
+            let (field_c, _) = self
+                .resolve_net_field_path(slot.layout_idx, &wf.field_name)
+                .ok_or_else(|| CodegenError::Unsupported {
                     context: format!("c99::net_component({})", nc.canonical_name),
                     detail: format!(
                         "wire field `{}` missing from solved layout `{}`",
-                        wf.field_name, self.layouts[l_idx].canonical_name
+                        wf.field_name, self.layouts[slot.layout_idx].canonical_name
                     ),
-                });
-            }
-            let fc = sanitize_c_field(&wf.field_name);
-            self.emit_c99_wire_field_encode(wf, &fc, "src");
+                })?;
+            let src_var = if is_soa {
+                format!("s_{slot_idx}")
+            } else {
+                "src".to_string()
+            };
+            self.emit_c99_wire_field_encode(wf, &field_c, &src_var);
         }
         let _ = writeln!(self.out, "}}\n");
+
+        let dec_params = if is_soa {
+            strata
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("{}* s_{i}", s.cty))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            format!("{}* out_val", strata[0].cty)
+        };
+        let dec_null_guard = if is_soa {
+            strata
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("s_{i} == NULL"))
+                .collect::<Vec<_>>()
+                .join(" || ")
+        } else {
+            "out_val == NULL".to_string()
+        };
 
         let _ = writeln!(
             self.out,
             "\
 static BAM_UNUSED inline bool strata_net_decode_{ident}(
-    const StrataNetPacket* pkt, {cty}* out_val
+    const StrataNetPacket* pkt, {dec_params}
 ) {{
-    if (pkt == NULL || out_val == NULL) {{
+    if (pkt == NULL || {dec_null_guard}) {{
         return false;
     }}
     if (!strata_net_verify_handshake(pkt, 0x{fp:016X}ull) || pkt->item_schema_fingerprint != 0x{fp:016X}ull) {{
@@ -512,18 +699,30 @@ static BAM_UNUSED inline bool strata_net_decode_{ident}(
             );
         }
         for wf in &nc.wire_fields {
-            let Some(sf) = layout_fields.iter().find(|sf| sf.name == wf.field_name) else {
-                return Err(CodegenError::Unsupported {
+            let sname = wf.stratum_layout.as_deref().unwrap_or(&nc.canonical_name);
+            let (slot_idx, slot) = strata
+                .iter()
+                .enumerate()
+                .find(|(_, s)| s.canonical == sname)
+                .ok_or_else(|| CodegenError::Unsupported {
+                    context: format!("c99::net_component({})", nc.canonical_name),
+                    detail: format!("stratum layout `{sname}` missing from component strata"),
+                })?;
+            let (field_c, sty) = self
+                .resolve_net_field_path(slot.layout_idx, &wf.field_name)
+                .ok_or_else(|| CodegenError::Unsupported {
                     context: format!("c99::net_component({})", nc.canonical_name),
                     detail: format!(
                         "wire field `{}` missing from solved layout `{}`",
-                        wf.field_name, self.layouts[l_idx].canonical_name
+                        wf.field_name, self.layouts[slot.layout_idx].canonical_name
                     ),
-                });
+                })?;
+            let dst_var = if is_soa {
+                format!("s_{slot_idx}")
+            } else {
+                "out_val".to_string()
             };
-            let fc = sanitize_c_field(&wf.field_name);
-            let sty = sf.ty.clone();
-            self.emit_c99_wire_field_decode(wf, &fc, "out_val", Some(&sty));
+            self.emit_c99_wire_field_decode(wf, &field_c, &dst_var, Some(&sty));
         }
         let _ = writeln!(self.out, "    return true;\n}}\n");
         Ok(())
@@ -594,13 +793,12 @@ static BAM_UNUSED inline void strata_net_encode_rpc_{ident}(
             pbytes = rpc.packed_bytes,
         );
         for wf in &rpc.wire_fields {
-            if !rpc.fields.iter().any(|(n, _, _, _)| n == &wf.field_name) {
+            let Some((fc, _)) = self.resolve_rpc_net_field(rpc, &wf.field_name) else {
                 return Err(CodegenError::Unsupported {
                     context: format!("c99::rpc({})", rpc.canonical_name),
                     detail: format!("wire field `{}` missing from RPC payload", wf.field_name),
                 });
-            }
-            let fc = sanitize_c_field(&wf.field_name);
+            };
             self.emit_c99_wire_field_encode(wf, &fc, "rpc");
         }
         let _ = writeln!(self.out, "}}\n");
@@ -629,14 +827,13 @@ static BAM_UNUSED inline bool strata_net_decode_rpc_{ident}(
             );
         }
         for wf in &rpc.wire_fields {
-            if !rpc.fields.iter().any(|(n, _, _, _)| n == &wf.field_name) {
+            let Some((fc, sty)) = self.resolve_rpc_net_field(rpc, &wf.field_name) else {
                 return Err(CodegenError::Unsupported {
                     context: format!("c99::rpc({})", rpc.canonical_name),
                     detail: format!("wire field `{}` missing from RPC payload", wf.field_name),
                 });
-            }
-            let fc = sanitize_c_field(&wf.field_name);
-            self.emit_c99_wire_field_decode(wf, &fc, "out_rpc", None);
+            };
+            self.emit_c99_wire_field_decode(wf, &fc, "out_rpc", sty.as_ref());
         }
         let _ = writeln!(self.out, "    return true;\n}}\n");
         Ok(())
@@ -653,8 +850,8 @@ static BAM_UNUSED inline bool strata_net_decode_rpc_{ident}(
         if rep_comps.is_empty() {
             return;
         }
-        let max_per_sys = MAX_QUERIES_PER_SYSTEM.saturating_sub(1).max(1);
-        for (chunk_idx, chunk) in rep_comps.chunks(max_per_sys).enumerate() {
+        let chunks = self.net_comp_chunks(&rep_comps);
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
             // RX system
             let _ = writeln!(
                 self.out,
@@ -681,14 +878,13 @@ static BAM_UNUSED BamResult strata_sys_net_rx_{chunk_idx}(BamSystemCtx* sys_ctx,
             );
             let mut entity_q_idx = 1u32;
             for nc in chunk {
-                let Some(c_idx) = self.find_comp_idx(&nc.canonical_name) else {
+                let Some(strata) = self.resolve_net_strata(nc) else {
                     continue;
                 };
-                let Some(l_idx) = self.components[c_idx].layout_idx else {
-                    continue;
-                };
-                let cty = self.layout_c_names[l_idx].clone();
-                let is_zst = self.layouts[l_idx].size == 0;
+                let c_idx = strata[0].comp_idx;
+                let cty = strata[0].cty.clone();
+                let is_zst = strata[0].is_zst;
+                let has_mod_res = self.components[c_idx].has_mod_res;
                 let ident = sanitize_ident(&nc.name);
                 let target_id = fnv1a_64_str(&nc.canonical_name);
                 if nc.is_resource {
@@ -698,10 +894,24 @@ static BAM_UNUSED BamResult strata_sys_net_rx_{chunk_idx}(BamSystemCtx* sys_ctx,
                             "        if (state->res_flags[{c_idx}] == 1u) {{ /* ZST resource: skip 1-byte column read */ }}"
                         );
                     } else {
+                        let mod_res_else = if has_mod_res {
+                            format!(
+                                " else if (state->res_flags[{c_idx}] == 0u) {{\n                rptr = &state->mod_res_{c_idx};\n            }}"
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let mod_shadow_sync = if has_mod_res {
+                            format!(
+                                "\n                        if (state->res_flags[{c_idx}] == 0u) {{ state->mod_res_shadow_{c_idx} = tmp; }}"
+                            )
+                        } else {
+                            String::new()
+                        };
                         let _ = writeln!(
                             self.out,
                             "\
-        if (state->res_flags[{c_idx}] == 1u && state->api->sys_res_mut_ptr != NULL) {{
+        {{
             size_t pi;
             const StrataNetPacket* last_pkt = NULL;
             for (pi = 0u; pi < got; ++pi) {{
@@ -710,11 +920,14 @@ static BAM_UNUSED BamResult strata_sys_net_rx_{chunk_idx}(BamSystemCtx* sys_ctx,
                 }}
             }}
             if (last_pkt != NULL) {{
-                {cty}* rptr = ({cty}*)state->api->sys_res_mut_ptr(sys_ctx, state->components[{c_idx}], NULL);
+                {cty}* rptr = NULL;
+                if (state->res_flags[{c_idx}] == 1u && state->api->sys_res_mut_ptr != NULL) {{
+                    rptr = ({cty}*)state->api->sys_res_mut_ptr(sys_ctx, state->components[{c_idx}], NULL);
+                }}{mod_res_else}
                 if (rptr != NULL) {{
                     {cty} tmp = *rptr;
                     if (strata_net_decode_{ident}(last_pkt, &tmp) && memcmp(&tmp, rptr, sizeof(tmp)) != 0) {{
-                        *rptr = tmp;
+                        *rptr = tmp;{mod_shadow_sync}
                     }}
                 }}
             }}
@@ -724,9 +937,6 @@ static BAM_UNUSED BamResult strata_sys_net_rx_{chunk_idx}(BamSystemCtx* sys_ctx,
                 } else {
                     let qi = entity_q_idx;
                     entity_q_idx += 1;
-                    let is_sparse = (self.layouts[l_idx].component_flags
-                        & bamabi_sys::BAM_COMPONENT_FLAG_SPARSE_SET)
-                        != 0;
                     let _ = writeln!(
                         self.out,
                         "\
@@ -747,7 +957,16 @@ static BAM_UNUSED BamResult strata_sys_net_rx_{chunk_idx}(BamSystemCtx* sys_ctx,
                     while (state->api->iter_next_chunk(q_it, &clen) != BAM_FALSE && clen > 0u) {{
                         const BamEntity* ents = state->api->iter_entities(q_it);"
                     );
-                    if is_zst {
+                    if strata.iter().all(|s| s.is_zst) {
+                        let dec_decls: Vec<String> = strata
+                            .iter()
+                            .enumerate()
+                            .map(|(k, s)| {
+                                format!("{} tmp_{k}; memset(&tmp_{k}, 0, sizeof(tmp_{k}));", s.cty)
+                            })
+                            .collect();
+                        let dec_args: Vec<String> =
+                            (0..strata.len()).map(|k| format!("&tmp_{k}")).collect();
                         let _ = writeln!(
                             self.out,
                             "\
@@ -761,45 +980,62 @@ static BAM_UNUSED BamResult strata_sys_net_rx_{chunk_idx}(BamSystemCtx* sys_ctx,
                                     }}
                                 }}
                                 if (last_pkt != NULL) {{
-                                    {cty} tmp;
-                                    memset(&tmp, 0, sizeof(tmp));
-                                    (void)strata_net_decode_{ident}(last_pkt, &tmp);
+                                    {decls}
+                                    (void)strata_net_decode_{ident}(last_pkt, {args});
                                 }}
                             }}
-                        }}"
-                        );
-                    } else if is_sparse {
-                        let _ = writeln!(
-                            self.out,
-                            "\
-                        {cty}* const* rows = (state->api->iter_column_rows_mutable != NULL) ? ({cty}* const*)state->api->iter_column_rows_mutable(q_it, 0u) : NULL;
-                        if (ents != NULL && rows != NULL) {{
-                            size_t row;
-                            for (row = 0u; row < clen; ++row) {{
-                                const StrataNetPacket* last_pkt = NULL;
-                                for (pi = 0u; pi < got; ++pi) {{
-                                    if (pkts[pi].kind == STRATA_NET_KIND_COMPONENT_DELTA && pkts[pi].target_id == 0x{target_id:016X}ull && pkts[pi].entity_bits == (uint64_t)ents[row]) {{
-                                        last_pkt = &pkts[pi];
-                                    }}
-                                }}
-                                if (last_pkt != NULL && rows[row] != NULL) {{
-                                    {cty} tmp = *rows[row];
-                                    if (strata_net_decode_{ident}(last_pkt, &tmp) && memcmp(&tmp, rows[row], sizeof(tmp)) != 0) {{
-                                        *rows[row] = tmp;
-                                        if (state->api->iter_mark_changed_range != NULL) {{
-                                            (void)state->api->iter_mark_changed_range(q_it, 0u, row, 1u);
-                                        }}
-                                    }}
-                                }}
-                            }}
-                        }}"
+                        }}",
+                            decls = dec_decls.join(" "),
+                            args = dec_args.join(", "),
                         );
                     } else {
+                        let mut ptr_guards = vec!["ents != NULL".to_string()];
+                        let mut row_guards = Vec::new();
+                        let mut tmp_inits = Vec::new();
+                        let mut dec_args = Vec::new();
+                        let mut write_backs = Vec::new();
+                        for (k, s) in strata.iter().enumerate() {
+                            let scty = &s.cty;
+                            if s.is_zst {
+                                tmp_inits.push(format!(
+                                    "{scty} tmp_{k}; memset(&tmp_{k}, 0, sizeof(tmp_{k}));"
+                                ));
+                                dec_args.push(format!("&tmp_{k}"));
+                                continue;
+                            }
+                            if s.is_sparse {
+                                let _ = writeln!(
+                                    self.out,
+                                    "                        {scty}* const* rows_{k} = (state->api->iter_column_rows_mutable != NULL) ? ({scty}* const*)state->api->iter_column_rows_mutable(q_it, {k}u) : NULL;"
+                                );
+                                ptr_guards.push(format!("rows_{k} != NULL"));
+                                row_guards.push(format!("rows_{k}[row] != NULL"));
+                                tmp_inits.push(format!("{scty} tmp_{k} = *rows_{k}[row];"));
+                                write_backs.push(format!(
+                                    "if (memcmp(&tmp_{k}, rows_{k}[row], sizeof(tmp_{k})) != 0) {{ *rows_{k}[row] = tmp_{k}; if (state->api->iter_mark_changed_range != NULL) {{ (void)state->api->iter_mark_changed_range(q_it, {k}u, row, 1u); }} }}"
+                                ));
+                            } else {
+                                let _ = writeln!(
+                                    self.out,
+                                    "                        {scty}* col_{k} = (state->api->iter_column_mutable_untracked != NULL) ? ({scty}*)state->api->iter_column_mutable_untracked(q_it, {k}u) : NULL;"
+                                );
+                                ptr_guards.push(format!("col_{k} != NULL"));
+                                tmp_inits.push(format!("{scty} tmp_{k} = col_{k}[row];"));
+                                write_backs.push(format!(
+                                    "if (memcmp(&tmp_{k}, &col_{k}[row], sizeof(tmp_{k})) != 0) {{ col_{k}[row] = tmp_{k}; if (state->api->iter_mark_changed_range != NULL) {{ (void)state->api->iter_mark_changed_range(q_it, {k}u, row, 1u); }} }}"
+                                ));
+                            }
+                            dec_args.push(format!("&tmp_{k}"));
+                        }
+                        let full_row_guard = if row_guards.is_empty() {
+                            "last_pkt != NULL".to_string()
+                        } else {
+                            format!("last_pkt != NULL && {}", row_guards.join(" && "))
+                        };
                         let _ = writeln!(
                             self.out,
                             "\
-                        {cty}* col = (state->api->iter_column_mutable_untracked != NULL) ? ({cty}*)state->api->iter_column_mutable_untracked(q_it, 0u) : NULL;
-                        if (ents != NULL && col != NULL) {{
+                        if ({ptr_guard}) {{
                             size_t row;
                             for (row = 0u; row < clen; ++row) {{
                                 const StrataNetPacket* last_pkt = NULL;
@@ -808,17 +1044,18 @@ static BAM_UNUSED BamResult strata_sys_net_rx_{chunk_idx}(BamSystemCtx* sys_ctx,
                                         last_pkt = &pkts[pi];
                                     }}
                                 }}
-                                if (last_pkt != NULL) {{
-                                    {cty} tmp = col[row];
-                                    if (strata_net_decode_{ident}(last_pkt, &tmp) && memcmp(&tmp, &col[row], sizeof(tmp)) != 0) {{
-                                        col[row] = tmp;
-                                        if (state->api->iter_mark_changed_range != NULL) {{
-                                            (void)state->api->iter_mark_changed_range(q_it, 0u, row, 1u);
-                                        }}
+                                if ({full_row_guard}) {{
+                                    {tmp_init}
+                                    if (strata_net_decode_{ident}(last_pkt, {dec_arg})) {{
+                                        {write_back}
                                     }}
                                 }}
                             }}
-                        }}"
+                        }}",
+                            ptr_guard = ptr_guards.join(" && "),
+                            tmp_init = tmp_inits.join(" "),
+                            dec_arg = dec_args.join(", "),
+                            write_back = write_backs.join(" "),
                         );
                     }
                     let _ = writeln!(
@@ -857,17 +1094,24 @@ static BAM_UNUSED BamResult strata_sys_net_tx_{chunk_idx}(BamSystemCtx* sys_ctx,
             );
             let mut tx_q_idx = 1u32;
             for nc in chunk {
-                let Some(c_idx) = self.find_comp_idx(&nc.canonical_name) else {
+                let Some(strata) = self.resolve_net_strata(nc) else {
                     continue;
                 };
-                let Some(l_idx) = self.components[c_idx].layout_idx else {
-                    continue;
-                };
-                let cty = self.layout_c_names[l_idx].clone();
-                let is_zst = self.layouts[l_idx].size == 0;
+                let c_idx = strata[0].comp_idx;
+                let cty = strata[0].cty.clone();
+                let is_zst = strata[0].is_zst;
+                let has_mod_res = self.components[c_idx].has_mod_res;
                 let ident = sanitize_ident(&nc.name);
+                let target_id = fnv1a_64_str(&nc.canonical_name);
                 if nc.is_resource {
                     let src_arg = if is_zst { "NULL" } else { "rptr" };
+                    let mod_tx = if has_mod_res && !is_zst {
+                        format!(
+                            " else if (state->res_flags[{c_idx}] == 0u) {{\n        if (memcmp(&state->mod_res_{c_idx}, &state->mod_res_shadow_{c_idx}, sizeof(state->mod_res_{c_idx})) != 0) {{\n            state->mod_res_shadow_{c_idx} = state->mod_res_{c_idx};\n            strata_net_encode_{ident}(&state->mod_res_{c_idx}, 0ull, 0u, 0u, &out_pkts[out_n++]);\n            if (out_n == 64u) {{\n                (void)state->api->msg_write_batch(msg_it, 0u, (const uint8_t*)out_pkts, out_n);\n                out_n = 0u;\n            }}\n        }}\n    }}"
+                        )
+                    } else {
+                        String::new()
+                    };
                     let _ = writeln!(
                         self.out,
                         "\
@@ -882,17 +1126,16 @@ static BAM_UNUSED BamResult strata_sys_net_tx_{chunk_idx}(BamSystemCtx* sys_ctx,
                 out_n = 0u;
             }}
         }}
-    }}"
+    }}{mod_tx}"
                     );
                 } else {
-                    let qi = tx_q_idx;
-                    tx_q_idx += 1;
-                    let is_sparse = (self.layouts[l_idx].component_flags
-                        & bamabi_sys::BAM_COMPONENT_FLAG_SPARSE_SET)
-                        != 0;
-                    let _ = writeln!(
-                        self.out,
-                        "\
+                    let is_soa = strata.len() > 1;
+                    for _trig_k in 0..strata.len() {
+                        let qi = tx_q_idx;
+                        tx_q_idx += 1;
+                        let _ = writeln!(
+                            self.out,
+                            "\
     if (state->api->iter_next_chunk != NULL && state->api->iter_entities != NULL) {{
         BamIter* q_it = NULL;
         if (state->api->sys_query(sys_ctx, {qi}u, &q_it) == BAM_RESULT_OK && q_it != NULL) {{
@@ -900,64 +1143,67 @@ static BAM_UNUSED BamResult strata_sys_net_tx_{chunk_idx}(BamSystemCtx* sys_ctx,
             size_t clen = 0u;
             while (state->api->iter_next_chunk(q_it, &clen) != BAM_FALSE && clen > 0u) {{
                 const BamEntity* ents = state->api->iter_entities(q_it);"
-                    );
-                    if is_zst {
+                        );
+                        let mut ptr_guards = vec!["ents != NULL".to_string()];
+                        let mut row_guards = Vec::new();
+                        let mut enc_args = Vec::new();
+                        for (j, s) in strata.iter().enumerate() {
+                            if s.is_zst {
+                                enc_args.push("NULL".to_string());
+                                continue;
+                            }
+                            let scty = &s.cty;
+                            if s.is_sparse {
+                                let _ = writeln!(
+                                    self.out,
+                                    "                const {scty}* const* rows_{j} = (state->api->iter_column_rows_readonly != NULL) ? (const {scty}* const*)state->api->iter_column_rows_readonly(q_it, {j}u) : NULL;"
+                                );
+                                ptr_guards.push(format!("rows_{j} != NULL"));
+                                row_guards.push(format!("rows_{j}[row] != NULL"));
+                                enc_args.push(format!("rows_{j}[row]"));
+                            } else {
+                                let _ = writeln!(
+                                    self.out,
+                                    "                const {scty}* col_{j} = (state->api->iter_column_readonly != NULL) ? (const {scty}*)state->api->iter_column_readonly(q_it, {j}u) : NULL;"
+                                );
+                                ptr_guards.push(format!("col_{j} != NULL"));
+                                enc_args.push(format!("&col_{j}[row]"));
+                            }
+                        }
+                        let dup_check = if is_soa {
+                            format!(
+                                "bool dup = false; size_t di; for (di = 0u; di < out_n; ++di) {{ if (out_pkts[di].target_id == 0x{target_id:016X}ull && out_pkts[di].entity_bits == (uint64_t)ents[row]) {{ dup = true; break; }} }} if (!dup) {{ strata_net_encode_{ident}({args}, (uint64_t)ents[row], 0u, 0u, &out_pkts[out_n++]); }}",
+                                args = enc_args.join(", "),
+                            )
+                        } else {
+                            format!(
+                                "strata_net_encode_{ident}({args}, (uint64_t)ents[row], 0u, 0u, &out_pkts[out_n++]);",
+                                args = enc_args.join(", "),
+                            )
+                        };
+                        let emit_stmt = format!(
+                            "{dup_check}\n                        if (out_n == 64u) {{ (void)state->api->msg_write_batch(msg_it, 0u, (const uint8_t*)out_pkts, out_n); out_n = 0u; }}"
+                        );
+                        let guarded_stmt = if row_guards.is_empty() {
+                            emit_stmt
+                        } else {
+                            format!("if ({}) {{ {emit_stmt} }}", row_guards.join(" && "))
+                        };
                         let _ = writeln!(
                             self.out,
                             "\
-                if (ents != NULL) {{
+                if ({ptr_guard}) {{
                     size_t row;
                     for (row = 0u; row < clen; ++row) {{
-                        strata_net_encode_{ident}(NULL, (uint64_t)ents[row], 0u, 0u, &out_pkts[out_n++]);
-                        if (out_n == 64u) {{
-                            (void)state->api->msg_write_batch(msg_it, 0u, (const uint8_t*)out_pkts, out_n);
-                            out_n = 0u;
-                        }}
+                        {guarded_stmt}
                     }}
-                }}"
-                        );
-                    } else if is_sparse {
-                        let _ = writeln!(
-                            self.out,
-                            "\
-                const {cty}* const* rows = (state->api->iter_column_rows_readonly != NULL) ? (const {cty}* const*)state->api->iter_column_rows_readonly(q_it, 0u) : NULL;
-                if (ents != NULL && rows != NULL) {{
-                    size_t row;
-                    for (row = 0u; row < clen; ++row) {{
-                        if (rows[row] != NULL) {{
-                            strata_net_encode_{ident}(rows[row], (uint64_t)ents[row], 0u, 0u, &out_pkts[out_n++]);
-                            if (out_n == 64u) {{
-                                (void)state->api->msg_write_batch(msg_it, 0u, (const uint8_t*)out_pkts, out_n);
-                                out_n = 0u;
-                            }}
-                        }}
-                    }}
-                }}"
-                        );
-                    } else {
-                        let _ = writeln!(
-                            self.out,
-                            "\
-                const {cty}* col = (state->api->iter_column_readonly != NULL) ? (const {cty}*)state->api->iter_column_readonly(q_it, 0u) : NULL;
-                if (ents != NULL && col != NULL) {{
-                    size_t row;
-                    for (row = 0u; row < clen; ++row) {{
-                        strata_net_encode_{ident}(&col[row], (uint64_t)ents[row], 0u, 0u, &out_pkts[out_n++]);
-                        if (out_n == 64u) {{
-                            (void)state->api->msg_write_batch(msg_it, 0u, (const uint8_t*)out_pkts, out_n);
-                            out_n = 0u;
-                        }}
-                    }}
-                }}"
-                        );
-                    }
-                    let _ = writeln!(
-                        self.out,
-                        "\
+                }}
             }}
         }}
-    }}"
-                    );
+    }}",
+                            ptr_guard = ptr_guards.join(" && "),
+                        );
+                    }
                 }
             }
             let _ = writeln!(
@@ -1040,9 +1286,9 @@ static BAM_UNUSED BamResult strata_sys_net_tx_{chunk_idx}(BamSystemCtx* sys_ctx,
         if rep_comps.is_empty() {
             return;
         }
-        let max_per_sys = MAX_QUERIES_PER_SYSTEM.saturating_sub(1).max(1);
-        let chunk_count = rep_comps.chunks(max_per_sys).len();
-        for (chunk_idx, chunk) in rep_comps.chunks(max_per_sys).enumerate() {
+        let chunks = self.net_comp_chunks(&rep_comps);
+        let chunk_count = chunks.len();
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
             let sys_name = if is_rx {
                 format!("__strata_net_rx_{chunk_idx}")
             } else {
@@ -1063,25 +1309,45 @@ static BAM_UNUSED BamResult strata_sys_net_tx_{chunk_idx}(BamSystemCtx* sys_ctx,
             } else {
                 "BAM_ACCESS_RESOURCE_READ"
             };
-            let comp_mode = if is_rx {
-                "BAM_ACCESS_WRITE"
-            } else {
-                "BAM_ACCESS_CHANGED"
-            };
             let _ = writeln!(self.out, "    if (state->net_pkt_is_msg != 0u) {{");
             let mut res_indices = Vec::new();
-            let mut comp_indices = Vec::new();
+            let mut entity_queries: Vec<Vec<(usize, &str)>> = Vec::new();
             for nc in chunk {
-                if let Some(c_idx) = self.find_comp_idx(&nc.canonical_name) {
-                    if nc.is_resource {
-                        res_indices.push(c_idx);
-                    } else {
-                        comp_indices.push(c_idx);
+                let Some(strata) = self.resolve_net_strata(nc) else {
+                    continue;
+                };
+                if nc.is_resource {
+                    res_indices.push(strata[0].comp_idx);
+                } else if is_rx {
+                    entity_queries.push(
+                        strata
+                            .iter()
+                            .map(|s| (s.comp_idx, "BAM_ACCESS_WRITE"))
+                            .collect(),
+                    );
+                } else {
+                    for k in 0..strata.len() {
+                        entity_queries.push(
+                            strata
+                                .iter()
+                                .enumerate()
+                                .map(|(j, s)| {
+                                    (
+                                        s.comp_idx,
+                                        if j == k {
+                                            "BAM_ACCESS_CHANGED"
+                                        } else {
+                                            "BAM_ACCESS_READ"
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        );
                     }
                 }
             }
             let q0_n = 1 + res_indices.len();
-            let q_total = 1 + comp_indices.len();
+            let q_total = 1 + entity_queries.len();
             let _ = writeln!(self.out, "        BamTermDesc q0_terms[{q0_n}u];");
             let _ = writeln!(
                 self.out,
@@ -1094,11 +1360,19 @@ static BAM_UNUSED BamResult strata_sys_net_tx_{chunk_idx}(BamSystemCtx* sys_ctx,
                     "        if (state->res_flags[{r_idx}] == 1u) {{ q0_terms[q0_cnt++] = bam_term_desc(state->components[{r_idx}], {res_mode}, 0u); }}"
                 );
             }
-            for (ei, &c_idx) in comp_indices.iter().enumerate() {
+            for (ei, terms) in entity_queries.iter().enumerate() {
                 let qi = ei + 1;
+                let term_inits: Vec<String> = terms
+                    .iter()
+                    .map(|(c_idx, mode)| {
+                        format!("bam_term_desc(state->components[{c_idx}], {mode}, 0u)")
+                    })
+                    .collect();
                 let _ = writeln!(
                     self.out,
-                    "        BamTermDesc qe_terms_{qi}[1] = {{ bam_term_desc(state->components[{c_idx}], {comp_mode}, 0u) }};"
+                    "        BamTermDesc qe_terms_{qi}[{}u] = {{ {} }};",
+                    terms.len(),
+                    term_inits.join(", ")
                 );
             }
             let _ = writeln!(self.out, "        BamQueryDesc net_qdescs[{q_total}u];");
@@ -1110,11 +1384,12 @@ static BAM_UNUSED BamResult strata_sys_net_tx_{chunk_idx}(BamSystemCtx* sys_ctx,
                 self.out,
                 "        net_qdescs[0].struct_size = (uint32_t)sizeof(BamQueryDesc);\n        net_qdescs[0].terms = q0_terms;\n        net_qdescs[0].term_count = q0_cnt;"
             );
-            for (ei, _) in comp_indices.iter().enumerate() {
+            for (ei, terms) in entity_queries.iter().enumerate() {
                 let qi = ei + 1;
                 let _ = writeln!(
                     self.out,
-                    "        net_qdescs[{qi}].struct_size = (uint32_t)sizeof(BamQueryDesc);\n        net_qdescs[{qi}].terms = qe_terms_{qi};\n        net_qdescs[{qi}].term_count = 1u;"
+                    "        net_qdescs[{qi}].struct_size = (uint32_t)sizeof(BamQueryDesc);\n        net_qdescs[{qi}].terms = qe_terms_{qi};\n        net_qdescs[{qi}].term_count = {}u;",
+                    terms.len(),
                 );
             }
             let _ = writeln!(

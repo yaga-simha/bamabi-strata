@@ -295,7 +295,7 @@ out.total = s;
 sys despawn_par() {
 for e in query(pos: &Pos) {
     if e.pos.x < 0.0 {
-        despawn(e.entity);
+        despawn(e.id);
     }
 }
 }
@@ -2116,7 +2116,7 @@ sys step_iter8() {
         row.o.arr32 = [id_f32(100000.0_f32), id_f32(-0.25_f32)];
         row.o.arr64 = [id_f64(-2.75_f64), id_f64(1.0e12_f64)];
         row.o.bs128 = bits(1, 90);
-        trigger(EvPing { entity: row.entity, inc: 5 });
+        trigger(EvPing { entity: row.id, inc: 5 });
     }
 }
 
@@ -2195,7 +2195,7 @@ object ObjBits {
 sys step_bits() {
     for row in query(p: &mut BitsPod) {
         row.p.rt_m = C_MASK;
-        trigger(EvProp { entity: row.entity }, propagate: true);
+        trigger(EvProp { entity: row.id }, propagate: true);
     }
 }
 
@@ -2426,4 +2426,847 @@ int main(void) {{
         run.status,
         String::from_utf8_lossy(&run.stderr)
     );
+}
+
+fn compile_and_run_c99_ubsan(art: &GeneratedArtifact, label: &str, main_driver: &str) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for f in &art.files {
+        std::fs::write(tmp.path().join(&f.path), &f.content).expect("write generated file");
+    }
+    let c_file = art.files.iter().find(|f| f.path.ends_with(".c")).unwrap();
+    let mut combined = std::fs::read_to_string(tmp.path().join(&c_file.path)).unwrap();
+    combined.push_str(main_driver);
+    let driver_path = tmp.path().join(format!("driver_{label}_ubsan.c"));
+    std::fs::write(&driver_path, &combined).unwrap();
+    let bin_path = tmp.path().join(format!("driver_{label}_ubsan"));
+    let cc = if Command::new("cc").arg("--version").output().is_ok() {
+        "cc"
+    } else {
+        "clang"
+    };
+    let comp = Command::new(cc)
+        .args([
+            "-std=c99",
+            "-Wall",
+            "-Wextra",
+            "-Wpedantic",
+            "-Werror",
+            "-fsanitize=undefined",
+            "-fno-sanitize-recover=all",
+            "-I",
+        ])
+        .arg(tmp.path())
+        .arg(&driver_path)
+        .arg("-lm")
+        .arg("-o")
+        .arg(&bin_path)
+        .output()
+        .expect("compile C99 UBSan driver");
+    assert!(
+        comp.status.success(),
+        "{label} C99 UBSan compile failed:\n{}",
+        String::from_utf8_lossy(&comp.stderr)
+    );
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("run C99 UBSan driver");
+    assert!(
+        run.status.success(),
+        "{label} C99 UBSan driver failed (exit={:?}):\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn c99_fix_pm03_pm04_pm05_pm07_pm08_pm11_pm12_math_tables_ubsan() {
+    let src = r#"
+module game::math_fixes @version(1.0.0);
+
+enum Mode {
+    ErrNeg = -2,
+    Idle = 0,
+    Active = 1,
+}
+
+struct SubCfg {
+    tag_id: i32,
+    gain: f32,
+}
+
+table CfgByMode by Mode {
+    off: vec2,
+    sub: SubCfg,
+    mask: BitSet<128>,
+} = {
+    ErrNeg => { off: vec2(-1.0, 2.0), sub: SubCfg { tag_id: -9, gain: 0.25 }, mask: bits(0, 127) },
+    Idle => { off: vec2(0.0, 0.0), sub: SubCfg { tag_id: 0, gain: 1.0 }, mask: bits(1) },
+    Active => { off: vec2(3.0, 4.0), sub: SubCfg { tag_id: 5, gain: 2.0 }, mask: bits(64) },
+};
+
+component FxItem {
+    fx32: fix32 = 2.0,
+    fx64: fix64 = 3.0,
+    flag: bool = true,
+}
+
+component MathBox {
+    swiz_v: vec2 = vec2(1.0, 2.0),
+    q_res: quat = quat(0.0, 0.0, 0.0, 1.0),
+    v3_res: vec3 = vec3(0.0, 0.0, 0.0),
+    v4_res: vec4 = vec4(0.0, 0.0, 0.0, 0.0),
+    f32_abs: fix32 = 0.0,
+    f64_abs: fix64 = 0.0,
+    f32_prod: fix32 = 0.0,
+    f64_prod: fix64 = 0.0,
+    min_i32_abs: i32 = 0,
+    min_i64_abs: i64 = 0,
+    cnt_v: u32 = 0,
+    any_v: bool = false,
+    all_v: bool = false,
+    tag_neg: i32 = 0,
+    has_127: bool = false,
+    q_dist: f32 = 0.0,
+    v3a_lsq: f32 = 0.0,
+    clamped: vec3 = vec3(0.0, 0.0, 0.0),
+}
+
+fn eval_math(m: &mut MathBox, neg_i32: i32, neg_i64: i64, neg_fx32: fix32, neg_fx64: fix64) -> i32 {
+    m.min_i32_abs = abs(neg_i32);
+    m.min_i64_abs = abs(neg_i64);
+    m.f32_abs = abs(neg_fx32);
+    m.f64_abs = abs(neg_fx64);
+
+    let qz = quat(0.0, 0.0, 0.70710677, 0.70710677);
+    let qid = quat(0.0, 0.0, 0.0, 1.0);
+    m.q_res = qz * qid;
+    m.v3_res = qz * vec3(1.0, 0.0, 0.0);
+
+    let mut lv = vec3(1.0, 2.0, 3.0);
+    lv.zx = vec2(9.0, 4.0);
+    m.swiz_v.yx = vec2(8.0, 7.0);
+    m.clamped = clamp(lv, 0.0, 5.0);
+
+    let va = vec4(0.0, 0.0, 0.0, 0.0);
+    let vb = vec4(2.0, 4.0, 6.0, 8.0);
+    m.v4_res = lerp(va, vb, 0.5);
+    let a3 = vec3a(1.0, 2.0, 2.0);
+    m.v3a_lsq = length_sq(a3);
+    m.q_dist = distance(va, vb);
+
+    let iv = ivec2(10, -7) / 2;
+    let uv = uvec2(9, 5) % 4;
+
+    let row = CfgByMode[Mode::ErrNeg];
+    m.tag_neg = row.sub.tag_id + iv.x + (uv.x as i32);
+    m.has_127 = row.mask.has(127);
+    return m.tag_neg;
+}
+
+sys step_math() {
+    let (p32, p64, c, a, l) = for it in query(x: &FxItem) reduce (
+        p32: prod(it.x.fx32),
+        p64: prod(it.x.fx64),
+        c: count(it.x.flag),
+        a: any(it.x.flag),
+        l: all(it.x.flag)
+    );
+    for row in query(m: &mut MathBox) {
+        let _r = eval_math(row.m, -100, -200, -2.5, -3.5);
+        row.m.f32_prod = p32;
+        row.m.f64_prod = p64;
+        row.m.cnt_v = c;
+        row.m.any_v = a;
+        row.m.all_v = l;
+    }
+}
+
+schedule FixedUpdate {
+    step_math
+}
+"#;
+    let mir = compile_strata_to_mir("math_tables_fixes.strata", src);
+    let art = emit(&mir).expect("emit c99 math_tables");
+    let c_src = &art.files[1].content;
+    assert!(
+        c_src.contains("strata_quat_mul") && c_src.contains("strata_quat_mul_vec3"),
+        "expected quat_mul helpers"
+    );
+    assert!(
+        c_src.contains("strata_fix32_mul") && c_src.contains("strata_fix64_mul"),
+        "expected wide fix32/fix64 mul for prod"
+    );
+
+    let mathbox_def = c_src
+        .lines()
+        .find(|l| {
+            l.contains("strata_default_") && l.contains("_MathBox(void)") && !l.ends_with(';')
+        })
+        .unwrap();
+    let mathbox_def_fn = mathbox_def
+        .split_whitespace()
+        .find(|t| t.starts_with("strata_default_"))
+        .unwrap()
+        .split('(')
+        .next()
+        .unwrap()
+        .to_string();
+    let mathbox_cty = c_src
+        .lines()
+        .find(|l| l.starts_with("typedef struct ") && l.contains("_MathBox "))
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_string();
+
+    let driver = format!(
+        r#"
+static int mock_row_i = 0;
+static int32_t mock_fx_p0[2];
+static const uint8_t* mock_fx_rows[2];
+static uint8_t mock_mbox_buf[256];
+
+static BamResult mock_sys_query(BamSystemCtx* ctx, size_t qi, BamIter** out_it) {{
+    (void)ctx;
+    static int dummy0 = 0, dummy1 = 1;
+    mock_row_i = 0;
+    *out_it = (BamIter*)((qi == 0u) ? &dummy0 : &dummy1);
+    return BAM_RESULT_OK;
+}}
+static BamBool mock_iter_next_chunk(BamIter* it, size_t* out_len) {{
+    int qid = *(int*)it;
+    if (mock_row_i++ == 0) {{
+        *out_len = (qid == 0) ? 2u : 1u;
+        return BAM_TRUE;
+    }}
+    *out_len = 0u;
+    return BAM_FALSE;
+}}
+static const uint8_t* mock_col_ro(const BamIter* it, size_t ti) {{
+    (void)it; (void)ti;
+    return NULL;
+}}
+static const uint8_t* const* mock_col_rows_ro(BamIter* it, size_t ti) {{
+    (void)it; (void)ti;
+    mock_fx_rows[0] = (const uint8_t*)&mock_fx_p0[0];
+    mock_fx_rows[1] = (const uint8_t*)&mock_fx_p0[1];
+    return mock_fx_rows;
+}}
+static uint8_t* mock_col_mut(BamIter* it, size_t ti) {{
+    (void)it; (void)ti;
+    return (uint8_t*)mock_mbox_buf;
+}}
+
+int main(void) {{
+    StrataModState st;
+    memset(&st, 0, sizeof(st));
+    BamHostApi api;
+    memset(&api, 0, sizeof(api));
+    api.struct_size = (uint32_t)sizeof(BamHostApi);
+    api.sys_query = mock_sys_query;
+    api.iter_next_chunk = mock_iter_next_chunk;
+    api.iter_column_readonly = mock_col_ro;
+    api.iter_column_rows_readonly = mock_col_rows_ro;
+    api.iter_column_mutable = mock_col_mut;
+    st.api = &api;
+
+    {mathbox_cty} m = {mathbox_def_fn}();
+    int32_t res = strata_fn_eval_math(&st, &m, INT32_MIN, INT64_MIN, (int32_t)(-2.5 * 65536.0), (int64_t)(-3.5 * 4294967296.0));
+    if (m.min_i32_abs != INT32_MIN) return 1;
+    if (m.min_i64_abs != INT64_MIN) return 2;
+    if (m.f32_abs != (int32_t)(2.5 * 65536.0)) return 3;
+    if (m.f64_abs != (int64_t)(3.5 * 4294967296.0)) return 4;
+    if (strata_fix32_mul(2 * 65536, 3 * 65536) != (int32_t)(6 * 65536)) return 5;
+    if (strata_fix64_mul(2ll << 32, 3ll << 32) != (6ll << 32)) return 6;
+    if (fabsf(m.v3_res.x) > 1e-4f || fabsf(m.v3_res.y - 1.0f) > 1e-4f) return 7;
+    if (fabsf(m.swiz_v.x - 7.0f) > 1e-5f || fabsf(m.swiz_v.y - 8.0f) > 1e-5f) return 8;
+    if (fabsf(m.clamped.z - 5.0f) > 1e-5f || fabsf(m.clamped.x - 4.0f) > 1e-5f) return 9;
+    if (fabsf(m.v4_res.w - 4.0f) > 1e-5f || fabsf(m.v3a_lsq - 9.0f) > 1e-5f) return 10;
+    if (res != (-9 + 5 + 1)) return 11;
+    if (m.has_127 != BAM_TRUE) return 12;
+    return 0;
+}}
+"#
+    );
+    compile_and_run_c99_ubsan(&art, "pm_math_tables", &driver);
+}
+
+#[test]
+fn c99_fix_bug_tl01_to_09_bitset_inlinestr_arrays_migrate_ubsan() {
+    let src = r#"
+module game::tl_fixes @version(1.0.0);
+
+const BS_MAT: [[BitSet<128>; 2]; 2] = [
+    [bits(0, 127), bits(1)],
+    [bits(64), bits(2, 120)],
+];
+
+struct InnerStr {
+    s: InlineStr<16>,
+    copied: InlineStr<16>,
+    bs: [BitSet<128>; 2],
+}
+
+component BoxV1 {
+    x: i32 = 10,
+}
+
+component BoxV2 {
+    x: i32 = 10,
+    flag: bool = true,
+    m3: mat3 = mat3::IDENTITY,
+    gw: GraceWindow = 0.5,
+    ib: InputBuffer<u32, 4> = [],
+}
+
+migrate BoxV2 from 1.0.0 to 2.0.0 (old: &BoxV1) -> BoxV2 {
+    BoxV2 { x: old.x + 5 }
+}
+
+component TlRec {
+    bs_arr: [BitSet<128>; 2] = [bits(1), bits(2)],
+    mat2d: [[i32; 2]; 2] = [[1, 2], [3, 4]],
+    names: [InlineStr<16>; 2] = ["alpha", "beta"],
+    nest: InnerStr = InnerStr { s: "hello", copied: "", bs: [bits(3), bits(4)] },
+    sv: SmallVec<i32, 4> = [11, 22],
+    has_127: bool = false,
+    mat_bit_ok: bool = false,
+    sv_sum: i32 = 0,
+}
+
+fn check_tl(r: &mut TlRec) -> i32 {
+    r.bs_arr[1].set(127);
+    r.has_127 = r.bs_arr[1].has(127);
+    r.bs_arr[1].clear(2);
+    r.mat2d[1][0] = 77;
+    r.names[1] = "gamma";
+    r.nest.copied = r.nest.s;
+    r.nest.bs[0].set(126);
+    r.sv.push(33);
+    r.sv_sum = r.sv[0] + r.sv[1] + r.sv[2];
+    r.mat_bit_ok = BS_MAT[0][0].has(127) && BS_MAT[1][0].has(64);
+    return r.mat2d[1][0] + r.sv_sum;
+}
+
+sys run_tl() {
+    for row in query(r: &mut TlRec) {
+        let _x = check_tl(row.r);
+    }
+}
+
+schedule FixedUpdate {
+    run_tl
+}
+"#;
+    let mut mir = compile_strata_to_mir("tl_fixes.strata", src);
+    // Inject mat3::IDENTITY into BoxV2's field_defaults to verify C99 Slot-67 migration + mat3 default emission directly.
+    let v2_canon = mir
+        .layouts
+        .iter()
+        .find(|l| l.canonical_name.ends_with("BoxV2"))
+        .unwrap()
+        .canonical_name
+        .clone();
+    mir.field_defaults.entry(v2_canon).or_default().insert(
+        "m3".to_owned(),
+        strata_mir::ir::MirConstVal::Array(vec![
+            strata_mir::ir::MirConstVal::Float(1.0),
+            strata_mir::ir::MirConstVal::Float(0.0),
+            strata_mir::ir::MirConstVal::Float(0.0),
+            strata_mir::ir::MirConstVal::Float(0.0),
+            strata_mir::ir::MirConstVal::Float(1.0),
+            strata_mir::ir::MirConstVal::Float(0.0),
+            strata_mir::ir::MirConstVal::Float(0.0),
+            strata_mir::ir::MirConstVal::Float(0.0),
+            strata_mir::ir::MirConstVal::Float(1.0),
+        ]),
+    );
+    let art = emit(&mir).expect("emit c99 tl_fixes");
+    let c_src = &art.files[1].content;
+    let tlrec_cty = c_src
+        .lines()
+        .find(|l| l.starts_with("typedef struct ") && l.contains("_TlRec "))
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_string();
+    let tlrec_def_fn = c_src
+        .lines()
+        .find(|l| l.contains("strata_default_") && l.contains("_TlRec(void)") && !l.ends_with(';'))
+        .unwrap()
+        .split_whitespace()
+        .find(|t| t.starts_with("strata_default_"))
+        .unwrap()
+        .split('(')
+        .next()
+        .unwrap()
+        .to_string();
+    let v2_cty = c_src
+        .lines()
+        .find(|l| l.starts_with("typedef struct ") && l.contains("_BoxV2 "))
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_string();
+    let v1_cty = c_src
+        .lines()
+        .find(|l| l.starts_with("typedef struct ") && l.contains("_BoxV1 "))
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_string();
+    let mig_fn = c_src
+        .lines()
+        .find(|l| l.contains("strata_mig_"))
+        .and_then(|l| l.split_whitespace().find(|t| t.starts_with("strata_mig_")))
+        .and_then(|t| t.split('(').next())
+        .unwrap()
+        .to_string();
+
+    let driver = format!(
+        r#"
+int main(void) {{
+    StrataModState st;
+    memset(&st, 0, sizeof(st));
+    {tlrec_cty} rec = {tlrec_def_fn}();
+    int32_t tot = strata_fn_check_tl(&st, &rec);
+    if (tot != (77 + 66)) return 1;
+    if (rec.has_127 != BAM_TRUE) return 2;
+    if (strata_bitset_get(&rec.bs_arr[16], 4u, 2u)) return 3;
+    if (!strata_bitset_get(&rec.bs_arr[16], 4u, 127u)) return 4;
+    if (!strata_bitset_get(&rec.nest.bs[0], 4u, 126u)) return 5;
+    if (rec.mat_bit_ok != BAM_TRUE) return 6;
+    if (memcmp(rec.nest.copied + 4u, "hello", 5u) != 0) return 7;
+    if (memcmp(rec.names + 20u + 4u, "gamma", 5u) != 0) return 8;
+
+    {v1_cty} old_v;
+    memset(&old_v, 0, sizeof(old_v));
+    old_v.x = 30;
+    {v2_cty} new_v;
+    memset(&new_v, 0, sizeof(new_v));
+    if ({mig_fn}(&old_v, &new_v, &st) != BAM_RESULT_OK) return 9;
+    if (new_v.x != 35) return 10;
+    if (new_v.flag != BAM_TRUE) return 11;
+    if (fabsf(new_v.m3.m[0] - 1.0f) > 1e-5f
+        || fabsf(new_v.m3.m[4] - 1.0f) > 1e-5f
+        || fabsf(new_v.m3.m[8] - 1.0f) > 1e-5f) return 12;
+    if (fabsf(new_v.gw - 0.5f) > 1e-5f) return 13;
+    return 0;
+}}
+"#
+    );
+    compile_and_run_c99_ubsan(&art, "tl_fixes", &driver);
+}
+
+#[test]
+fn c99_fix_ecs_flow_spatial_schedules_eq_gf_sw_nt10d_ubsan() {
+    let mut src = String::from(
+        r#"
+module game::ecs_flow_fixes @version(1.0.0);
+
+component Pos { xyz: vec3 = vec3(0.0, 0.0, 0.0) }
+component Pos2 { x: f32 = 0.0, y: f32 = 0.0 }
+component ValBox { val: i32 = 0 }
+component Shield { hp: f32 = 10.0 }
+tag SpatialTag;
+stream Ping { seq_no: i32 = 0 }
+relation Squad { power: u32 }
+relation ChildOf;
+event PingEv { code: i32 }
+
+resource ProbeOut {
+    got_seq: i32 = 0,
+    cascade_val: i32 = 0,
+    hits_2d: u32 = 0,
+    hits_oob: u32 = 0,
+    helper_res: f32 = 0.0,
+    tx_val: f32 = 0.0,
+}
+
+resource SimClock {
+    dt: f32 = 0.0,
+}
+
+spatial_grid GridXZ(
+    cell_size: 4.0_m,
+    bounds: vec2(-20.0_m, -20.0_m)..vec2(20.0_m, 20.0_m),
+    capacity: 16,
+) over SpatialTag by Pos.xyz;
+
+spatial_history HistXZ(
+    frames: 4,
+    cell_size: 4.0_m,
+    bounds: vec2(-20.0_m, -20.0_m)..vec2(20.0_m, 20.0_m),
+    capacity: 16,
+) over SpatialTag by Pos.xyz;
+
+timeline CombatTl @rate(60_hz) @duration(20_f) {
+    window w0 = 0_f .. 2_f;
+    window w1 = 1_f .. 4_f;
+    window w2 = 3_f .. 6_f;
+    window w3 = 5_f .. 8_f;
+    window w4 = 7_f .. 10_f;
+    window w5 = 2_f .. 15_f;
+    at 2_f => despawn(self);
+}
+
+fn add_x(x: &f32, dx: f32) -> f32 {
+    return x + dx;
+}
+
+sys startup_obj_user(out: &mut res ProbeOut) {
+    let o0 = query_one(t: &ValBox).on(Obj0).unwrap();
+    out.cascade_val = o0.t.val;
+}
+
+sys s_emit_ping() {
+    for row in query(px: &Pos2.x, py: &mut Pos2.y).added<Pos2>() {
+        row.py = add_x(row.px, 2.0);
+    }
+    emit(Ping { seq_no: 77 });
+}
+
+sys s_read_ping(msg: stream_in<Ping>, out: &mut res ProbeOut) {
+    out.got_seq = msg.seq_no;
+}
+
+sys s_relations_and_cascade(out: &mut res ProbeOut) {
+    for row in query(t: &ValBox) {
+        insert_relation<ChildOf>(row.id, row.id);
+        insert_relation<Squad>(row.id, row.id, Squad { power: 5 });
+        trigger(row.id, PingEv { code: 9 }, propagate: true);
+    }
+    for u1 in query(t: &ValBox).up<ChildOf>() {
+        out.cascade_val += u1.t.val;
+    }
+    for u2 in query(t: &ValBox).up<Squad>() {
+        out.cascade_val += u2.t.val;
+    }
+}
+
+sys s_spatial_and_atomic(
+    g: &res GridXZ,
+    h: &res HistXZ,
+    out: &mut res ProbeOut,
+) {
+    for _h in g.query_disc(vec2(1.0, 2.0), 3.0_m) {
+        out.hits_2d += 1;
+    }
+    for _h2 in h.query_segment_at(99, vec3(0.0, 0.0, 0.0), vec3(4.0, 0.0, 4.0), 1.0_m) {
+        out.hits_oob += 1;
+    }
+    for row in query(sh: &mut Shield) {
+        atomic {
+            row.sh.hp = 50.0;
+            require_true(false);
+        }
+        atomic {
+            row.sh.hp = 30.0;
+            atomic {
+                row.sh.hp = 99.0;
+                require_true(false);
+            }
+            require_true(true);
+            out.tx_val = row.sh.hp;
+        }
+    }
+}
+
+sys s_first() {}
+sys s_second() {}
+sys s_false_gated() {}
+"#,
+    );
+    // NT-10d: 17 named objects (> MAX_QUERIES_PER_SYSTEM = 16)
+    for i in 0..17 {
+        src.push_str(&format!(
+            "\nobject Obj{i} {{ ValBox {{ val: {} }} }}",
+            i + 1
+        ));
+    }
+    src.push_str(
+        r#"
+
+schedule Startup {
+    startup_obj_user
+}
+
+schedule Main {
+    seq MainRoot {
+        set OuterSet {
+            set SharedSet before(s_read_ping) {
+                s_emit_ping
+            }
+        }
+        set NextSet {
+            s_read_ping
+        }
+    }
+}
+
+schedule FixedUpdate {
+    set SharedSet {
+        s_first before(s_second)
+        s_second
+    }
+    s_relations_and_cascade
+    s_spatial_and_atomic
+}
+
+schedule Update run_if(false) {
+    s_false_gated
+}
+"#,
+    );
+
+    let mir = compile_strata_to_mir("ecs_flow_fixes.strata", &src);
+    let art = emit(&mir).expect("emit c99 ecs_flow_fixes");
+    let c_src = &art.files[1].content;
+
+    assert!(c_src.contains("BAM_HOST_API_OFFSET_REGISTER_MESSAGE"));
+    assert!(c_src.contains("mod_stream_last_"));
+    assert!(c_src.contains("BAM_TERM_FLAG_ADDED"));
+    assert!(c_src.contains("BAM_TRIGGER_FLAG_PROPAGATE"));
+    assert!(c_src.contains("BAM_CHILD_OF_NAME") || c_src.contains("bevy_ecs::hierarchy::ChildOf"));
+    assert!(c_src.contains("__strata_rel_parent_Squad"));
+    assert!(c_src.contains("strata_spatial_query_disc_2d"));
+    assert!(c_src.contains("strata_fn_add_x(StrataModState* state, float p_0, float p_1)"));
+    assert!(
+        c_src.contains("\"__strata_startup_objects_0\"")
+            && c_src.contains("\"__strata_startup_objects_1\"")
+    );
+    assert!(c_src.contains("return BAM_FALSE;"));
+    assert!(c_src.contains("state->sets["));
+    assert!(c_src.contains("after_sets"));
+
+    // EQ-09: Pos.x + Pos.y merged into single Pos term in s_emit_ping without BAM_RESTRICT aliasing
+    let emit_ping_reg = c_src
+        .split("s_emit_ping */\n")
+        .nth(1)
+        .and_then(|s| s.split("/* System").next())
+        .unwrap_or("");
+    assert!(
+        emit_ping_reg.contains("[1];") && emit_ping_reg.contains("term_count = 1u;"),
+        "expected deduplicated 1-term query for (&Pos.x, &mut Pos.y):\n{emit_ping_reg}"
+    );
+    let emit_ping_fn = c_src
+        .split("static BamResult strata_sys_s_emit_ping(")
+        .nth(1)
+        .and_then(|s| s.split("\n}\n").next())
+        .unwrap();
+    assert!(
+        !emit_ping_fn.contains("BAM_RESTRICT"),
+        "aliased projected terms must not use BAM_RESTRICT:\n{emit_ping_fn}"
+    );
+
+    // GF-03 + EQ-02 runtime execution under strict C99 UBSan!
+    let tl_fn = c_src
+        .lines()
+        .find(|l| l.contains("CombatTl") && l.contains("static BamResult strata_sys_"))
+        .and_then(|l| l.split_whitespace().find(|t| t.starts_with("strata_sys_")))
+        .and_then(|t| t.split('(').next())
+        .unwrap()
+        .to_string();
+
+    let driver = format!(
+        r#"
+static BamEntity mock_tl_ent = (BamEntity)42ull;
+static uint8_t mock_tl_buf[16];
+static uint8_t* mock_tl_rows[1];
+static float mock_dt_val = 0.055f; /* > 3 * (1/60)f cleanly -> frame 3 */
+static int mock_tl_mode = 0;
+static int mock_calls = 0;
+
+static BamResult mock_sys_query(BamSystemCtx* ctx, size_t qi, BamIter** out_it) {{
+    (void)ctx; (void)qi;
+    static int dummy = 0;
+    mock_calls = 0;
+    *out_it = (BamIter*)&dummy;
+    return BAM_RESULT_OK;
+}}
+static BamBool mock_iter_next_chunk(BamIter* it, size_t* out_len) {{
+    (void)it;
+    if (mock_tl_mode != 0 && mock_calls++ == 0) {{ *out_len = 1u; return BAM_TRUE; }}
+    *out_len = 0u;
+    return BAM_FALSE;
+}}
+static const BamEntity* mock_iter_entities(const BamIter* it) {{
+    (void)it;
+    return &mock_tl_ent;
+}}
+static uint8_t* const* mock_col_rows_mut(BamIter* it, size_t term_idx) {{
+    (void)it; (void)term_idx;
+    mock_tl_rows[0] = mock_tl_buf;
+    return mock_tl_rows;
+}}
+static const uint8_t* mock_sys_res_ptr(const BamSystemCtx* ctx, BamComponent comp, BamChangeTicks* ticks) {{
+    (void)ctx; (void)comp;
+    if (ticks != NULL) memset(ticks, 0, sizeof(*ticks));
+    return (const uint8_t*)&mock_dt_val;
+}}
+static BamResult mock_sys_cmds(BamSystemCtx* ctx, BamCommands** out_c) {{
+    (void)ctx;
+    static int dc = 0;
+    *out_c = (BamCommands*)&dc;
+    return BAM_RESULT_OK;
+}}
+static BamResult mock_despawn(BamCommands* c, BamEntity e) {{
+    (void)c; (void)e;
+    return BAM_RESULT_OK;
+}}
+
+int main(void) {{
+    StrataModState st;
+    memset(&st, 0, sizeof(st));
+    for (size_t ri = 0u; ri < sizeof(st.res_flags) / sizeof(st.res_flags[0]); ++ri) {{
+        st.res_flags[ri] = 1u;
+    }}
+    st.res_flags[3] = 0u;
+    BamHostApi api;
+    memset(&api, 0, sizeof(api));
+    api.struct_size = (uint32_t)sizeof(BamHostApi);
+    api.sys_query = mock_sys_query;
+    api.sys_commands = mock_sys_cmds;
+    api.iter_next_chunk = mock_iter_next_chunk;
+    api.iter_entities = mock_iter_entities;
+    api.iter_column_rows_mutable = mock_col_rows_mut;
+    api.sys_res_ptr = mock_sys_res_ptr;
+    api.cmd_despawn = mock_despawn;
+    st.api = &api;
+
+    /* GF-03: run CombatTl advance step with elapsed=0.05s at 60Hz -> frame 3 -> window w5 active! */
+    memset(mock_tl_buf, 0, sizeof(mock_tl_buf));
+    mock_tl_mode = 1;
+    int fake_ctx = 1;
+    if ({tl_fn}((BamSystemCtx*)&fake_ctx, &st) != BAM_RESULT_OK) return 1;
+    mock_tl_mode = 0;
+    uint16_t frame_after = 0u;
+    uint16_t flags_after = 0u;
+    uint32_t mask_after = 0u;
+    memcpy(&frame_after, mock_tl_buf, 2u);
+    memcpy(&flags_after, mock_tl_buf + 2u, 2u);
+    memcpy(&mask_after, mock_tl_buf + 4u, 4u);
+    if (frame_after != 3u) return 2;
+    if ((flags_after & 1u) == 0u) return 3;
+    /* w1 (1..4) = bit 1 (2u), w2 (3..6) = bit 2 (4u), w5 (2..15) = bit 5 (32u) */
+    if ((mask_after & 32u) == 0u || (mask_after & 2u) == 0u || (mask_after & 4u) == 0u) return 4;
+
+    /* BUG-SW-05: HistXZ OOB tick_offset (UINT32_MAX) returns 0 hits cleanly under UBSan */
+    st.spatial_HistXZ.frames = 4u;
+    StrataSpatialHits h_oob = strata_spatial_query_segment_at(&st.spatial_HistXZ, (StrataVec3){{0.0f, 0.0f, 0.0f}}, (StrataVec3){{1.0f, 0.0f, 1.0f}}, 1.0f, UINT32_MAX);
+    if (h_oob.count != 0u) return 5;
+
+    /* BUG-SW-06: GridXZ 2D disc query uses XZ axes (axis 0, axis 2) */
+    st.spatial_GridXZ.frames = 1u;
+    st.spatial_GridXZ.capacity = 16u;
+    st.spatial_GridXZ.cols = 10u;
+    st.spatial_GridXZ.rows = 10u;
+    st.spatial_GridXZ.cell_count = 100u;
+    st.spatial_GridXZ.cell_size = 4.0f;
+    st.spatial_GridXZ.inv_cell_size = 0.25f;
+    st.spatial_GridXZ.bounds_min_x = -20.0f;
+    st.spatial_GridXZ.bounds_min_y = -20.0f;
+    st.spatial_GridXZ.plane_ax0 = 0u;
+    st.spatial_GridXZ.plane_ax1 = 2u;
+    st.spatial_GridXZ.counts = st.spatial_GridXZ_counts;
+    st.spatial_GridXZ.cell_offsets = st.spatial_GridXZ_offsets;
+    st.spatial_GridXZ.write_cursors = st.spatial_GridXZ_cursors;
+    st.spatial_GridXZ.entities = st.spatial_GridXZ_entities;
+    st.spatial_GridXZ.positions = st.spatial_GridXZ_positions;
+    strata_spatial_csr_begin(&st.spatial_GridXZ);
+    strata_spatial_csr_count(&st.spatial_GridXZ, strata_spatial_pos_v3((StrataVec3){{1.0f, 99.0f, 2.0f}}));
+    strata_spatial_csr_prefix_sum(&st.spatial_GridXZ);
+    strata_spatial_csr_scatter(&st.spatial_GridXZ, (BamEntity)88ull, strata_spatial_pos_v3((StrataVec3){{1.0f, 99.0f, 2.0f}}));
+    StrataSpatialHits h2d = strata_spatial_query_disc_2d(&st.spatial_GridXZ, (StrataVec2){{1.0f, 2.0f}}, 2.0f);
+    if (h2d.count != 1u || h2d.entities[0] != (BamEntity)88ull) return 6;
+
+    /* EQ-02/GF-14: standalone stream emit + read via mod_stream_last fallback */
+    if (strata_sys_s_emit_ping((BamSystemCtx*)&fake_ctx, &st) != BAM_RESULT_OK) return 7;
+    if (st.mod_stream_has_3 != 1u || st.mod_stream_last_3.seq_no != 77) return 8;
+    if (strata_sys_s_read_ping((BamSystemCtx*)&fake_ctx, &st) != BAM_RESULT_OK) return 9;
+    return 0;
+}}
+"#
+    );
+    // Avoid hardcoding component index `3` for Ping in main(): find exact comp idx or check `st.mod_stream_has_`
+    let ping_idx = c_src
+        .lines()
+        .find(|l| l.contains("mod_stream_last_"))
+        .and_then(|l| l.split("mod_stream_last_").nth(1))
+        .and_then(|r| r.split(';').next())
+        .unwrap();
+    let driver = driver
+        .replace("st.res_flags[3]", &format!("st.res_flags[{ping_idx}]"))
+        .replace(
+            "st.mod_stream_has_3",
+            &format!("st.mod_stream_has_{ping_idx}"),
+        )
+        .replace(
+            "st.mod_stream_last_3",
+            &format!("st.mod_stream_last_{ping_idx}"),
+        );
+    compile_and_run_c99_ubsan(&art, "ecs_flow_fixes", &driver);
+}
+
+#[test]
+fn c99_fix_nt01_nt03_nt04_nt09_networking_ubsan() {
+    let src = r#"
+module game::net_fixes @version(1.0.0);
+
+@soa
+@net(reliable, channel = 0)
+@authority(server)
+component SoaUnit {
+    hot {
+        @quantize(min = -1000000000.0, max = 1000000000.0, bits = 16)
+        x: f32 = 0.0,
+    }
+    cold meta {
+        tag_id: u16 = 3,
+    }
+}
+
+@net(reliable, channel = 1)
+@authority(server)
+resource NetState {
+    score: i32 = 0,
+    @quantize(min = 0.0, max = 100.0, bits = 16)
+    ratio: f32 = 50.0,
+}
+
+sys bump_res(s: &mut res NetState) {
+    s.score += 1;
+}
+
+schedule FixedUpdate {
+    bump_res
+}
+"#;
+    let mir = compile_strata_to_mir("net_fixes.strata", src);
+    let art = emit(&mir).expect("emit c99 net_fixes");
+    let c_src = &art.files[1].content;
+    assert!(
+        c_src.contains("mod_res_shadow_"),
+        "expected NT-04 module-local replicated resource shadow state"
+    );
+    assert!(
+        c_src.contains("1000000000"),
+        "expected NT-09 wide quantized range codec"
+    );
+    let driver = r#"
+int main(void) {
+    BamHostApi api;
+    memset(&api, 0, sizeof(api));
+    api.struct_size = (uint32_t)sizeof(BamHostApi);
+    BamInstance* inst = NULL;
+    (void)bamabi_init(&api, NULL, &inst);
+    if (inst != NULL) { free(inst); }
+    return 0;
+}
+"#;
+    compile_and_run_c99_ubsan(&art, "net_fixes", driver);
 }

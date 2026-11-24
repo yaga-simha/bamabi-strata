@@ -89,7 +89,7 @@ impl<'a> EmitCtx<'a> {
             Ty::U16 => format!("uint16_t {field_name}"),
             Ty::U32 | Ty::Sym | Ty::Rgba8 => format!("uint32_t {field_name}"),
             Ty::U64 => format!("uint64_t {field_name}"),
-            Ty::F32 | Ty::UnitScalar { .. } => {
+            Ty::F32 | Ty::UnitScalar { .. } | Ty::GraceWindow => {
                 if byte_size == 8 {
                     format!("double {field_name}")
                 } else {
@@ -141,6 +141,16 @@ impl<'a> EmitCtx<'a> {
     }
 
     pub(super) fn emit_composite_typedefs(&mut self) {
+        for &sz in &self.raw_pod_sizes {
+            let _ = writeln!(
+                self.out,
+                "typedef struct StrataBytes_{sz} {{ uint8_t bytes[{sz}]; }} StrataBytes_{sz};\n\
+                 BAM_STATIC_ASSERT(sizeof(StrataBytes_{sz}) == {sz}u, strata_bytes_{sz}_size);"
+            );
+        }
+        if !self.raw_pod_sizes.is_empty() {
+            self.out.push('\n');
+        }
         let order = self.composite_order.clone();
         for decl in order {
             match decl {
@@ -224,6 +234,236 @@ impl<'a> EmitCtx<'a> {
         Ok(())
     }
 
+    fn c_table_static_zero(&self, ty: &Ty) -> String {
+        self.c_table_static_zero_impl(ty, false)
+    }
+
+    fn c_table_static_zero_impl(&self, ty: &Ty, in_struct: bool) -> String {
+        match ty {
+            Ty::Bool => "BAM_FALSE".to_string(),
+            Ty::I64 | Ty::Fix64 => "0ll".to_string(),
+            Ty::U8 | Ty::U16 | Ty::U32 | Ty::Sym | Ty::Rgba8 => "0u".to_string(),
+            Ty::U64 => "0ull".to_string(),
+            Ty::F32 | Ty::UnitScalar { .. } | Ty::GraceWindow => "0.0f".to_string(),
+            Ty::F64 => "0.0".to_string(),
+            Ty::Ref(_) => "BAM_ENTITY_NULL".to_string(),
+            Ty::Vec2 => "{ 0.0f, 0.0f }".to_string(),
+            Ty::Vec3 => "{ 0.0f, 0.0f, 0.0f }".to_string(),
+            Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => "{ 0.0f, 0.0f, 0.0f, 0.0f }".to_string(),
+            Ty::IVec2 => "{ 0, 0 }".to_string(),
+            Ty::IVec3 => "{ 0, 0, 0 }".to_string(),
+            Ty::UVec2 => "{ 0u, 0u }".to_string(),
+            Ty::Mat3 | Ty::Mat4 => "{ { 0.0f } }".to_string(),
+            Ty::BitSet(_) | Ty::InlineStr(_) | Ty::InputBuffer { .. } | Ty::SmallVec { .. } => {
+                if in_struct {
+                    "{ 0u }".to_string()
+                } else {
+                    "{ { 0u } }".to_string()
+                }
+            }
+            Ty::Array { elem, len } => {
+                if in_struct {
+                    "{ 0u }".to_string()
+                } else {
+                    let m = Self::sema_to_mir_storage_ty(elem);
+                    if self.array_name(&m, *len).is_some() {
+                        let zeros: Vec<String> = (0..(*len).max(1))
+                            .map(|_| self.c_table_static_zero(elem))
+                            .collect();
+                        format!("{{ {{ {} }} }}", zeros.join(", "))
+                    } else {
+                        "{ { 0u } }".to_string()
+                    }
+                }
+            }
+            Ty::Named(_) => "{ 0 }".to_string(),
+            _ => "0".to_string(),
+        }
+    }
+
+    fn c_table_static_init(&self, expr: &HirExpr, ty: &Ty) -> String {
+        let resolved = self.resolve_const_hir_expr(expr, 0);
+        if let Some(mc) = self.hir_expr_to_mir_const_for_ty(resolved, Some(ty)) {
+            return self.c_table_static_const(ty, &mc, false);
+        }
+        self.c_table_static_zero(ty)
+    }
+
+    fn c_table_static_const(&self, ty: &Ty, val: &MirConstVal, in_struct: bool) -> String {
+        match (ty, val) {
+            (Ty::Bool, MirConstVal::Bool(b)) => {
+                if *b { "BAM_TRUE" } else { "BAM_FALSE" }.to_string()
+            }
+            (Ty::Bool, MirConstVal::Int(i)) => {
+                if *i != 0 { "BAM_TRUE" } else { "BAM_FALSE" }.to_string()
+            }
+            (
+                Ty::Fix32
+                | Ty::Fix64
+                | Ty::I8
+                | Ty::I16
+                | Ty::I32
+                | Ty::I64
+                | Ty::U8
+                | Ty::U16
+                | Ty::U32
+                | Ty::U64
+                | Ty::Sym
+                | Ty::Rgba8
+                | Ty::F32
+                | Ty::F64
+                | Ty::UnitScalar { .. }
+                | Ty::GraceWindow,
+                _,
+            ) => self.c_const_val_for_ty(ty, val),
+            (Ty::Vec2, MirConstVal::Vec2(v)) => {
+                format!("{{ {}, {} }}", c_f32(v[0] as f32), c_f32(v[1] as f32))
+            }
+            (Ty::Vec3, MirConstVal::Vec3(v)) => format!(
+                "{{ {}, {}, {} }}",
+                c_f32(v[0] as f32),
+                c_f32(v[1] as f32),
+                c_f32(v[2] as f32)
+            ),
+            (Ty::Vec3a, MirConstVal::Vec3(v)) => format!(
+                "{{ {}, {}, {}, 0.0f }}",
+                c_f32(v[0] as f32),
+                c_f32(v[1] as f32),
+                c_f32(v[2] as f32)
+            ),
+            (Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba, MirConstVal::Vec4(v)) => format!(
+                "{{ {}, {}, {}, {} }}",
+                c_f32(v[0] as f32),
+                c_f32(v[1] as f32),
+                c_f32(v[2] as f32),
+                c_f32(v[3] as f32)
+            ),
+            (Ty::IVec2, MirConstVal::Vec2(v)) => {
+                format!(
+                    "{{ {}, {} }}",
+                    c_i32_lit(v[0] as i32),
+                    c_i32_lit(v[1] as i32)
+                )
+            }
+            (Ty::IVec3, MirConstVal::Vec3(v)) => format!(
+                "{{ {}, {}, {} }}",
+                c_i32_lit(v[0] as i32),
+                c_i32_lit(v[1] as i32),
+                c_i32_lit(v[2] as i32)
+            ),
+            (Ty::UVec2, MirConstVal::Vec2(v)) => {
+                format!("{{ {}u, {}u }}", v[0] as u32, v[1] as u32)
+            }
+            (Ty::Mat3, MirConstVal::Array(elems)) => {
+                let fl = flatten_mat_floats(elems, 9);
+                let items: Vec<String> = fl.iter().map(|&f| c_f32(f)).collect();
+                format!("{{ {{ {} }} }}", items.join(", "))
+            }
+            (Ty::Mat4, MirConstVal::Array(elems)) => {
+                let fl = flatten_mat_floats(elems, 16);
+                let items: Vec<String> = fl.iter().map(|&f| c_f32(f)).collect();
+                format!("{{ {{ {} }} }}", items.join(", "))
+            }
+            (Ty::BitSet(bits), _) => {
+                let byte_len = (*bits).div_ceil(32).max(1) * 4;
+                let packed = pack_bitset_bytes(val, byte_len);
+                let bytes_c: Vec<String> = packed.iter().map(|b| format!("0x{b:02X}u")).collect();
+                if in_struct {
+                    format!("{{ {} }}", bytes_c.join(", "))
+                } else {
+                    format!("{{ {{ {} }} }}", bytes_c.join(", "))
+                }
+            }
+            (Ty::InlineStr(_), MirConstVal::String(_)) => {
+                if let Some(packed) = self.pack_const_bytes_for_ty(ty, val) {
+                    let bytes_c: Vec<String> =
+                        packed.iter().map(|b| format!("0x{b:02X}u")).collect();
+                    if in_struct {
+                        format!("{{ {} }}", bytes_c.join(", "))
+                    } else {
+                        format!("{{ {{ {} }} }}", bytes_c.join(", "))
+                    }
+                } else {
+                    self.c_table_static_zero_impl(ty, in_struct)
+                }
+            }
+            (Ty::Array { elem, len }, MirConstVal::Array(elems)) => {
+                let m = Self::sema_to_mir_storage_ty(elem);
+                if !in_struct && self.array_name(&m, *len).is_some() {
+                    let mut items = Vec::with_capacity((*len).max(1));
+                    for i in 0..(*len).max(1) {
+                        if let Some(ev) = elems.get(i) {
+                            items.push(self.c_table_static_const(elem, ev, false));
+                        } else {
+                            items.push(self.c_table_static_zero(elem));
+                        }
+                    }
+                    format!("{{ {{ {} }} }}", items.join(", "))
+                } else if let Some(packed) = self.pack_const_bytes_for_ty(ty, val)
+                    && !packed.is_empty()
+                {
+                    let bytes_c: Vec<String> =
+                        packed.iter().map(|b| format!("0x{b:02X}u")).collect();
+                    if in_struct {
+                        format!("{{ {} }}", bytes_c.join(", "))
+                    } else {
+                        format!("{{ {{ {} }} }}", bytes_c.join(", "))
+                    }
+                } else {
+                    self.c_table_static_zero_impl(ty, in_struct)
+                }
+            }
+            (Ty::Named(key), MirConstVal::Int(v)) if self.c_enum_ty(key).is_some() => {
+                let et = self.c_enum_ty(key).unwrap_or("int32_t");
+                if et == "int32_t" {
+                    c_i32_lit(*v as i32)
+                } else {
+                    format!("(({et}){}u)", *v as u32)
+                }
+            }
+            (Ty::Named(key), MirConstVal::Struct { name, fields }) => {
+                let Some(l_idx) = self
+                    .find_layout_idx(key)
+                    .or_else(|| self.find_layout_idx(name))
+                else {
+                    return self.c_table_static_zero_impl(ty, in_struct);
+                };
+                let layout = &self.layouts[l_idx];
+                if layout.size == 0 {
+                    return "{ 0 }".to_string();
+                }
+                let short = short_name(&layout.canonical_name);
+                let defs_opt = self
+                    .mir
+                    .field_defaults
+                    .get(&layout.canonical_name)
+                    .or_else(|| self.mir.field_defaults.get(short));
+                let mut inits = Vec::new();
+                for sf in &layout.fields {
+                    if sf.is_padding {
+                        continue;
+                    }
+                    let fc = sanitize_c_field(&sf.name);
+                    let fval_opt = fields
+                        .iter()
+                        .find(|(fnm, _)| fnm == &sf.name)
+                        .map(|(_, fv)| fv)
+                        .or_else(|| defs_opt.and_then(|defs| defs.get(&sf.name)));
+                    if let Some(fv) = fval_opt {
+                        let s_init = self.c_table_static_const(&sf.ty, fv, true);
+                        inits.push(format!(".{fc} = {s_init}"));
+                    }
+                }
+                if inits.is_empty() {
+                    "{ 0 }".to_string()
+                } else {
+                    format!("{{ {} }}", inits.join(", "))
+                }
+            }
+            _ => self.c_table_static_zero_impl(ty, in_struct),
+        }
+    }
+
     pub(super) fn emit_rodata_tables_and_curves(&mut self) -> Result<(), CodegenError> {
         // 1. `.rodata` tables keyed by enum discriminant.
         for t in &self.mir.tables {
@@ -245,64 +485,113 @@ impl<'a> EmitCtx<'a> {
                 e.canonical_name == t.key_enum
                     || short_name(&e.canonical_name) == short_name(&t.key_enum)
             });
-            let mut max_disc: usize = 0;
-            let mut row_by_disc: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+            let mut row_by_disc: BTreeMap<i64, Vec<String>> = BTreeMap::new();
             for (row_key, col_exprs) in &t.typed_rows {
                 let disc = key_enum
                     .and_then(|e| {
                         e.variants
                             .iter()
                             .find(|(vn, _)| vn == row_key)
-                            .map(|(_, d)| (*d).max(0) as usize)
+                            .map(|(_, d)| *d)
                     })
-                    .unwrap_or(row_by_disc.len());
-                max_disc = max_disc.max(disc);
+                    .unwrap_or(row_by_disc.len() as i64);
                 let mut vals = Vec::with_capacity(t.fields.len());
                 for (fname, fty) in &t.fields {
                     let v = col_exprs
                         .iter()
                         .find(|(k, _)| k == fname)
-                        .map(|(_, expr)| self.c_hir_expr(expr, fty))
-                        .unwrap_or_else(|| self.c_zero_for_sema(fty));
+                        .map(|(_, expr)| self.c_table_static_init(expr, fty))
+                        .unwrap_or_else(|| self.c_table_static_zero(fty));
                     vals.push(v);
                 }
                 row_by_disc.insert(disc, vals);
             }
-            let len = (max_disc + 1).max(1);
-            let _ = writeln!(
-                self.out,
-                "static BAM_UNUSED const StrataTable_{t_ident} STRATA_TABLE_{t_ident}[{len}] = {{"
-            );
-            for d in 0..len {
-                let comma = if d + 1 < len { "," } else { "" };
-                if let Some(vals) = row_by_disc.get(&d) {
-                    if vals.is_empty() {
+            let min_disc = row_by_disc.keys().copied().min().unwrap_or(0);
+            let max_disc = row_by_disc.keys().copied().max().unwrap_or(0);
+            let span = max_disc.saturating_sub(min_disc).saturating_add(1);
+            let use_dense = !row_by_disc.is_empty() && span > 0 && span <= 4096;
+            if use_dense {
+                let len = span as usize;
+                let _ = writeln!(
+                    self.out,
+                    "static BAM_UNUSED const StrataTable_{t_ident} STRATA_TABLE_{t_ident}[{len}] = {{"
+                );
+                for offset in 0..len {
+                    let d = min_disc + offset as i64;
+                    let comma = if offset + 1 < len { "," } else { "" };
+                    if let Some(vals) = row_by_disc.get(&d) {
+                        if vals.is_empty() {
+                            let _ = writeln!(self.out, "    {{ 0u }}{comma}");
+                        } else {
+                            let _ = writeln!(self.out, "    {{ {} }}{comma}", vals.join(", "));
+                        }
+                    } else if t.fields.is_empty() {
                         let _ = writeln!(self.out, "    {{ 0u }}{comma}");
                     } else {
-                        let _ = writeln!(self.out, "    {{ {} }}{comma}", vals.join(", "));
+                        let zeros: Vec<String> = t
+                            .fields
+                            .iter()
+                            .map(|(_, ty)| self.c_table_static_zero(ty))
+                            .collect();
+                        let _ = writeln!(self.out, "    {{ {} }}{comma}", zeros.join(", "));
                     }
-                } else if t.fields.is_empty() {
-                    let _ = writeln!(self.out, "    {{ 0u }}{comma}");
-                } else {
-                    let zeros: Vec<String> = t
-                        .fields
-                        .iter()
-                        .map(|(_, ty)| self.c_zero_for_sema(ty))
-                        .collect();
-                    let _ = writeln!(self.out, "    {{ {} }}{comma}", zeros.join(", "));
                 }
+                let _ = writeln!(self.out, "}};");
+                let _ = writeln!(
+                    self.out,
+                    "static BAM_UNUSED inline StrataTable_{t_ident} strata_table_load_{t_ident}(int32_t key) {{"
+                );
+                let min_lit = c_i64_lit(min_disc);
+                let max_lit = c_i64_lit(max_disc);
+                let _ = writeln!(
+                    self.out,
+                    "    size_t idx = ((int64_t)key >= {min_lit} && (int64_t)key <= {max_lit}) ? (size_t)((int64_t)key - {min_lit}) : 0u;"
+                );
+                let _ = writeln!(self.out, "    return STRATA_TABLE_{t_ident}[idx];");
+                let _ = writeln!(self.out, "}}\n");
+            } else {
+                let len = row_by_disc.len().max(1);
+                let _ = writeln!(
+                    self.out,
+                    "static BAM_UNUSED const StrataTable_{t_ident} STRATA_TABLE_{t_ident}[{len}] = {{"
+                );
+                if row_by_disc.is_empty() {
+                    if t.fields.is_empty() {
+                        let _ = writeln!(self.out, "    {{ 0u }}");
+                    } else {
+                        let zeros: Vec<String> = t
+                            .fields
+                            .iter()
+                            .map(|(_, ty)| self.c_table_static_zero(ty))
+                            .collect();
+                        let _ = writeln!(self.out, "    {{ {} }}", zeros.join(", "));
+                    }
+                } else {
+                    for (ri, (_, vals)) in row_by_disc.iter().enumerate() {
+                        let comma = if ri + 1 < len { "," } else { "" };
+                        if vals.is_empty() {
+                            let _ = writeln!(self.out, "    {{ 0u }}{comma}");
+                        } else {
+                            let _ = writeln!(self.out, "    {{ {} }}{comma}", vals.join(", "));
+                        }
+                    }
+                }
+                let _ = writeln!(self.out, "}};");
+                let keys: Vec<String> = if row_by_disc.is_empty() {
+                    vec!["0ll".to_string()]
+                } else {
+                    row_by_disc.keys().map(|&k| c_i64_lit(k)).collect()
+                };
+                let _ = writeln!(
+                    self.out,
+                    "static BAM_UNUSED const int64_t STRATA_TABLE_KEYS_{t_ident}[{len}] = {{ {} }};",
+                    keys.join(", ")
+                );
+                let _ = writeln!(
+                    self.out,
+                    "static BAM_UNUSED inline StrataTable_{t_ident} strata_table_load_{t_ident}(int32_t key) {{\n    size_t i;\n    for (i = 0u; i < {len}u; ++i) {{\n        if (STRATA_TABLE_KEYS_{t_ident}[i] == (int64_t)key) {{ return STRATA_TABLE_{t_ident}[i]; }}\n    }}\n    return STRATA_TABLE_{t_ident}[0u];\n}}\n"
+                );
             }
-            let _ = writeln!(self.out, "}};");
-            let _ = writeln!(
-                self.out,
-                "static BAM_UNUSED inline StrataTable_{t_ident} strata_table_load_{t_ident}(int32_t key) {{"
-            );
-            let _ = writeln!(
-                self.out,
-                "    size_t idx = (key >= 0 && (size_t)key < {len}u) ? (size_t)key : 0u;"
-            );
-            let _ = writeln!(self.out, "    return STRATA_TABLE_{t_ident}[idx];");
-            let _ = writeln!(self.out, "}}\n");
         }
 
         // 2. `.rodata` piecewise-linear curves.
@@ -384,6 +673,21 @@ impl<'a> EmitCtx<'a> {
             {
                 let cty = &self.layout_c_names[l_idx];
                 let _ = writeln!(mod_res_fields, "    {cty} mod_res_{};", c.idx);
+                if self.mir.net_components.iter().any(|nc| {
+                    nc.is_resource
+                        && nc.is_replicated
+                        && self.find_comp_idx(&nc.canonical_name) == Some(c.idx)
+                }) {
+                    let _ = writeln!(mod_res_fields, "    {cty} mod_res_shadow_{};", c.idx);
+                }
+            } else if c.item_kind == Some(SchemaItemKind::Stream) {
+                if let Some(l_idx) = c.layout_idx
+                    && self.layouts[l_idx].size > 0
+                {
+                    let cty = &self.layout_c_names[l_idx];
+                    let _ = writeln!(mod_res_fields, "    {cty} mod_stream_last_{};", c.idx);
+                }
+                let _ = writeln!(mod_res_fields, "    uint8_t mod_stream_has_{};", c.idx);
             }
         }
         for sp in &self.mir.spatial_indices {
@@ -409,6 +713,12 @@ impl<'a> EmitCtx<'a> {
             ""
         };
 
+        let startup_chunk_n = self
+            .systems
+            .iter()
+            .filter(|rs| rs.startup_obj_range.is_some())
+            .count()
+            .max(1);
         let _ = writeln!(
             self.out,
             "\
@@ -423,7 +733,7 @@ typedef struct StrataModState {{
     BamEntity named_objects[{obj_n}u];
     BamSystem systems[{sys_n}u];
     BamSystemSet sets[{set_n}u];
-    BamBool objects_initialized;
+    BamBool objects_initialized[{startup_chunk_n}u];
 {mod_res_fields}}} StrataModState;\n"
         );
 
@@ -462,11 +772,14 @@ typedef struct StrataModState {{
                 }
             }
         }
-        if !self.mir.objects.is_empty() {
-            let _ = writeln!(
-                self.out,
-                "static BamResult strata_sys_startup_objects(BamSystemCtx* sys_ctx, void* user_data);"
-            );
+        for rs in &self.systems {
+            if rs.startup_obj_range.is_some() {
+                let _ = writeln!(
+                    self.out,
+                    "static BamResult {}(BamSystemCtx* sys_ctx, void* user_data);",
+                    rs.c_fn_name
+                );
+            }
         }
         self.out.push('\n');
     }
@@ -478,9 +791,10 @@ typedef struct StrataModState {{
             self.c_ty(&f.ret_ty)
         };
         let fn_name = format!("strata_fn_{}", sanitize_ident(&f.name));
+        let param_tys = self.resolve_helper_param_tys(f);
         let mut params = vec!["StrataModState* state".to_string()];
-        for (i, p) in f.params.iter().enumerate() {
-            let p_ty = self.c_ty(&p.ty);
+        for (i, p_mir) in param_tys.iter().enumerate() {
+            let p_ty = self.c_ty(p_mir);
             params.push(format!("{p_ty} p_{i}"));
         }
         format!("static BAM_UNUSED {ret} {fn_name}({})", params.join(", "))
@@ -490,134 +804,145 @@ typedef struct StrataModState {{
         if self.mir.objects.is_empty() {
             return Ok(());
         }
-        let mut s = String::new();
-        let _ = writeln!(
-            s,
-            "static BamResult strata_sys_startup_objects(BamSystemCtx* sys_ctx, void* user_data) {{"
-        );
-        let _ = writeln!(s, "    StrataModState* state = (StrataModState*)user_data;");
-        let _ = writeln!(
-            s,
-            "    if (sys_ctx == NULL || state == NULL || state->api == NULL) {{ return BAM_RESULT_NULL_POINTER; }}"
-        );
-        let _ = writeln!(
-            s,
-            "    if (state->objects_initialized) {{ return BAM_RESULT_OK; }}"
-        );
-        let _ = writeln!(s, "    state->objects_initialized = BAM_TRUE;");
-        let _ = writeln!(s, "    BamCommands* cmds = NULL;");
-        let _ = writeln!(
-            s,
-            "    if (state->api->sys_commands != NULL) {{ (void)state->api->sys_commands(sys_ctx, &cmds); }}"
-        );
-
+        let startup_chunks: Vec<(String, (usize, usize))> = self
+            .systems
+            .iter()
+            .filter_map(|rs| rs.startup_obj_range.map(|r| (rs.c_fn_name.clone(), r)))
+            .collect();
         let objs = self.mir.objects.clone();
-        let mut probe_q_idx = 0usize;
-        for (o_idx, obj) in objs.iter().enumerate() {
-            let reg_obj = &self.objects[o_idx];
-            let _ = writeln!(s, "    /* Named Object: {} */", obj.name);
+        for (chunk_idx, (fn_name, (start, end))) in startup_chunks.into_iter().enumerate() {
+            let mut s = String::new();
             let _ = writeln!(
                 s,
-                "    if (state->named_objects[{o_idx}] == BAM_ENTITY_NULL) {{"
+                "static BamResult {fn_name}(BamSystemCtx* sys_ctx, void* user_data) {{"
             );
-            if reg_obj.primary_comp_idx.is_some() {
-                let qi = probe_q_idx;
-                probe_q_idx += 1;
-                let _ = writeln!(s, "        BamIter* it = NULL;");
-                let _ = writeln!(
-                    s,
-                    "        if (state->api->sys_query != NULL && state->api->sys_query(sys_ctx, {qi}u, &it) == BAM_RESULT_OK && it != NULL) {{"
-                );
-                let _ = writeln!(s, "            size_t len = 0u;");
-                let _ = writeln!(
-                    s,
-                    "            if (state->api->iter_next_chunk != NULL && state->api->iter_next_chunk(it, &len) != BAM_FALSE && len > 0u && state->api->iter_entities != NULL) {{"
-                );
-                let _ = writeln!(
-                    s,
-                    "                const BamEntity* ents = state->api->iter_entities(it);"
-                );
-                let _ = writeln!(
-                    s,
-                    "                if (ents != NULL && ents[0] != BAM_ENTITY_NULL) {{ state->named_objects[{o_idx}] = ents[0]; }}"
-                );
-                let _ = writeln!(s, "            }}");
-                let _ = writeln!(s, "        }}");
-            }
+            let _ = writeln!(s, "    StrataModState* state = (StrataModState*)user_data;");
             let _ = writeln!(
                 s,
-                "        if (state->named_objects[{o_idx}] == BAM_ENTITY_NULL && cmds != NULL) {{"
+                "    if (sys_ctx == NULL || state == NULL || state->api == NULL) {{ return BAM_RESULT_NULL_POINTER; }}"
             );
-            let bundle = self.build_object_component_bundle(obj);
-            let n_comps = bundle.len().max(1);
-            let _ = writeln!(s, "            BamComponent comps[{n_comps}u];");
-            let _ = writeln!(s, "            const uint8_t* datas[{n_comps}u];");
-            for (bi, (c_idx, init_opt)) in bundle.iter().enumerate() {
-                let comp = &self.components[*c_idx];
-                let _ = writeln!(s, "            comps[{bi}u] = state->components[{c_idx}u];");
-                if let Some(l_idx) = comp.layout_idx
-                    && self.layouts[l_idx].size > 0
-                {
-                    let cty = &self.layout_c_names[l_idx];
-                    let def_fn = format!(
-                        "strata_default_{l_idx}_{}",
-                        sanitize_ident(short_name(&self.layouts[l_idx].canonical_name))
+            let _ = writeln!(
+                s,
+                "    if (state->objects_initialized[{chunk_idx}u]) {{ return BAM_RESULT_OK; }}"
+            );
+            let _ = writeln!(
+                s,
+                "    state->objects_initialized[{chunk_idx}u] = BAM_TRUE;"
+            );
+            let _ = writeln!(s, "    BamCommands* cmds = NULL;");
+            let _ = writeln!(
+                s,
+                "    if (state->api->sys_commands != NULL) {{ (void)state->api->sys_commands(sys_ctx, &cmds); }}"
+            );
+
+            let mut probe_q_idx = 0usize;
+            for (o_idx, obj) in objs.iter().enumerate().take(end).skip(start) {
+                let reg_obj = &self.objects[o_idx];
+                let _ = writeln!(s, "    /* Named Object: {} */", obj.name);
+                let _ = writeln!(
+                    s,
+                    "    if (state->named_objects[{o_idx}] == BAM_ENTITY_NULL) {{"
+                );
+                if reg_obj.primary_comp_idx.is_some() {
+                    let qi = probe_q_idx;
+                    probe_q_idx += 1;
+                    let _ = writeln!(s, "        BamIter* it = NULL;");
+                    let _ = writeln!(
+                        s,
+                        "        if (state->api->sys_query != NULL && state->api->sys_query(sys_ctx, {qi}u, &it) == BAM_RESULT_OK && it != NULL) {{"
                     );
-                    let _ = writeln!(s, "            {cty} val_{bi} = {def_fn}();");
-                    if let Some(ci) = init_opt {
-                        for (fname, fexpr) in &ci.fields {
-                            let fc = sanitize_c_field(fname);
-                            let sf_opt =
-                                self.layouts[l_idx].fields.iter().find(|f| f.name == *fname);
-                            let field_ty = sf_opt.map(|f| f.ty.clone()).unwrap_or(Ty::Unknown);
-                            let field_sz = sf_opt.map_or(0, |f| f.size);
-                            self.emit_c_object_field_override(
-                                &mut s,
-                                "            ",
-                                &format!("val_{bi}.{fc}"),
-                                &field_ty,
-                                field_sz,
-                                fexpr,
-                                true,
-                                0,
-                            );
-                        }
-                    }
-                    let _ = writeln!(s, "            datas[{bi}u] = (const uint8_t*)&val_{bi};");
-                } else {
-                    let _ = writeln!(s, "            datas[{bi}u] = NULL;");
+                    let _ = writeln!(s, "            size_t len = 0u;");
+                    let _ = writeln!(
+                        s,
+                        "            if (state->api->iter_next_chunk != NULL && state->api->iter_next_chunk(it, &len) != BAM_FALSE && len > 0u && state->api->iter_entities != NULL) {{"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "                const BamEntity* ents = state->api->iter_entities(it);"
+                    );
+                    let _ = writeln!(
+                        s,
+                        "                if (ents != NULL && ents[0] != BAM_ENTITY_NULL) {{ state->named_objects[{o_idx}] = ents[0]; }}"
+                    );
+                    let _ = writeln!(s, "            }}");
+                    let _ = writeln!(s, "        }}");
                 }
+                let _ = writeln!(
+                    s,
+                    "        if (state->named_objects[{o_idx}] == BAM_ENTITY_NULL && cmds != NULL) {{"
+                );
+                let bundle = self.build_object_component_bundle(obj);
+                let n_comps = bundle.len().max(1);
+                let _ = writeln!(s, "            BamComponent comps[{n_comps}u];");
+                let _ = writeln!(s, "            const uint8_t* datas[{n_comps}u];");
+                for (bi, (c_idx, init_opt)) in bundle.iter().enumerate() {
+                    let comp = &self.components[*c_idx];
+                    let _ = writeln!(s, "            comps[{bi}u] = state->components[{c_idx}u];");
+                    if let Some(l_idx) = comp.layout_idx
+                        && self.layouts[l_idx].size > 0
+                    {
+                        let cty = &self.layout_c_names[l_idx];
+                        let def_fn = format!(
+                            "strata_default_{l_idx}_{}",
+                            sanitize_ident(short_name(&self.layouts[l_idx].canonical_name))
+                        );
+                        let _ = writeln!(s, "            {cty} val_{bi} = {def_fn}();");
+                        if let Some(ci) = init_opt {
+                            for (fname, fexpr) in &ci.fields {
+                                let fc = sanitize_c_field(fname);
+                                let sf_opt =
+                                    self.layouts[l_idx].fields.iter().find(|f| f.name == *fname);
+                                let field_ty = sf_opt.map(|f| f.ty.clone()).unwrap_or(Ty::Unknown);
+                                let field_sz = sf_opt.map_or(0, |f| f.size);
+                                self.emit_c_object_field_override(
+                                    &mut s,
+                                    "            ",
+                                    &format!("val_{bi}.{fc}"),
+                                    &field_ty,
+                                    field_sz,
+                                    fexpr,
+                                    true,
+                                    0,
+                                );
+                            }
+                        }
+                        let _ =
+                            writeln!(s, "            datas[{bi}u] = (const uint8_t*)&val_{bi};");
+                    } else {
+                        let _ = writeln!(s, "            datas[{bi}u] = NULL;");
+                    }
+                }
+                if bundle.is_empty() {
+                    let _ = writeln!(s, "            comps[0u] = BAM_COMPONENT_INVALID;");
+                    let _ = writeln!(s, "            datas[0u] = NULL;");
+                }
+                let spawn_fn = if obj.is_persist {
+                    "cmd_spawn_persistent"
+                } else {
+                    "cmd_spawn"
+                };
+                let real_count = bundle.len();
+                let _ = writeln!(
+                    s,
+                    "            BamEntity spawned = BAM_ENTITY_NULL;\n            if (state->api->{spawn_fn} != NULL) {{\n                (void)state->api->{spawn_fn}(cmds, comps, datas, {real_count}u, &spawned);\n            }}\n            state->named_objects[{o_idx}] = spawned;"
+                );
+                let _ = writeln!(s, "        }}");
+                let escaped = c_escape(&obj.name);
+                let _ = writeln!(
+                    s,
+                    "        if (state->named_objects[{o_idx}] != BAM_ENTITY_NULL && state->host_ctx != NULL && state->api->bind_named_object != NULL) {{"
+                );
+                let _ = writeln!(
+                    s,
+                    "            (void)state->api->bind_named_object(state->host_ctx, bam_str_view(\"{escaped}\"), state->named_objects[{o_idx}]);"
+                );
+                let _ = writeln!(s, "        }}");
+                let _ = writeln!(s, "    }}");
             }
-            if bundle.is_empty() {
-                let _ = writeln!(s, "            comps[0u] = BAM_COMPONENT_INVALID;");
-                let _ = writeln!(s, "            datas[0u] = NULL;");
-            }
-            let spawn_fn = if obj.is_persist {
-                "cmd_spawn_persistent"
-            } else {
-                "cmd_spawn"
-            };
-            let real_count = bundle.len();
-            let _ = writeln!(
-                s,
-                "            BamEntity spawned = BAM_ENTITY_NULL;\n            if (state->api->{spawn_fn} != NULL) {{\n                (void)state->api->{spawn_fn}(cmds, comps, datas, {real_count}u, &spawned);\n            }}\n            state->named_objects[{o_idx}] = spawned;"
-            );
-            let _ = writeln!(s, "        }}");
-            let escaped = c_escape(&obj.name);
-            let _ = writeln!(
-                s,
-                "        if (state->named_objects[{o_idx}] != BAM_ENTITY_NULL && state->host_ctx != NULL && state->api->bind_named_object != NULL) {{"
-            );
-            let _ = writeln!(
-                s,
-                "            (void)state->api->bind_named_object(state->host_ctx, bam_str_view(\"{escaped}\"), state->named_objects[{o_idx}]);"
-            );
-            let _ = writeln!(s, "        }}");
-            let _ = writeln!(s, "    }}");
+            let _ = writeln!(s, "    return BAM_RESULT_OK;");
+            let _ = writeln!(s, "}}\n");
+            self.out.push_str(&s);
         }
-        let _ = writeln!(s, "    return BAM_RESULT_OK;");
-        let _ = writeln!(s, "}}\n");
-        self.out.push_str(&s);
         Ok(())
     }
 
@@ -843,6 +1168,17 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
                 let short = short_name(&self.layouts[l_idx].canonical_name);
                 let def_fn = format!("strata_default_{l_idx}_{}", sanitize_ident(short));
                 let _ = writeln!(self.out, "    state->mod_res_{} = {def_fn}();", comp.idx);
+                if self.mir.net_components.iter().any(|nc| {
+                    nc.is_resource
+                        && nc.is_replicated
+                        && self.find_comp_idx(&nc.canonical_name) == Some(comp.idx)
+                }) {
+                    let _ = writeln!(
+                        self.out,
+                        "    state->mod_res_shadow_{} = state->mod_res_{};",
+                        comp.idx, comp.idx
+                    );
+                }
             }
         }
         for comp_idx in reg_order {
@@ -1037,6 +1373,23 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
                 } else {
                     format!("&comp_uuid_{idx}")
                 };
+                let reg_call = if comp.item_kind == Some(SchemaItemKind::Stream) {
+                    format!(
+                        "#ifdef BAM_HOST_API_OFFSET_REGISTER_MESSAGE\n\
+                         \x20       if (api->struct_size >= (uint32_t)(BAM_HOST_API_OFFSET_REGISTER_MESSAGE + sizeof(api->register_message)) && api->register_message != NULL) {{\n\
+                         \x20           reg_rc = api->register_message(load_ctx, &cdesc, &state->components[{idx}]);\n\
+                         \x20       }} else {{\n\
+                         \x20           reg_rc = api->register_component(load_ctx, &cdesc, &state->components[{idx}]);\n\
+                         \x20       }}\n\
+                         #else\n\
+                         \x20       reg_rc = api->register_component(load_ctx, &cdesc, &state->components[{idx}]);\n\
+                         #endif"
+                    )
+                } else {
+                    format!(
+                        "reg_rc = api->register_component(load_ctx, &cdesc, &state->components[{idx}]);"
+                    )
+                };
                 let _ = writeln!(
                     self.out,
                     "\
@@ -1045,7 +1398,7 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
             reg_rc = api->resolve_component(state->host_ctx, cdesc.name, {uuid_arg}, &state->components[{idx}]);
         }}
         if (reg_rc == BAM_RESULT_NOT_FOUND) {{
-            reg_rc = api->register_component(load_ctx, &cdesc, &state->components[{idx}]);
+            {reg_call}
         }}"
                 );
             }
@@ -1112,26 +1465,32 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
 
         if !self.sets.is_empty() {
             let sets = self.sets.clone();
-            let set_idx_by_name: HashMap<String, usize> =
-                sets.iter().map(|st| (st.name.clone(), st.idx)).collect();
+            for s in &sets {
+                let _ = writeln!(
+                    self.out,
+                    "    state->sets[{}] = BAM_SYSTEM_SET_INVALID;",
+                    s.idx
+                );
+            }
             let _ = writeln!(self.out, "    if (api->configure_schedule_set != NULL) {{");
             for s in &sets {
                 let idx = s.idx;
                 let esc = c_escape(&s.name);
-                let after_handles: Vec<String> = s
-                    .after_sets
-                    .iter()
-                    .filter_map(|n| set_idx_by_name.get(n))
-                    .map(|p_idx| format!("state->sets[{p_idx}]"))
-                    .collect();
                 let _ = writeln!(self.out, "        {{");
-                if !after_handles.is_empty() {
+                let after_count = s.after_sets.len();
+                if after_count > 0 {
                     let _ = writeln!(
                         self.out,
-                        "            BamSystemSet after_sets_{idx}[{}] = {{ {} }};",
-                        after_handles.len(),
-                        after_handles.join(", ")
+                        "            BamSystemSet after_sets_{idx}[{after_count}u];\n            uint32_t after_n_{idx} = 0u;"
                     );
+                    for &p_idx in &s.after_sets {
+                        if p_idx < idx {
+                            let _ = writeln!(
+                                self.out,
+                                "            if (state->sets[{p_idx}] != BAM_SYSTEM_SET_INVALID) {{ after_sets_{idx}[after_n_{idx}++] = state->sets[{p_idx}]; }}"
+                            );
+                        }
+                    }
                 }
                 let _ = writeln!(self.out, "            BamScheduleSetDesc set_desc;");
                 let _ = writeln!(
@@ -1145,15 +1504,10 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
                 let _ = writeln!(self.out, "            set_desc.flags = {};", s.flags_expr);
                 let _ = writeln!(self.out, "            set_desc.schedule = {};", s.schedule);
                 let _ = writeln!(self.out, "            set_desc.name = \"{esc}\";");
-                if !after_handles.is_empty() {
+                if after_count > 0 {
                     let _ = writeln!(
                         self.out,
-                        "            set_desc.after_sets = after_sets_{idx};"
-                    );
-                    let _ = writeln!(
-                        self.out,
-                        "            set_desc.after_count = {}u;",
-                        after_handles.len()
+                        "            if (after_n_{idx} > 0u) {{ set_desc.after_sets = after_sets_{idx}; set_desc.after_count = after_n_{idx}; }}"
                     );
                 }
                 let _ = writeln!(
@@ -1179,15 +1533,44 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
             self.emit_register_single_system(sys)?;
         }
 
-        if has_net_protocol(self.mir) {
-            self.emit_net_sys_registration(false);
-        }
-
         let free_net_rx = if has_net_protocol(self.mir) {
             "free(state->net_rx_buf); "
         } else {
             ""
         };
+        let mut mount_ops: Vec<(usize, usize, &'static str, Vec<usize>)> = systems
+            .iter()
+            .filter(|sys| !sys.mount_set_indices.is_empty())
+            .map(|sys| {
+                (
+                    sys.sched_order,
+                    sys.idx,
+                    sys.schedule,
+                    sys.mount_set_indices.clone(),
+                )
+            })
+            .collect();
+        if !mount_ops.is_empty() {
+            mount_ops.sort_by_key(|&(ord, idx, _, _)| (ord, idx));
+            let _ = writeln!(
+                self.out,
+                "    if (api->register_system_handle != NULL && api->mount_system_in_schedule != NULL) {{"
+            );
+            for (_, s_idx, schedule, set_indices) in mount_ops {
+                for set_idx in set_indices {
+                    let _ = writeln!(
+                        self.out,
+                        "        {{\n            BamSystemSet target_set = (state->sets[{set_idx}] != BAM_SYSTEM_SET_INVALID) ? state->sets[{set_idx}] : BAM_SYSTEM_SET_INVALID;\n            BamResult mrc = api->mount_system_in_schedule(load_ctx, state->systems[{s_idx}], {schedule}, target_set);\n            if (mrc != BAM_RESULT_OK) {{ {free_net_rx}free(state); *instance_out = NULL; return mrc; }}\n        }}"
+                    );
+                }
+            }
+            let _ = writeln!(self.out, "    }}");
+        }
+
+        if has_net_protocol(self.mir) {
+            self.emit_net_sys_registration(false);
+        }
+
         let observers = self.observers.clone();
         if !observers.is_empty() {
             let _ = writeln!(
@@ -1202,7 +1585,7 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
                 let (q_ptr, q_cnt) = self.emit_fn_query_descs(
                     obs_slot_idx,
                     Some(obs.mir_fn_idx),
-                    false,
+                    None,
                     &[],
                     &format!("c99::observer({})", obs.reg_name),
                 )?;
@@ -1250,7 +1633,7 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
         &mut self,
         s_idx: usize,
         mir_fn_idx: Option<usize>,
-        is_startup_objects: bool,
+        startup_obj_range: Option<(usize, usize)>,
         run_if_resources: &[usize],
         err_ctx: &str,
     ) -> Result<(String, String), CodegenError> {
@@ -1259,8 +1642,8 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
         let mut query_param_set_groups: Vec<u32> = Vec::new();
         let mut res_modes: BTreeMap<usize, bool> = BTreeMap::new();
         let mut msg_modes: BTreeMap<usize, bool> = BTreeMap::new();
-        if is_startup_objects {
-            for obj in &self.objects {
+        if let Some((start, end)) = startup_obj_range {
+            for obj in &self.objects[start..end] {
                 if let Some(p_idx) = obj.primary_comp_idx {
                     query_terms_c.push(vec![format!(
                         "bam_term_desc(state->components[{p_idx}], BAM_ACCESS_FILTER_ONLY, 0u)"
@@ -1274,52 +1657,13 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
             let mut query_stream_comps: HashSet<usize> = HashSet::new();
 
             for qb in &f.query_bindings {
+                let dedup = self.compute_dedup_query_terms(f, qb, err_ctx)?;
+                query_stream_comps.extend(dedup.stream_comps);
                 let mut t_strs = Vec::new();
-                let mut extra_changed: Vec<usize> = Vec::new();
-                let mut term_comp_indices: Vec<usize> = Vec::new();
-                for term in &qb.terms {
-                    let c_idx = self
-                        .find_comp_idx(&term.canonical_component)
-                        .ok_or_else(|| CodegenError::Unsupported {
-                            context: err_ctx.to_owned(),
-                            detail: format!(
-                                "missing component `{}` in query {}",
-                                term.canonical_component, qb.query_idx
-                            ),
-                        })?;
-                    term_comp_indices.push(c_idx);
-                    if matches!(
-                        term.mode,
-                        TermAccessMode::StreamRead | TermAccessMode::StreamWrite
-                    ) {
-                        query_stream_comps.insert(c_idx);
-                    }
-                    let is_changed = f.changed_terms.iter().any(|ct| {
-                        ct.query_idx == qb.query_idx
-                            && (ct.term_idx == term.term_idx
-                                || ct.canonical_component == term.canonical_component)
-                    });
-                    let mode_c = if is_changed && term.mode == TermAccessMode::Read {
-                        "BAM_ACCESS_CHANGED"
-                    } else {
-                        if is_changed && !extra_changed.contains(&c_idx) {
-                            extra_changed.push(c_idx);
-                        }
-                        c_access_mode(term.mode)
-                    };
+                for (c_idx, mode_c, flags_c) in dedup.terms {
                     t_strs.push(format!(
-                        "bam_term_desc(state->components[{c_idx}], {mode_c}, 0u)"
+                        "bam_term_desc(state->components[{c_idx}], {mode_c}, {flags_c})"
                     ));
-                }
-                if let Some(qdesc) = f.queries.get(qb.query_idx as usize) {
-                    for cf in &qdesc.changed_filters {
-                        if let Some(c_idx) = self.find_comp_idx(cf)
-                            && !term_comp_indices.contains(&c_idx)
-                            && !extra_changed.contains(&c_idx)
-                        {
-                            extra_changed.push(c_idx);
-                        }
-                    }
                 }
                 for w in &qb.with_filters {
                     if let Some(c_idx) = self.find_comp_idx(w) {
@@ -1335,9 +1679,14 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
                         ));
                     }
                 }
-                for c_idx in extra_changed {
+                for c_idx in dedup.extra_changed {
                     t_strs.push(format!(
                         "bam_term_desc(state->components[{c_idx}], BAM_ACCESS_CHANGED, 0u)"
+                    ));
+                }
+                for c_idx in dedup.extra_added {
+                    t_strs.push(format!(
+                        "bam_term_desc(state->components[{c_idx}], BAM_ACCESS_FILTER_ONLY, BAM_TERM_FLAG_ADDED)"
                     ));
                 }
                 if t_strs.len() > MAX_TERMS_PER_QUERY {
@@ -1579,7 +1928,7 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
         let (q_ptr, q_cnt) = self.emit_fn_query_descs(
             s_idx,
             sys.mir_fn_idx,
-            sys.is_startup_objects,
+            sys.startup_obj_range,
             &sys.run_if_resources,
             &format!("c99::system({})", sys.reg_name),
         )?;
@@ -1643,6 +1992,25 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
                 aw_lits.len()
             );
         }
+        if !sys.before_names.is_empty() {
+            let bef_lits: Vec<String> = sys
+                .before_names
+                .iter()
+                .map(|b| format!("\"{}\"", c_escape(b)))
+                .collect();
+            let _ = writeln!(
+                self.out,
+                "        static const char* const sys_before_{s_idx}[{}] = {{ {} }};",
+                bef_lits.len(),
+                bef_lits.join(", ")
+            );
+            let _ = writeln!(self.out, "        sdesc.before = sys_before_{s_idx};");
+            let _ = writeln!(
+                self.out,
+                "        sdesc.before_count = {}u;",
+                bef_lits.len()
+            );
+        }
         if !sys.in_sets.is_empty() {
             let set_lits: Vec<String> = sys
                 .in_sets
@@ -1675,15 +2043,20 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
         } else {
             ""
         };
+        let mount_inline = if sys.mount_set_indices.is_empty() {
+            format!(
+                "\n            if (syarc == BAM_RESULT_OK) {{\n                syarc = api->mount_system_in_schedule(load_ctx, state->systems[{s_idx}], {}, BAM_SYSTEM_SET_INVALID);\n            }}",
+                sys.schedule
+            )
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             self.out,
             "\
         BamResult syarc = BAM_RESULT_UNSUPPORTED;
         if (api->register_system_handle != NULL && api->mount_system_in_schedule != NULL) {{
-            syarc = api->register_system_handle(load_ctx, &sdesc, &state->systems[{s_idx}]);
-            if (syarc == BAM_RESULT_OK) {{
-                syarc = api->mount_system_in_schedule(load_ctx, state->systems[{s_idx}], {}, BAM_SYSTEM_SET_INVALID);
-            }}
+            syarc = api->register_system_handle(load_ctx, &sdesc, &state->systems[{s_idx}]);{mount_inline}
         }} else if (api->register_system != NULL) {{
             syarc = api->register_system(load_ctx, &sdesc);
         }}
@@ -1691,8 +2064,7 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
             {free_net_rx}free(state);
             *instance_out = NULL;
             return syarc;
-        }}",
-            sys.schedule
+        }}"
         );
         let _ = writeln!(self.out, "    }}");
         Ok(())

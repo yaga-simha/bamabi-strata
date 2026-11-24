@@ -10,7 +10,8 @@ use std::fmt::Write as _;
 use bamabi_sys::{ComponentUuid, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, fnv1a_64_str};
 use strata_mir::ir::{
     BasicBlock, BlockId, Inst, LocalId, MirConstVal, MirFnKind, MirFunction, MirModule,
-    MirNetComponent, MirNetFieldSpec, MirRpc, MirStmt, MirStreamOpKind, MirType, Terminator,
+    MirNetComponent, MirNetFieldSpec, MirQueryBinding, MirRpc, MirStmt, MirStreamOpKind, MirType,
+    Terminator,
 };
 use strata_sema::access::TermAccessMode;
 use strata_sema::hir::{
@@ -104,7 +105,7 @@ struct RegScheduleSet {
     name: String,
     schedule: &'static str,
     flags_expr: &'static str,
-    after_sets: Vec<String>,
+    after_sets: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -117,10 +118,23 @@ struct RegSystem {
     flags_expr: String,
     after_names: Vec<String>,
     after_weak_names: Vec<String>,
+    before_names: Vec<String>,
     in_sets: Vec<String>,
+    mount_set_indices: Vec<usize>,
+    sched_order: usize,
     run_if_fn: Option<String>,
     run_if_resources: Vec<usize>,
-    is_startup_objects: bool,
+    startup_obj_range: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DedupQueryTerms {
+    pub(super) terms: Vec<(usize, &'static str, &'static str)>,
+    pub(super) extra_changed: Vec<usize>,
+    pub(super) extra_added: Vec<usize>,
+    pub(super) remap: HashMap<u32, u32>,
+    pub(super) aliased_dedup_indices: HashSet<u32>,
+    pub(super) stream_comps: HashSet<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +218,7 @@ struct EmitCtx<'a> {
     helper_by_name: HashMap<String, usize>,
     tuple_types: Vec<(Vec<MirType>, String)>,
     array_types: Vec<(MirType, usize, String)>,
+    raw_pod_sizes: BTreeSet<usize>,
     composite_order: Vec<CompositeDecl>,
     run_if_wrappers: Vec<String>,
 }
@@ -251,6 +266,7 @@ impl<'a> EmitCtx<'a> {
             helper_by_name: HashMap::new(),
             tuple_types: Vec::new(),
             array_types: Vec::new(),
+            raw_pod_sizes: BTreeSet::new(),
             composite_order: Vec::new(),
             run_if_wrappers: Vec::new(),
         };
@@ -370,6 +386,42 @@ impl<'a> EmitCtx<'a> {
                     collect_inst_components(&stmt.inst, &mut extra_tags);
                 }
             }
+        }
+        let mut uses_child_of = false;
+        for f in &fns_snapshot {
+            for bb in &f.blocks {
+                for stmt in &bb.stmts {
+                    if let Inst::CmdInsertRelation { relation, .. }
+                    | Inst::CmdRemoveRelation { relation, .. } = &stmt.inst
+                        && is_child_of_rel(relation)
+                    {
+                        uses_child_of = true;
+                    }
+                }
+            }
+        }
+        if uses_child_of && self.find_comp_idx(bamabi_sys::BAM_CHILD_OF_NAME).is_none() {
+            let uuid = ComponentUuid::from_parts(bamabi_sys::BAM_CHILD_OF_NAME, 8, 8, 0);
+            let (_, fp) = compute_wire_identity(bamabi_sys::BAM_CHILD_OF_NAME, 8, 8, 0, true, &[]);
+            let idx = self.components.len();
+            self.comp_by_key
+                .insert(bamabi_sys::BAM_CHILD_OF_NAME.to_string(), idx);
+            self.comp_by_key.insert("ChildOf".to_string(), idx);
+            self.components.push(RegComponent {
+                idx,
+                canonical: bamabi_sys::BAM_CHILD_OF_NAME.to_string(),
+                short: "ChildOf".to_string(),
+                layout_idx: None,
+                item_kind: None,
+                has_mod_res: false,
+                size: 8,
+                align: 8,
+                uuid,
+                fingerprint: fp,
+                flags: 0,
+                migration_fn: None,
+                required_indices: Vec::new(),
+            });
         }
         for tag in extra_tags {
             if self.find_comp_idx(&tag).is_none() {
@@ -718,21 +770,271 @@ impl<'a> EmitCtx<'a> {
             .map(|sp| sp.name.clone())
     }
 
+    pub(super) fn compute_dedup_query_terms(
+        &self,
+        f: &MirFunction,
+        qb: &MirQueryBinding,
+        err_ctx: &str,
+    ) -> Result<DedupQueryTerms, CodegenError> {
+        #[derive(Clone, Copy)]
+        struct AccEntry {
+            c_idx: usize,
+            mode: TermAccessMode,
+            is_changed: bool,
+            is_added: bool,
+            seen_count: usize,
+        }
+
+        let mut entries: Vec<AccEntry> = Vec::new();
+        let mut comp_to_pos: HashMap<usize, usize> = HashMap::new();
+        let mut remap: HashMap<u32, u32> = HashMap::new();
+        let mut stream_comps: HashSet<usize> = HashSet::new();
+
+        for term in &qb.terms {
+            let c_idx = self
+                .find_comp_idx(&term.canonical_component)
+                .ok_or_else(|| CodegenError::Unsupported {
+                    context: err_ctx.to_owned(),
+                    detail: format!(
+                        "missing component `{}` in query {}",
+                        term.canonical_component, qb.query_idx
+                    ),
+                })?;
+            if matches!(
+                term.mode,
+                TermAccessMode::StreamRead | TermAccessMode::StreamWrite
+            ) {
+                stream_comps.insert(c_idx);
+            }
+            let is_changed = f.changed_terms.iter().any(|ct| {
+                ct.query_idx == qb.query_idx
+                    && (ct.term_idx == term.term_idx
+                        || ct.canonical_component == term.canonical_component)
+            });
+            let is_added = f.added_terms.iter().any(|at| {
+                at.query_idx == qb.query_idx
+                    && (at.term_idx == term.term_idx
+                        || at.canonical_component == term.canonical_component)
+            });
+            if let Some(&pos) = comp_to_pos.get(&c_idx) {
+                let entry = &mut entries[pos];
+                entry.mode = merge_term_access_mode(entry.mode, term.mode);
+                entry.is_changed |= is_changed;
+                entry.is_added |= is_added;
+                entry.seen_count += 1;
+                remap.insert(term.term_idx, pos as u32);
+            } else {
+                let pos = entries.len();
+                comp_to_pos.insert(c_idx, pos);
+                entries.push(AccEntry {
+                    c_idx,
+                    mode: term.mode,
+                    is_changed,
+                    is_added,
+                    seen_count: 1,
+                });
+                remap.insert(term.term_idx, pos as u32);
+            }
+        }
+
+        let mut terms = Vec::with_capacity(entries.len());
+        let mut aliased_dedup_indices = HashSet::new();
+        let mut extra_changed = Vec::new();
+        let mut extra_added = Vec::new();
+
+        for (pos, e) in entries.iter().enumerate() {
+            if e.seen_count > 1 {
+                aliased_dedup_indices.insert(pos as u32);
+            }
+            let (mode_c, flags_c) = if e.is_added {
+                if e.is_changed {
+                    (
+                        c_access_mode(e.mode),
+                        "BAM_TERM_FLAG_CHANGED | BAM_TERM_FLAG_ADDED",
+                    )
+                } else {
+                    (c_access_mode(e.mode), "BAM_TERM_FLAG_ADDED")
+                }
+            } else if e.is_changed && e.mode == TermAccessMode::Read {
+                ("BAM_ACCESS_CHANGED", "0u")
+            } else {
+                if e.is_changed && !extra_changed.contains(&e.c_idx) {
+                    extra_changed.push(e.c_idx);
+                }
+                (c_access_mode(e.mode), "0u")
+            };
+            terms.push((e.c_idx, mode_c, flags_c));
+        }
+
+        if let Some(qdesc) = f.queries.get(qb.query_idx as usize) {
+            for cf in &qdesc.changed_filters {
+                if let Some(c_idx) = self.find_comp_idx(cf)
+                    && !comp_to_pos.contains_key(&c_idx)
+                    && !extra_changed.contains(&c_idx)
+                {
+                    extra_changed.push(c_idx);
+                }
+            }
+        }
+        for (qi, af) in &f.added_filters {
+            if *qi == qb.query_idx
+                && let Some(c_idx) = self.find_comp_idx(af)
+                && !comp_to_pos.contains_key(&c_idx)
+                && !extra_added.contains(&c_idx)
+            {
+                extra_added.push(c_idx);
+            }
+        }
+
+        Ok(DedupQueryTerms {
+            terms,
+            extra_changed,
+            extra_added,
+            remap,
+            aliased_dedup_indices,
+            stream_comps,
+        })
+    }
+
+    pub(super) fn resolve_helper_param_tys(&self, f: &MirFunction) -> Vec<MirType> {
+        let mut out: Vec<MirType> = f.params.iter().map(|p| p.ty.clone()).collect();
+        if !matches!(f.kind, MirFnKind::HelperFn) {
+            return out;
+        }
+        let all_fns = self.mir_functions();
+        for (pi, p) in f.params.iter().enumerate() {
+            if !matches!(p.ty, MirType::Ptr | MirType::MutPtr) {
+                continue;
+            }
+            if p.layout_key
+                .as_deref()
+                .and_then(|k| self.find_layout_idx(k))
+                .is_some()
+            {
+                continue;
+            }
+            let Some(ploc) = p.local else {
+                continue;
+            };
+            let used_as_ptr = f.blocks.iter().any(|bb| {
+                bb.stmts.iter().any(|st| match &st.inst {
+                    Inst::FieldPtr { base_ptr, .. }
+                    | Inst::FieldLoad { base_ptr, .. }
+                    | Inst::FieldStore { base_ptr, .. }
+                    | Inst::ArrayStore { base_ptr, .. } => *base_ptr == ploc,
+                    Inst::ArrayIndex { base, .. } => *base == ploc,
+                    Inst::BitSetGet { ptr, .. }
+                    | Inst::BitSetSet { ptr, .. }
+                    | Inst::BitSetClear { ptr, .. }
+                    | Inst::GraceArm { ptr, .. }
+                    | Inst::GraceClear { ptr, .. }
+                    | Inst::GraceIsActive { ptr, .. }
+                    | Inst::GraceTick { ptr, .. }
+                    | Inst::InputBufPush { ptr, .. }
+                    | Inst::InputBufConsume { ptr, .. }
+                    | Inst::InputBufPeek { ptr, .. }
+                    | Inst::InputBufTick { ptr, .. }
+                    | Inst::TimelineInWindow { ptr, .. } => *ptr == ploc,
+                    Inst::TimelineAdvance { cursor_ptr, .. } => *cursor_ptr == ploc,
+                    _ => false,
+                })
+            });
+            if used_as_ptr {
+                continue;
+            }
+            let mut inferred: Option<MirType> = None;
+            for caller in all_fns {
+                for bb in &caller.blocks {
+                    for st in &bb.stmts {
+                        if let Inst::Call { callee, args } = &st.inst
+                            && (callee == &f.name || short_name(callee) == short_name(&f.name))
+                            && let Some(&arg_id) = args.get(pi)
+                            && let Some(arg_loc) = caller.locals.iter().find(|l| l.id == arg_id)
+                            && !matches!(arg_loc.ty, MirType::Ptr | MirType::MutPtr | MirType::Unit)
+                        {
+                            inferred = Some(arg_loc.ty.clone());
+                            break;
+                        }
+                    }
+                    if inferred.is_some() {
+                        break;
+                    }
+                }
+                if inferred.is_some() {
+                    break;
+                }
+            }
+            if inferred.is_none() {
+                for bb in &f.blocks {
+                    for st in &bb.stmts {
+                        if let Inst::BinOp { lhs, rhs, .. } = &st.inst {
+                            let peer = if *lhs == ploc {
+                                Some(*rhs)
+                            } else if *rhs == ploc {
+                                Some(*lhs)
+                            } else {
+                                None
+                            };
+                            if let Some(pid) = peer
+                                && let Some(pl) = f.locals.iter().find(|l| l.id == pid)
+                                && !matches!(pl.ty, MirType::Ptr | MirType::MutPtr | MirType::Unit)
+                            {
+                                inferred = Some(pl.ty.clone());
+                                break;
+                            }
+                        }
+                    }
+                    if inferred.is_some() {
+                        break;
+                    }
+                }
+            }
+            if inferred.is_none() {
+                for bb in &f.blocks {
+                    if let Terminator::Return(Some(rid)) = &bb.terminator
+                        && *rid == ploc
+                        && !matches!(f.ret_ty, MirType::Ptr | MirType::MutPtr | MirType::Unit)
+                    {
+                        inferred = Some(f.ret_ty.clone());
+                        break;
+                    }
+                }
+            }
+            if let Some(ty) = inferred {
+                out[pi] = ty;
+            }
+        }
+        out
+    }
+
     fn collect_schedules_and_systems(&mut self) -> Result<(), CodegenError> {
-        let mut sys_sets: HashMap<String, Vec<String>> = HashMap::new();
+        let mut sys_in_sets: HashMap<String, Vec<String>> = HashMap::new();
+        let mut sys_mount_sets: HashMap<String, Vec<usize>> = HashMap::new();
         let mut sys_after: HashMap<String, Vec<String>> = HashMap::new();
+        let mut sys_after_weak: HashMap<String, Vec<String>> = HashMap::new();
+        let mut sys_before: HashMap<String, Vec<String>> = HashMap::new();
+        let mut sys_sched_order: HashMap<String, usize> = HashMap::new();
+        let mut set_index_map: HashMap<(&'static str, String), usize> = HashMap::new();
+        let mut set_seq_counter = 0usize;
+        let mut leaf_order = 0usize;
 
         for sched in &self.mir.schedules {
             let sched_c = c_schedule_const(&sched.label);
-            let mut prev_set_name: Option<String> = None;
+            let mut parent_sets: Vec<(usize, String)> = Vec::new();
             for node in &sched.nodes {
-                self.walk_schedule_node(
+                let (_leaves, _cur_set_idx) = self.walk_schedule_node(
                     node,
                     sched_c,
-                    &mut prev_set_name,
-                    None,
-                    &mut sys_sets,
+                    &mut parent_sets,
+                    &mut set_index_map,
+                    &mut set_seq_counter,
+                    &mut leaf_order,
+                    &mut sys_in_sets,
+                    &mut sys_mount_sets,
                     &mut sys_after,
+                    &mut sys_after_weak,
+                    &mut sys_before,
+                    &mut sys_sched_order,
                 );
             }
         }
@@ -759,22 +1061,49 @@ impl<'a> EmitCtx<'a> {
             0
         };
 
+        let mut startup_obj_names: Vec<String> = Vec::new();
         if !self.mir.objects.is_empty() {
-            let idx = self.systems.len();
-            self.systems.push(RegSystem {
-                idx,
-                mir_fn_idx: None,
-                c_fn_name: "strata_sys_startup_objects".to_string(),
-                reg_name: "__strata_startup_objects".to_string(),
-                schedule: "BAM_SCHEDULE_STARTUP",
-                flags_expr: "BAM_SYSTEM_FLAG_MAIN_THREAD".to_string(),
-                after_names: Vec::new(),
-                after_weak_names: Vec::new(),
-                in_sets: Vec::new(),
-                run_if_fn: None,
-                run_if_resources: Vec::new(),
-                is_startup_objects: true,
-            });
+            let obj_total = self.mir.objects.len();
+            let obj_chunk_sz = MAX_QUERIES_PER_SYSTEM.max(1);
+            let obj_chunks = obj_total.div_ceil(obj_chunk_sz);
+            for chunk_idx in 0..obj_chunks {
+                let start = chunk_idx * obj_chunk_sz;
+                let end = (start + obj_chunk_sz).min(obj_total);
+                let (c_fn_name, reg_name) = if obj_chunks == 1 {
+                    (
+                        "strata_sys_startup_objects".to_string(),
+                        "__strata_startup_objects".to_string(),
+                    )
+                } else {
+                    (
+                        format!("strata_sys_startup_objects_{chunk_idx}"),
+                        format!("__strata_startup_objects_{chunk_idx}"),
+                    )
+                };
+                let mut after_names = Vec::new();
+                if let Some(prev_name) = startup_obj_names.last() {
+                    after_names.push(prev_name.clone());
+                }
+                startup_obj_names.push(reg_name.clone());
+                let idx = self.systems.len();
+                self.systems.push(RegSystem {
+                    idx,
+                    mir_fn_idx: None,
+                    c_fn_name,
+                    reg_name,
+                    schedule: "BAM_SCHEDULE_STARTUP",
+                    flags_expr: "BAM_SYSTEM_FLAG_MAIN_THREAD".to_string(),
+                    after_names,
+                    after_weak_names: Vec::new(),
+                    before_names: Vec::new(),
+                    in_sets: Vec::new(),
+                    mount_set_indices: Vec::new(),
+                    sched_order: chunk_idx,
+                    run_if_fn: None,
+                    run_if_resources: Vec::new(),
+                    startup_obj_range: Some((start, end)),
+                });
+            }
         }
 
         for (fn_idx, f) in fns_snapshot.iter().enumerate() {
@@ -798,6 +1127,14 @@ impl<'a> EmitCtx<'a> {
                         .remove(&reg_name)
                         .or_else(|| sys_after.remove(&f.name))
                         .unwrap_or_default();
+                    let after_weak_list = sys_after_weak
+                        .remove(&reg_name)
+                        .or_else(|| sys_after_weak.remove(&f.name))
+                        .unwrap_or_default();
+                    let before_names = sys_before
+                        .remove(&reg_name)
+                        .or_else(|| sys_before.remove(&f.name))
+                        .unwrap_or_default();
                     if !is_timer_tick
                         && sched_c == "BAM_SCHEDULE_FIXED_UPDATE"
                         && let Some(ref tt_name) = timer_tick_reg_name
@@ -805,16 +1142,35 @@ impl<'a> EmitCtx<'a> {
                     {
                         after_names.push(tt_name.clone());
                     }
-                    let mut after_weak_names = Vec::new();
-                    if sched_c == "BAM_SCHEDULE_FIXED_UPDATE" && net_chunk_count > 0 {
-                        for chunk_idx in 0..net_chunk_count {
-                            after_weak_names.push(format!("__strata_net_rx_{chunk_idx}"));
+                    if sched_c == "BAM_SCHEDULE_STARTUP" {
+                        for st_name in &startup_obj_names {
+                            if !after_names.contains(st_name) {
+                                after_names.push(st_name.clone());
+                            }
                         }
                     }
-                    let in_sets = sys_sets
+                    let mut after_weak_names = after_weak_list;
+                    if sched_c == "BAM_SCHEDULE_FIXED_UPDATE" && net_chunk_count > 0 {
+                        for chunk_idx in 0..net_chunk_count {
+                            let rx_name = format!("__strata_net_rx_{chunk_idx}");
+                            if !after_weak_names.contains(&rx_name) {
+                                after_weak_names.push(rx_name);
+                            }
+                        }
+                    }
+                    let in_sets = sys_in_sets
                         .remove(&reg_name)
-                        .or_else(|| sys_sets.remove(&f.name))
+                        .or_else(|| sys_in_sets.remove(&f.name))
                         .unwrap_or_default();
+                    let mount_set_indices = sys_mount_sets
+                        .remove(&reg_name)
+                        .or_else(|| sys_mount_sets.remove(&f.name))
+                        .unwrap_or_default();
+                    let sched_order = sys_sched_order
+                        .get(&reg_name)
+                        .or_else(|| sys_sched_order.get(&f.name))
+                        .copied()
+                        .unwrap_or(usize::MAX);
                     let run_if_fn = self.schedule_run_if_for(sched_label, fn_idx);
                     let run_if_resources = run_if_fn
                         .as_ref()
@@ -831,10 +1187,13 @@ impl<'a> EmitCtx<'a> {
                         flags_expr: "0u".to_string(),
                         after_names,
                         after_weak_names,
+                        before_names,
                         in_sets,
+                        mount_set_indices,
+                        sched_order,
                         run_if_fn: run_if_name,
                         run_if_resources,
-                        is_startup_objects: false,
+                        startup_obj_range: None,
                     });
                 }
                 MirFnKind::Observer { event, target_comp } => {
@@ -882,9 +1241,6 @@ impl<'a> EmitCtx<'a> {
                 res_indices.push(c.idx);
             }
         }
-        if res_indices.is_empty() {
-            return None;
-        }
         let fn_name = format!("strata_run_if_{}_{}", sanitize_ident(sched_label), sys_idx);
         let cond_c = self.translate_run_if_expr(cond_expr, &res_indices);
         let mut body = String::new();
@@ -896,9 +1252,13 @@ impl<'a> EmitCtx<'a> {
             body,
             "    const StrataModState* state = (const StrataModState*)user_data;"
         );
-        let _ = writeln!(body, "    if (state == NULL || state->api == NULL) {{");
-        let _ = writeln!(body, "        return BAM_RESULT_OK;");
-        let _ = writeln!(body, "    }}");
+        if res_indices.is_empty() {
+            let _ = writeln!(body, "    (void)sys_ctx; (void)state;");
+        } else {
+            let _ = writeln!(body, "    if (state == NULL || state->api == NULL) {{");
+            let _ = writeln!(body, "        return BAM_RESULT_OK;");
+            let _ = writeln!(body, "    }}");
+        }
         for &r_idx in &res_indices {
             if let Some(l_idx) = self.components[r_idx].layout_idx {
                 let cty = &self.layout_c_names[l_idx];
@@ -934,6 +1294,12 @@ impl<'a> EmitCtx<'a> {
         if let Some(inner) = s.strip_prefix("run_if(").and_then(|r| r.strip_suffix(')')) {
             s = inner.trim();
         }
+        if s == "false" {
+            return "BAM_FALSE".to_string();
+        }
+        if s == "true" {
+            return "BAM_TRUE".to_string();
+        }
         let mut s = s.to_string();
         for &r_idx in res_indices {
             let short = &self.components[r_idx].short;
@@ -954,93 +1320,171 @@ impl<'a> EmitCtx<'a> {
         s
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk_schedule_node(
         &mut self,
         node: &HirScheduleGroup,
         sched_c: &'static str,
-        prev_sibling: &mut Option<String>,
-        parent_set: Option<&str>,
-        sys_sets: &mut HashMap<String, Vec<String>>,
+        parent_sets: &mut Vec<(usize, String)>,
+        set_index_map: &mut HashMap<(&'static str, String), usize>,
+        set_seq_counter: &mut usize,
+        leaf_order: &mut usize,
+        sys_in_sets: &mut HashMap<String, Vec<String>>,
+        sys_mount_sets: &mut HashMap<String, Vec<usize>>,
         sys_after: &mut HashMap<String, Vec<String>>,
-    ) {
+        sys_after_weak: &mut HashMap<String, Vec<String>>,
+        sys_before: &mut HashMap<String, Vec<String>>,
+        sys_sched_order: &mut HashMap<String, usize>,
+    ) -> (Vec<String>, Option<usize>) {
+        let push_uniq_s = |map: &mut HashMap<String, Vec<String>>, key: &str, val: String| {
+            let list = map.entry(key.to_string()).or_default();
+            if !list.contains(&val) {
+                list.push(val);
+            }
+        };
         match node.kind.as_str() {
-            "leaf" => {
+            "leaf" if !node.name.is_empty() => {
                 let leaf_name = short_name(&node.name).to_string();
-                if let Some(pset) = parent_set {
-                    sys_sets
-                        .entry(leaf_name.clone())
-                        .or_default()
-                        .push(pset.to_string());
+                sys_sched_order.entry(leaf_name.clone()).or_insert_with(|| {
+                    let o = *leaf_order;
+                    *leaf_order += 1;
+                    o
+                });
+                for (_, ps_name) in parent_sets.iter() {
+                    push_uniq_s(sys_in_sets, &leaf_name, ps_name.clone());
                 }
-                if let Some(prev) = prev_sibling {
-                    sys_after
-                        .entry(leaf_name)
-                        .or_default()
-                        .push(short_name(prev).to_string());
+                if let Some(&(set_idx, _)) = parent_sets.last() {
+                    let mlist = sys_mount_sets.entry(leaf_name.clone()).or_default();
+                    if !mlist.contains(&set_idx) {
+                        mlist.push(set_idx);
+                    }
                 }
+                for a in &node.after {
+                    push_uniq_s(sys_after, &leaf_name, short_name(a).to_string());
+                }
+                for b in &node.before {
+                    push_uniq_s(sys_before, &leaf_name, short_name(b).to_string());
+                }
+                (vec![leaf_name], None)
             }
             kind @ ("seq" | "seq_weak" | "par" | "set") => {
                 let set_name = if node.name.is_empty() {
-                    format!("set_{}", self.sets.len())
+                    *set_seq_counter += 1;
+                    format!("__group_{set_seq_counter}")
                 } else {
                     short_name(&node.name).to_string()
                 };
-                let flags_expr = match kind {
-                    "seq" => "BAM_SCHEDULE_SET_FLAG_SEQUENCE",
-                    "seq_weak" => "BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK",
-                    _ => "BAM_SCHEDULE_SET_FLAG_PARALLEL",
+                let key = (sched_c, set_name.clone());
+                let own_set_idx = if let Some(&existing) = set_index_map.get(&key) {
+                    existing
+                } else {
+                    let flags_expr = match kind {
+                        "seq" => "BAM_SCHEDULE_SET_FLAG_SEQUENCE",
+                        "seq_weak" => "BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK",
+                        _ => "BAM_SCHEDULE_SET_FLAG_PARALLEL",
+                    };
+                    let idx = self.sets.len();
+                    self.sets.push(RegScheduleSet {
+                        idx,
+                        name: set_name.clone(),
+                        schedule: sched_c,
+                        flags_expr,
+                        after_sets: Vec::new(),
+                    });
+                    set_index_map.insert(key, idx);
+                    idx
                 };
-                let mut after_sets = Vec::new();
-                if let Some(prev) = prev_sibling.as_ref() {
-                    after_sets.push(prev.clone());
-                }
-                let idx = self.sets.len();
-                self.sets.push(RegScheduleSet {
-                    idx,
-                    name: set_name.clone(),
-                    schedule: sched_c,
-                    flags_expr,
-                    after_sets,
-                });
-                let mut child_prev: Option<String> = None;
+                parent_sets.push((own_set_idx, set_name));
+                let is_seq = kind == "seq";
+                let is_seq_weak = kind == "seq_weak";
+                let mut prev_leaves: Vec<String> = Vec::new();
+                let mut prev_set_idx: Option<usize> = None;
+                let mut all_leaves: Vec<String> = Vec::new();
                 for child in &node.children {
-                    if kind == "seq" || kind == "seq_weak" {
-                        self.walk_schedule_node(
-                            child,
-                            sched_c,
-                            &mut child_prev,
-                            Some(&set_name),
-                            sys_sets,
-                            sys_after,
-                        );
-                        if child.kind == "leaf" {
-                            child_prev = Some(child.name.clone());
-                        }
-                    } else {
-                        let mut no_prev = None;
-                        self.walk_schedule_node(
-                            child,
-                            sched_c,
-                            &mut no_prev,
-                            Some(&set_name),
-                            sys_sets,
-                            sys_after,
-                        );
-                    }
-                }
-                *prev_sibling = Some(set_name);
-            }
-            _ => {
-                for child in &node.children {
-                    self.walk_schedule_node(
+                    let (leaves, cur_set_idx) = self.walk_schedule_node(
                         child,
                         sched_c,
-                        prev_sibling,
-                        parent_set,
-                        sys_sets,
+                        parent_sets,
+                        set_index_map,
+                        set_seq_counter,
+                        leaf_order,
+                        sys_in_sets,
+                        sys_mount_sets,
                         sys_after,
+                        sys_after_weak,
+                        sys_before,
+                        sys_sched_order,
                     );
+                    if is_seq || is_seq_weak {
+                        if let (Some(p_s), Some(c_s)) = (prev_set_idx, cur_set_idx)
+                            && p_s != c_s
+                            && !self.sets[c_s].after_sets.contains(&p_s)
+                        {
+                            self.sets[c_s].after_sets.push(p_s);
+                        }
+                        for l in &leaves {
+                            for pl in &prev_leaves {
+                                if pl != l {
+                                    if is_seq {
+                                        push_uniq_s(sys_after, l, pl.clone());
+                                    } else {
+                                        push_uniq_s(sys_after_weak, l, pl.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !leaves.is_empty() {
+                        prev_leaves = leaves.clone();
+                    }
+                    if cur_set_idx.is_some() {
+                        prev_set_idx = cur_set_idx;
+                    } else if !leaves.is_empty() {
+                        prev_set_idx = None;
+                    }
+                    all_leaves.extend(leaves);
                 }
+                parent_sets.pop();
+                for a in &node.after {
+                    let a_short = short_name(a).to_string();
+                    if let Some(&a_idx) = set_index_map.get(&(sched_c, a_short.clone()))
+                        && a_idx != own_set_idx
+                        && !self.sets[own_set_idx].after_sets.contains(&a_idx)
+                    {
+                        self.sets[own_set_idx].after_sets.push(a_idx);
+                    }
+                    for l in &all_leaves {
+                        push_uniq_s(sys_after, l, a_short.clone());
+                    }
+                }
+                for b in &node.before {
+                    let b_short = short_name(b).to_string();
+                    for l in &all_leaves {
+                        push_uniq_s(sys_before, l, b_short.clone());
+                    }
+                }
+                (all_leaves, Some(own_set_idx))
+            }
+            _ => {
+                let mut all_leaves = Vec::new();
+                for child in &node.children {
+                    let (leaves, _) = self.walk_schedule_node(
+                        child,
+                        sched_c,
+                        parent_sets,
+                        set_index_map,
+                        set_seq_counter,
+                        leaf_order,
+                        sys_in_sets,
+                        sys_mount_sets,
+                        sys_after,
+                        sys_after_weak,
+                        sys_before,
+                        sys_sched_order,
+                    );
+                    all_leaves.extend(leaves);
+                }
+                (all_leaves, None)
             }
         }
     }
@@ -1057,19 +1501,115 @@ impl<'a> EmitCtx<'a> {
             roots.push(f.ret_ty.clone());
             for bb in &f.blocks {
                 for st in &bb.stmts {
-                    if let Inst::SlotAlloc { ty } = &st.inst {
-                        roots.push(ty.clone());
+                    match &st.inst {
+                        Inst::SlotAlloc { ty } => roots.push(ty.clone()),
+                        Inst::FieldLoad { field_ty, .. } => roots.push(field_ty.clone()),
+                        Inst::ArrayStore { elem_ty, .. } => roots.push(elem_ty.clone()),
+                        _ => {}
                     }
                 }
             }
+        }
+        let sema_roots: Vec<Ty> = self
+            .mir
+            .tables
+            .iter()
+            .flat_map(|t| t.fields.iter().map(|(_, ty)| ty.clone()))
+            .chain(self.layouts.iter().flat_map(|l| {
+                l.fields
+                    .iter()
+                    .filter(|f| !f.is_padding)
+                    .map(|f| f.ty.clone())
+            }))
+            .chain(self.mir.consts.iter().map(|c| c.ty.clone()))
+            .collect();
+        for ty in &sema_roots {
+            self.register_sema_composite_type(ty);
         }
         for ty in &roots {
             self.register_composite_type(ty);
         }
     }
 
+    fn sema_to_mir_storage_ty(ty: &Ty) -> MirType {
+        match ty {
+            Ty::Bool => MirType::Bool,
+            Ty::I8 => MirType::I8,
+            Ty::I16 => MirType::I16,
+            Ty::I32 => MirType::I32,
+            Ty::I64 => MirType::I64,
+            Ty::U8 => MirType::U8,
+            Ty::U16 => MirType::U16,
+            Ty::U32 | Ty::Sym | Ty::Rgba8 => MirType::U32,
+            Ty::U64 => MirType::U64,
+            Ty::Fix32 => MirType::Fix32,
+            Ty::Fix64 => MirType::Fix64,
+            Ty::F32 | Ty::UnitScalar { .. } => MirType::F32,
+            Ty::F64 => MirType::F64,
+            Ty::GraceWindow => MirType::Named("GraceWindow".to_owned()),
+            Ty::Vec2 => MirType::Vec2,
+            Ty::Vec3 => MirType::Vec3,
+            Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => MirType::Vec4,
+            Ty::IVec2 => MirType::IVec2,
+            Ty::IVec3 => MirType::IVec3,
+            Ty::UVec2 => MirType::UVec2,
+            Ty::Mat3 => MirType::Named("mat3".to_owned()),
+            Ty::Mat4 => MirType::Named("mat4".to_owned()),
+            Ty::Ref(_) => MirType::Entity,
+            Ty::BitSet(bits) => MirType::Named(format!("BitSet<{bits}>")),
+            Ty::InlineStr(cap) => MirType::Named(format!("InlineStr<{cap}>")),
+            Ty::InputBuffer { action, cap } => {
+                MirType::Named(format!("InputBuffer<{action},{cap}>"))
+            }
+            Ty::SmallVec { elem, cap } => MirType::Named(format!("SmallVec<{elem:?},{cap}>")),
+            Ty::Array { elem, len } => MirType::Array {
+                elem: Box::new(Self::sema_to_mir_storage_ty(elem)),
+                len: *len,
+            },
+            Ty::Tuple(items) => {
+                MirType::Tuple(items.iter().map(Self::sema_to_mir_storage_ty).collect())
+            }
+            Ty::Named(n) => MirType::Named(n.clone()),
+            _ => MirType::Unit,
+        }
+    }
+
+    fn register_sema_composite_type(&mut self, ty: &Ty) {
+        if let Some((sz, _)) = self.sema_ty_size_align(ty)
+            && matches!(
+                ty,
+                Ty::BitSet(_) | Ty::InlineStr(_) | Ty::InputBuffer { .. } | Ty::SmallVec { .. }
+            )
+        {
+            self.raw_pod_sizes.insert(sz.max(1));
+        }
+        match ty {
+            Ty::Array { elem, .. } => {
+                self.register_sema_composite_type(elem);
+                let mty = Self::sema_to_mir_storage_ty(ty);
+                self.register_composite_type(&mty);
+            }
+            Ty::SmallVec { elem, .. } => {
+                self.register_sema_composite_type(elem);
+            }
+            Ty::Tuple(items) => {
+                for it in items {
+                    self.register_sema_composite_type(it);
+                }
+                let mty = Self::sema_to_mir_storage_ty(ty);
+                self.register_composite_type(&mty);
+            }
+            _ => {}
+        }
+    }
+
     fn register_composite_type(&mut self, ty: &MirType) {
         match ty {
+            MirType::Named(key) => {
+                if let Some(sz) = self.named_mir_pod_bytes(key) {
+                    self.raw_pod_sizes.insert(sz.max(1));
+                }
+            }
             MirType::Tuple(elems) => {
                 if self.tuple_types.iter().any(|(e, _)| e == elems) {
                     return;
@@ -1084,6 +1624,7 @@ impl<'a> EmitCtx<'a> {
             }
             MirType::Array { elem, len } => {
                 let elem_ty = (**elem).clone();
+                self.register_composite_type(&elem_ty);
                 if self
                     .array_types
                     .iter()
@@ -1091,7 +1632,6 @@ impl<'a> EmitCtx<'a> {
                 {
                     return;
                 }
-                self.register_composite_type(&elem_ty);
                 let id = self.array_types.len();
                 self.array_types
                     .push((elem_ty, *len, format!("StrataArray_{id}")));
@@ -1099,6 +1639,48 @@ impl<'a> EmitCtx<'a> {
             }
             _ => {}
         }
+    }
+
+    fn parse_smallvec_mir_key(&self, key: &str) -> Option<(Ty, usize)> {
+        let inner = key.strip_prefix("SmallVec<")?.strip_suffix('>')?;
+        let (elem_dbg, cap_s) = inner.rsplit_once(',')?;
+        let cap = cap_s.trim().parse::<usize>().ok()?;
+        let elem = parse_mir_debug_ty(elem_dbg.trim())?;
+        Some((elem, cap))
+    }
+
+    fn named_mir_pod_bytes(&self, key: &str) -> Option<usize> {
+        if let Some(rest) = key
+            .strip_prefix("BitSet<")
+            .and_then(|s| s.strip_suffix('>'))
+        {
+            let bits = rest.trim().parse::<usize>().ok()?;
+            return Some(bits.div_ceil(32).max(1) * 4);
+        }
+        if let Some(rest) = key
+            .strip_prefix("InlineStr<")
+            .and_then(|s| s.strip_suffix('>'))
+        {
+            let cap = rest.trim().parse::<usize>().ok()?;
+            return Some(4 + cap.div_ceil(4) * 4);
+        }
+        if let Some(rest) = key
+            .strip_prefix("InputBuffer<")
+            .and_then(|s| s.strip_suffix('>'))
+            && let Some((_, cap_s)) = rest.rsplit_once(',')
+        {
+            let cap = cap_s.trim().parse::<usize>().ok()?;
+            return Some(cap.max(1) * 8);
+        }
+        if let Some((elem, cap)) = self.parse_smallvec_mir_key(key) {
+            return self
+                .sema_ty_size_align(&Ty::SmallVec {
+                    elem: Box::new(elem),
+                    cap,
+                })
+                .map(|(s, _)| s.max(1));
+        }
+        None
     }
 
     fn tuple_name(&self, elems: &[MirType]) -> Option<&str> {
@@ -1155,6 +1737,8 @@ impl<'a> EmitCtx<'a> {
             ty,
             MirType::Named(k) if k.starts_with("__strata_table_")
                 || self.find_layout_idx(k).is_some()
+                || self.named_mir_pod_bytes(k).is_some()
+                || matches!(k.as_str(), "mat3" | "Mat3" | "mat4" | "Mat4")
                 || k.contains("SpatialHits")
                 || k.contains("Vec2")
                 || k.contains("Vec3")
@@ -1205,6 +1789,16 @@ impl<'a> EmitCtx<'a> {
                     et.to_string()
                 } else if let Some(l_idx) = self.find_layout_idx(key) {
                     self.layout_c_names[l_idx].clone()
+                } else if key == "InlineStr" {
+                    "const char*".to_string()
+                } else if key == "GraceWindow" {
+                    "float".to_string()
+                } else if matches!(key.as_str(), "mat3" | "Mat3") {
+                    "StrataMat3".to_string()
+                } else if matches!(key.as_str(), "mat4" | "Mat4") {
+                    "StrataMat4".to_string()
+                } else if let Some(sz) = self.named_mir_pod_bytes(key) {
+                    format!("StrataBytes_{sz}")
                 } else if key.contains("SpatialHits") {
                     "StrataSpatialHits".to_string()
                 } else if key.contains("Vec2") || key == "vec2" {
@@ -1252,13 +1846,28 @@ impl<'a> EmitCtx<'a> {
             Ty::U32 | Ty::Sym | Ty::Rgba8 => "uint32_t".to_string(),
             Ty::U64 => "uint64_t".to_string(),
             Ty::BitSet(bits) => {
-                if *bits <= 32 {
-                    "uint32_t".to_string()
+                let sz = (*bits).div_ceil(32).max(1) * 4;
+                format!("StrataBytes_{sz}")
+            }
+            Ty::InlineStr(cap) => {
+                let sz = 4 + cap.div_ceil(4) * 4;
+                format!("StrataBytes_{sz}")
+            }
+            Ty::InputBuffer { .. } | Ty::SmallVec { .. } => self
+                .sema_ty_size_align(ty)
+                .map(|(s, _)| format!("StrataBytes_{}", s.max(1)))
+                .unwrap_or_else(|| "int32_t".to_string()),
+            Ty::Array { elem, len } => {
+                let m = Self::sema_to_mir_storage_ty(elem);
+                if let Some(n) = self.array_name(&m, *len) {
+                    n.to_string()
                 } else {
-                    "uint64_t".to_string()
+                    self.sema_ty_size_align(ty)
+                        .map(|(s, _)| format!("StrataBytes_{}", s.max(1)))
+                        .unwrap_or_else(|| "int32_t".to_string())
                 }
             }
-            Ty::F32 | Ty::UnitScalar { .. } => "float".to_string(),
+            Ty::F32 | Ty::UnitScalar { .. } | Ty::GraceWindow => "float".to_string(),
             Ty::F64 => "double".to_string(),
             Ty::Ref(_) => "BamEntity".to_string(),
             Ty::Vec2 => "StrataVec2".to_string(),
@@ -1303,6 +1912,18 @@ impl<'a> EmitCtx<'a> {
             MirType::IVec2 => "strata_ivec2(0, 0)".to_string(),
             MirType::IVec3 => "strata_ivec3(0, 0, 0)".to_string(),
             MirType::UVec2 => "strata_uvec2(0u, 0u)".to_string(),
+            MirType::Named(k) if k == "InlineStr" => "\"\"".to_string(),
+            MirType::Named(k) if k == "GraceWindow" => "0.0f".to_string(),
+            MirType::Named(k) if matches!(k.as_str(), "mat3" | "Mat3") => {
+                "((StrataMat3){ { 0.0f } })".to_string()
+            }
+            MirType::Named(k) if matches!(k.as_str(), "mat4" | "Mat4") => {
+                "((StrataMat4){ { 0.0f } })".to_string()
+            }
+            MirType::Named(k) if self.named_mir_pod_bytes(k).is_some() => {
+                let sz = self.named_mir_pod_bytes(k).unwrap_or(4);
+                format!("((StrataBytes_{sz}){{ {{ 0 }} }})")
+            }
             MirType::Named(k) if self.find_layout_idx(k).is_none() => "0".to_string(),
             _ => "{ 0 }".to_string(),
         }
@@ -1311,9 +1932,17 @@ impl<'a> EmitCtx<'a> {
     fn c_zero_for_sema(&self, ty: &Ty) -> String {
         match ty {
             Ty::Bool | Ty::U8 | Ty::U16 | Ty::U32 | Ty::Sym | Ty::Rgba8 => "0u".to_string(),
-            Ty::U64 | Ty::BitSet(_) => "0ull".to_string(),
+            Ty::U64 => "0ull".to_string(),
+            Ty::BitSet(_)
+            | Ty::InlineStr(_)
+            | Ty::InputBuffer { .. }
+            | Ty::SmallVec { .. }
+            | Ty::Array { .. } => {
+                let cty = self.c_ty_from_sema(ty);
+                format!("(({cty}){{ {{ 0 }} }})")
+            }
             Ty::I64 | Ty::Fix64 => "0ll".to_string(),
-            Ty::F32 | Ty::UnitScalar { .. } => "0.0f".to_string(),
+            Ty::F32 | Ty::UnitScalar { .. } | Ty::GraceWindow => "0.0f".to_string(),
             Ty::F64 => "0.0".to_string(),
             Ty::Ref(_) => "BAM_ENTITY_NULL".to_string(),
             Ty::Vec2 => "strata_vec2(0.0f, 0.0f)".to_string(),
@@ -1324,6 +1953,12 @@ impl<'a> EmitCtx<'a> {
             Ty::IVec2 => "strata_ivec2(0, 0)".to_string(),
             Ty::IVec3 => "strata_ivec3(0, 0, 0)".to_string(),
             Ty::UVec2 => "strata_uvec2(0u, 0u)".to_string(),
+            Ty::Mat3 => "((StrataMat3){ { 0.0f } })".to_string(),
+            Ty::Mat4 => "((StrataMat4){ { 0.0f } })".to_string(),
+            Ty::Named(key) if self.find_layout_idx(key).is_some() => {
+                let cty = self.c_ty_from_sema(ty);
+                format!("(({cty}){{ 0 }})")
+            }
             _ => "0".to_string(),
         }
     }
@@ -1430,6 +2065,49 @@ impl<'a> EmitCtx<'a> {
                         "{indent}{{ static const uint8_t _istr[] = {{ {} }}; size_t _n = sizeof(_istr) < sizeof({target}) ? sizeof(_istr) : sizeof({target}); memcpy({target}, _istr, _n); }}",
                         bytes_strs.join(", ")
                     );
+                }
+            }
+            Ty::InputBuffer { .. } => {
+                if zero_missing_array_elems || val_opt.is_some() {
+                    let _ = writeln!(buf, "{indent}memset({target}, 0, sizeof({target}));");
+                }
+            }
+            Ty::SmallVec { elem, cap } => {
+                if zero_missing_array_elems || val_opt.is_some() {
+                    let _ = writeln!(buf, "{indent}memset({target}, 0, sizeof({target}));");
+                }
+                if let Some(MirConstVal::Array(elems)) = val_opt {
+                    let (es, ea) = self.sema_ty_size_align(elem).unwrap_or((4, 4));
+                    let stride = es.div_ceil(ea) * ea;
+                    let count = elems.len().min(*cap);
+                    if count > 0 {
+                        let _ = writeln!(
+                            buf,
+                            "{indent}{{ uint32_t _sv_len = {count}u; memcpy({target}, &_sv_len, sizeof(uint32_t)); }}"
+                        );
+                        for (ei, ev) in elems.iter().take(count).enumerate() {
+                            let byte_off = 8 + ei * stride;
+                            if let Some(bytes) = self.pack_const_bytes_for_ty(elem, ev)
+                                && !bytes.is_empty()
+                            {
+                                let bytes_c: Vec<String> =
+                                    bytes.iter().map(|b| format!("0x{b:02X}u")).collect();
+                                let n = bytes.len();
+                                let _ = writeln!(
+                                    buf,
+                                    "{indent}{{ static const uint8_t _sve[{n}] = {{ {} }}; if (({byte_off}u + {n}u) <= sizeof({target})) {{ memcpy(((uint8_t*)({target})) + {byte_off}u, _sve, {n}u); }} }}",
+                                    bytes_c.join(", ")
+                                );
+                            } else {
+                                let elem_cty = self.c_ty_from_sema(elem);
+                                let ev_s = self.c_const_val_for_ty(elem, ev);
+                                let _ = writeln!(
+                                    buf,
+                                    "{indent}{{ {elem_cty} _sve = {ev_s}; if (({byte_off}u + sizeof(_sve)) <= sizeof({target})) {{ memcpy(((uint8_t*)({target})) + {byte_off}u, &_sve, sizeof(_sve)); }} }}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
             _ => {
@@ -1910,6 +2588,28 @@ impl<'a> EmitCtx<'a> {
                 c_f32(v[1] as f32),
                 c_f32(v[2] as f32)
             ),
+            (Ty::Mat3, MirConstVal::Array(elems)) => {
+                let floats = flatten_mat_floats(elems, 9);
+                let items: Vec<String> = floats.iter().map(|&f| c_f32(f)).collect();
+                format!("((StrataMat3){{ {{ {} }} }})", items.join(", "))
+            }
+            (Ty::Mat4, MirConstVal::Array(elems)) => {
+                let floats = flatten_mat_floats(elems, 16);
+                let items: Vec<String> = floats.iter().map(|&f| c_f32(f)).collect();
+                format!("((StrataMat4){{ {{ {} }} }})", items.join(", "))
+            }
+            (Ty::InlineStr(cap), MirConstVal::String(s)) => {
+                let total = 4 + cap.div_ceil(4) * 4;
+                let mut end = s.len().min(*cap);
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let mut raw = vec![0u8; total];
+                raw[..4].copy_from_slice(&(end as u32).to_le_bytes());
+                raw[4..4 + end].copy_from_slice(&s.as_bytes()[..end]);
+                let bytes_c: Vec<String> = raw.iter().map(|b| format!("0x{b:02X}u")).collect();
+                format!("((StrataBytes_{total}){{ {{ {} }} }})", bytes_c.join(", "))
+            }
             (Ty::BitSet(bits), val) => {
                 let byte_len = (*bits).div_ceil(32).max(1) * 4;
                 let packed = pack_bitset_bytes(val, byte_len);
@@ -1953,6 +2653,13 @@ impl<'a> EmitCtx<'a> {
             Ty::Mat4 => Some((64, 4)),
             Ty::BitSet(bits) => Some(((*bits).div_ceil(32).max(1) * 4, 4)),
             Ty::InlineStr(cap) => Some((4 + cap.div_ceil(4) * 4, 4)),
+            Ty::InputBuffer { cap, .. } => Some(((*cap).max(1) * 8, 4)),
+            Ty::SmallVec { elem, cap } => {
+                let (es, ea) = self.sema_ty_size_align(elem)?;
+                let align = ea.max(4);
+                let stride = es.div_ceil(ea) * ea;
+                Some((8 + stride * *cap, align))
+            }
             Ty::Array { elem, len } => {
                 let (es, ea) = self.sema_ty_size_align(elem)?;
                 let stride = es.div_ceil(ea) * ea;
@@ -2075,6 +2782,22 @@ impl<'a> EmitCtx<'a> {
                 let mut out = Vec::with_capacity(8);
                 out.extend_from_slice(&(v[0] as u32).to_le_bytes());
                 out.extend_from_slice(&(v[1] as u32).to_le_bytes());
+                Some(out)
+            }
+            (Ty::Mat3, MirConstVal::Array(elems)) => {
+                let floats = flatten_mat_floats(elems, 9);
+                let mut out = Vec::with_capacity(36);
+                for f in floats {
+                    out.extend_from_slice(&f.to_le_bytes());
+                }
+                Some(out)
+            }
+            (Ty::Mat4, MirConstVal::Array(elems)) => {
+                let floats = flatten_mat_floats(elems, 16);
+                let mut out = Vec::with_capacity(64);
+                for f in floats {
+                    out.extend_from_slice(&f.to_le_bytes());
+                }
                 Some(out)
             }
             (Ty::BitSet(bits), _) => {
@@ -2259,7 +2982,13 @@ impl<'a> EmitCtx<'a> {
                     "BAM_FALSE".to_string()
                 }
             }
-            HirExpr::StringLit(st) => format!("\"{}\"", c_escape(st)),
+            HirExpr::StringLit(st) => {
+                if matches!(hint_ty, Ty::InlineStr(_)) {
+                    self.c_const_val_for_ty(hint_ty, &MirConstVal::String(st.clone()))
+                } else {
+                    format!("\"{}\"", c_escape(st))
+                }
+            }
             HirExpr::Unary { op, expr, .. } => {
                 if matches!(op, HirUnOp::Neg) && matches!(hint_ty, Ty::Fix32 | Ty::Fix64) {
                     match &**expr {
@@ -2634,6 +3363,41 @@ impl<'a> EmitCtx<'a> {
                         a(0, &Ty::U32, "0u"),
                         a(1, &Ty::U32, "0u")
                     ),
+                    "mat3" | "Mat3" => {
+                        if call.args.len() == 3 {
+                            let c0 = call
+                                .args
+                                .first()
+                                .and_then(|e| self.hir_expr_to_mir_const(e))
+                                .unwrap_or(MirConstVal::Vec3([0.0; 3]));
+                            let c1 = call
+                                .args
+                                .get(1)
+                                .and_then(|e| self.hir_expr_to_mir_const(e))
+                                .unwrap_or(MirConstVal::Vec3([0.0; 3]));
+                            let c2 = call
+                                .args
+                                .get(2)
+                                .and_then(|e| self.hir_expr_to_mir_const(e))
+                                .unwrap_or(MirConstVal::Vec3([0.0; 3]));
+                            let fl = flatten_mat_floats(&[c0, c1, c2], 9);
+                            let items: Vec<String> = fl.iter().map(|&f| c_f32(f)).collect();
+                            format!("((StrataMat3){{ {{ {} }} }})", items.join(", "))
+                        } else {
+                            let mut items = Vec::with_capacity(9);
+                            for i in 0..9 {
+                                items.push(a(i, &Ty::F32, "0.0f"));
+                            }
+                            format!("((StrataMat3){{ {{ {} }} }})", items.join(", "))
+                        }
+                    }
+                    "mat4" | "Mat4" => {
+                        let mut items = Vec::with_capacity(16);
+                        for i in 0..16 {
+                            items.push(a(i, &Ty::F32, "0.0f"));
+                        }
+                        format!("((StrataMat4){{ {{ {} }} }})", items.join(", "))
+                    }
                     "meters" | "sec" | "ms" | "rad" | "deg" | "mps" | "mps2" | "hz" | "frames" => {
                         let inner_ty = if matches!(hint_ty, Ty::Unknown | Ty::Fix32 | Ty::Fix64) {
                             &Ty::F32
@@ -2882,6 +3646,37 @@ impl<'a> EmitCtx<'a> {
                     "vec4::Y" => Some(MirConstVal::Vec4([0.0, 1.0, 0.0, 0.0])),
                     "vec4::Z" => Some(MirConstVal::Vec4([0.0, 0.0, 1.0, 0.0])),
                     "vec4::W" => Some(MirConstVal::Vec4([0.0, 0.0, 0.0, 1.0])),
+                    "mat3::ZERO" => Some(MirConstVal::Array(vec![MirConstVal::Float(0.0); 9])),
+                    "mat3::IDENTITY" => Some(MirConstVal::Array(vec![
+                        MirConstVal::Float(1.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(1.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(1.0),
+                    ])),
+                    "mat4::ZERO" => Some(MirConstVal::Array(vec![MirConstVal::Float(0.0); 16])),
+                    "mat4::IDENTITY" => Some(MirConstVal::Array(vec![
+                        MirConstVal::Float(1.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(1.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(1.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(0.0),
+                        MirConstVal::Float(1.0),
+                    ])),
                     _ => None,
                 }
             }
@@ -3163,6 +3958,32 @@ impl<'a> EmitCtx<'a> {
                         .unwrap_or(0.0);
                     Some(MirConstVal::Vec4([a0, a1, a2, a3]))
                 }
+                "mat3" | "Mat3" => {
+                    let mut cols = Vec::with_capacity(call.args.len());
+                    for a in &call.args {
+                        cols.push(self.hir_expr_to_mir_const(a)?);
+                    }
+                    let floats = flatten_mat_floats(&cols, 9);
+                    Some(MirConstVal::Array(
+                        floats
+                            .into_iter()
+                            .map(|f| MirConstVal::Float(f64::from(f)))
+                            .collect(),
+                    ))
+                }
+                "mat4" | "Mat4" => {
+                    let mut cols = Vec::with_capacity(call.args.len());
+                    for a in &call.args {
+                        cols.push(self.hir_expr_to_mir_const(a)?);
+                    }
+                    let floats = flatten_mat_floats(&cols, 16);
+                    Some(MirConstVal::Array(
+                        floats
+                            .into_iter()
+                            .map(|f| MirConstVal::Float(f64::from(f)))
+                            .collect(),
+                    ))
+                }
                 "meters" | "sec" | "ms" | "rad" | "deg" | "mps" | "mps2" | "hz" | "frames" => call
                     .args
                     .first()
@@ -3171,6 +3992,67 @@ impl<'a> EmitCtx<'a> {
             },
             _ => None,
         }
+    }
+
+    pub(super) fn resolve_sema_field_ty(
+        &self,
+        l_idx: usize,
+        field: &str,
+        offset_bytes: usize,
+    ) -> Option<Ty> {
+        let mut cur_l = l_idx;
+        if !field.is_empty() && field.contains('.') {
+            let parts: Vec<&str> = field.split('.').collect();
+            for (pi, seg) in parts.iter().enumerate() {
+                let sf = self.layouts[cur_l]
+                    .fields
+                    .iter()
+                    .find(|f| !f.is_padding && f.name == *seg)?;
+                if pi + 1 == parts.len() {
+                    return Some(sf.ty.clone());
+                }
+                if let Ty::Named(ref inner) = sf.ty {
+                    cur_l = self.find_layout_idx(inner)?;
+                } else {
+                    return None;
+                }
+            }
+        }
+        fn find_by_name_or_off(
+            ctx: &EmitCtx<'_>,
+            fields: &[SolvedField],
+            field: &str,
+            rel_off: usize,
+        ) -> Option<Ty> {
+            if !field.is_empty()
+                && let Some(sf) = fields.iter().find(|f| !f.is_padding && f.name == field)
+            {
+                return Some(sf.ty.clone());
+            }
+            for f in fields {
+                if f.is_padding {
+                    continue;
+                }
+                if f.offset == rel_off {
+                    return Some(f.ty.clone());
+                }
+                if rel_off > f.offset
+                    && rel_off < f.offset + f.size
+                    && let Ty::Named(ref inner) = f.ty
+                    && let Some(sub_li) = ctx.find_layout_idx(inner)
+                    && let Some(sub_ty) = find_by_name_or_off(
+                        ctx,
+                        &ctx.layouts[sub_li].fields,
+                        field,
+                        rel_off - f.offset,
+                    )
+                {
+                    return Some(sub_ty);
+                }
+            }
+            None
+        }
+        find_by_name_or_off(self, &self.layouts[l_idx].fields, field, offset_bytes)
     }
 }
 
@@ -3184,6 +4066,50 @@ fn canonicalize(module_path: &str, name: &str) -> String {
 
 fn short_name(canon: &str) -> &str {
     canon.rsplit("::").next().unwrap_or(canon)
+}
+
+pub(super) fn is_child_of_rel(rel: &str) -> bool {
+    rel == "ChildOf" || rel.ends_with("::ChildOf") || rel == bamabi_sys::BAM_CHILD_OF_NAME
+}
+
+pub(super) fn custom_rel_parent_comp(rel: &str) -> String {
+    format!("__strata_rel_parent_{}", short_name(rel))
+}
+
+fn merge_term_access_mode(a: TermAccessMode, b: TermAccessMode) -> TermAccessMode {
+    if a == b {
+        return a;
+    }
+    if matches!(a, TermAccessMode::StreamRead | TermAccessMode::StreamWrite)
+        && matches!(b, TermAccessMode::StreamRead | TermAccessMode::StreamWrite)
+    {
+        return if a == TermAccessMode::StreamWrite || b == TermAccessMode::StreamWrite {
+            TermAccessMode::StreamWrite
+        } else {
+            TermAccessMode::StreamRead
+        };
+    }
+    let classify = |m: TermAccessMode| -> (bool, bool, bool) {
+        match m {
+            TermAccessMode::Write => (true, true, false),
+            TermAccessMode::SelectiveWrite => (true, true, true),
+            TermAccessMode::OptionalWrite => (false, true, false),
+            TermAccessMode::OptionalRead => (false, false, false),
+            _ => (true, false, false),
+        }
+    };
+    let (ra, wa, sa) = classify(a);
+    let (rb, wb, sb) = classify(b);
+    let req = ra || rb;
+    let write = wa || wb;
+    let sel = (wa && sa || !wa) && (wb && sb || !wb) && (sa || sb);
+    match (req, write, sel) {
+        (true, true, true) => TermAccessMode::SelectiveWrite,
+        (true, true, false) => TermAccessMode::Write,
+        (true, false, _) => TermAccessMode::Read,
+        (false, true, _) => TermAccessMode::OptionalWrite,
+        (false, false, _) => TermAccessMode::OptionalRead,
+    }
 }
 
 fn pack_bitset_bytes(val: &MirConstVal, byte_len: usize) -> Vec<u8> {
@@ -3208,6 +4134,142 @@ fn pack_bitset_bytes(val: &MirConstVal, byte_len: usize) -> Vec<u8> {
         _ => {}
     }
     packed
+}
+
+fn flatten_mat_floats(elems: &[MirConstVal], count: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(count);
+    for e in elems {
+        if out.len() >= count {
+            break;
+        }
+        match e {
+            MirConstVal::Float(f) => out.push(*f as f32),
+            MirConstVal::Int(i) => out.push(*i as f32),
+            MirConstVal::Vec3(v) => {
+                for &x in v {
+                    if out.len() < count {
+                        out.push(x as f32);
+                    }
+                }
+            }
+            MirConstVal::Vec4(v) => {
+                for &x in v {
+                    if out.len() < count {
+                        out.push(x as f32);
+                    }
+                }
+            }
+            MirConstVal::Vec2(v) => {
+                for &x in v {
+                    if out.len() < count {
+                        out.push(x as f32);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    while out.len() < count {
+        out.push(0.0f32);
+    }
+    out
+}
+
+fn parse_mir_debug_ty(s: &str) -> Option<Ty> {
+    let s = s.trim();
+    match s {
+        "Bool" => Some(Ty::Bool),
+        "U8" => Some(Ty::U8),
+        "I8" => Some(Ty::I8),
+        "U16" => Some(Ty::U16),
+        "I16" => Some(Ty::I16),
+        "U32" => Some(Ty::U32),
+        "I32" => Some(Ty::I32),
+        "Fix32" => Some(Ty::Fix32),
+        "Sym" => Some(Ty::Sym),
+        "Rgba8" => Some(Ty::Rgba8),
+        "U64" => Some(Ty::U64),
+        "I64" => Some(Ty::I64),
+        "Fix64" => Some(Ty::Fix64),
+        "F32" => Some(Ty::F32),
+        "F64" => Some(Ty::F64),
+        "Vec2" => Some(Ty::Vec2),
+        "Vec3" => Some(Ty::Vec3),
+        "Vec3a" => Some(Ty::Vec3a),
+        "Vec4" => Some(Ty::Vec4),
+        "Quat" => Some(Ty::Quat),
+        "Rgba" => Some(Ty::Rgba),
+        "IVec2" => Some(Ty::IVec2),
+        "IVec3" => Some(Ty::IVec3),
+        "UVec2" => Some(Ty::UVec2),
+        "Mat3" => Some(Ty::Mat3),
+        "Mat4" => Some(Ty::Mat4),
+        "GraceWindow" => Some(Ty::GraceWindow),
+        _ if s.starts_with("UnitScalar") => Some(Ty::F32),
+        _ if s.starts_with("BitSet(") && s.ends_with(')') => {
+            let b = s["BitSet(".len()..s.len() - 1].trim().parse().ok()?;
+            Some(Ty::BitSet(b))
+        }
+        _ if s.starts_with("InlineStr(") && s.ends_with(')') => {
+            let cap = s["InlineStr(".len()..s.len() - 1].trim().parse().ok()?;
+            Some(Ty::InlineStr(cap))
+        }
+        _ if s.starts_with("Named(") && s.ends_with(')') => {
+            let inner = s["Named(".len()..s.len() - 1].trim().trim_matches('"');
+            Some(Ty::Named(inner.to_owned()))
+        }
+        _ if s.starts_with("Ref(") && s.ends_with(')') => {
+            let inner = s["Ref(".len()..s.len() - 1].trim().trim_matches('"');
+            Some(Ty::Ref(inner.to_owned()))
+        }
+        _ if s.starts_with("InputBuffer") => {
+            if let Some(cap_pos) = s.rfind("cap:") {
+                let after = &s[cap_pos + 4..];
+                let digits: String = after
+                    .trim_start()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                let cap = digits.parse().ok()?;
+                return Some(Ty::InputBuffer {
+                    action: String::new(),
+                    cap,
+                });
+            }
+            None
+        }
+        _ if s.starts_with("SmallVec") => {
+            if let Some(elem_pos) = s.find("elem:")
+                && let Some(cap_pos) = s.rfind(", cap:")
+            {
+                let elem_s = &s[elem_pos + 5..cap_pos];
+                let cap_s = s[cap_pos + 6..].trim().trim_end_matches('}').trim();
+                let elem = parse_mir_debug_ty(elem_s)?;
+                let cap = cap_s.parse().ok()?;
+                return Some(Ty::SmallVec {
+                    elem: Box::new(elem),
+                    cap,
+                });
+            }
+            None
+        }
+        _ if s.starts_with("Array") => {
+            if let Some(elem_pos) = s.find("elem:")
+                && let Some(len_pos) = s.rfind(", len:")
+            {
+                let elem_s = &s[elem_pos + 5..len_pos];
+                let len_s = s[len_pos + 6..].trim().trim_end_matches('}').trim();
+                let elem = parse_mir_debug_ty(elem_s)?;
+                let len = len_s.parse().ok()?;
+                return Some(Ty::Array {
+                    elem: Box::new(elem),
+                    len,
+                });
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn lane_name(lane: u8) -> &'static str {

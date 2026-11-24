@@ -36,6 +36,19 @@ impl<'a> EmitCtx<'a> {
             .zip(pset_groups.iter())
             .filter_map(|(qb, &g)| (g != 0).then_some(qb.query_idx))
             .collect();
+        let mut query_term_remaps: HashMap<(u32, u32), u32> = HashMap::new();
+        let mut query_aliased_terms: HashSet<(u32, u32)> = HashSet::new();
+        for qb in &f.query_bindings {
+            if let Ok(dq) = self.compute_dedup_query_terms(f, qb, "emit_mir_function") {
+                for (raw_ti, eff_ti) in dq.remap {
+                    query_term_remaps.insert((qb.query_idx, raw_ti), eff_ti);
+                    if dq.aliased_dedup_indices.contains(&eff_ti) {
+                        query_aliased_terms.insert((qb.query_idx, raw_ti));
+                    }
+                }
+            }
+        }
+        let active_checkpoints = compute_active_checkpoints(f);
         let mut def_counts: HashMap<LocalId, usize> = HashMap::new();
         for bb in &f.blocks {
             for stmt in &bb.stmts {
@@ -47,12 +60,29 @@ impl<'a> EmitCtx<'a> {
         let mut slot_allocs: Vec<(LocalId, MirType)> = Vec::new();
         let mut spatial_hits_locals: Vec<LocalId> = Vec::new();
         let mut dirty_owners: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::new();
-        let mut checkpoint_locals: Vec<LocalId> = Vec::new();
         let mut field_ptr_arrays: HashMap<LocalId, (Ty, usize)> = HashMap::new();
+        let mut smallvec_ptrs: HashMap<LocalId, (Ty, usize)> = HashMap::new();
+        let mut array_index_strides: HashMap<LocalId, usize> = HashMap::new();
         let mut slot_ptr_meta: HashMap<LocalId, PtrKind> = HashMap::new();
+        let mut slot_mir_arrays: HashMap<LocalId, (MirType, usize)> = HashMap::new();
         let mut local_types: HashMap<LocalId, MirType> = HashMap::new();
         for l in &f.locals {
             local_types.insert(l.id, l.ty.clone());
+        }
+        if is_helper {
+            let helper_param_tys = self.resolve_helper_param_tys(f);
+            for (i, p) in f.params.iter().enumerate() {
+                if let Some(ploc) = p.local
+                    && let Some(resolved_ty) = helper_param_tys.get(i)
+                    && !matches!(resolved_ty, MirType::Ptr | MirType::MutPtr)
+                    && matches!(
+                        local_types.get(&ploc),
+                        Some(MirType::Ptr | MirType::MutPtr) | None
+                    )
+                {
+                    local_types.insert(ploc, resolved_ty.clone());
+                }
+            }
         }
 
         for bb in &f.blocks {
@@ -157,6 +187,13 @@ impl<'a> EmitCtx<'a> {
                                     is_mut: true,
                                 },
                             };
+                            if let MirType::Named(ref key) = *ty
+                                && let Some((elem, cap)) = self.parse_smallvec_mir_key(key)
+                            {
+                                smallvec_ptrs.insert(d, (elem, cap));
+                            } else if let MirType::Array { elem, len } = ty {
+                                slot_mir_arrays.insert(d, ((**elem).clone(), *len));
+                            }
                             ptr_meta.insert(d, pk);
                         }
                     }
@@ -197,7 +234,9 @@ impl<'a> EmitCtx<'a> {
                                         layout_idx: l_idx,
                                         is_mut: false,
                                     };
-                                    if !param_set_queries.contains(query_idx) {
+                                    if !param_set_queries.contains(query_idx)
+                                        && !query_aliased_terms.contains(&(*query_idx, *term_idx))
+                                    {
                                         restrict_cols.insert(d, pk.clone());
                                     }
                                     ptr_meta.insert(d, pk);
@@ -267,7 +306,9 @@ impl<'a> EmitCtx<'a> {
                                         layout_idx: l_idx,
                                         is_mut: true,
                                     };
-                                    if !param_set_queries.contains(query_idx) {
+                                    if !param_set_queries.contains(query_idx)
+                                        && !query_aliased_terms.contains(&(*query_idx, *term_idx))
+                                    {
                                         restrict_cols.insert(d, pk.clone());
                                     }
                                     ptr_meta.insert(d, pk);
@@ -412,11 +453,6 @@ impl<'a> EmitCtx<'a> {
                             .or_default()
                             .push((*query_idx, *term_idx));
                     }
-                    Inst::CmdCheckpoint => {
-                        if let Some(d) = dst {
-                            checkpoint_locals.push(d);
-                        }
-                    }
                     _ => {}
                 }
             }
@@ -443,25 +479,6 @@ impl<'a> EmitCtx<'a> {
                                 }
                                 if let Some(pk) = slot_ptr_meta.get(slot) {
                                     ptr_meta.entry(d).or_insert_with(|| pk.clone());
-                                }
-                            }
-                            Inst::FieldLoad {
-                                layout_key,
-                                field,
-                                offset_bytes,
-                                ..
-                            } => {
-                                if let Some(l_idx) = self.find_layout_idx(layout_key) {
-                                    let f_opt = self.layouts[l_idx].fields.iter().find(|sf| {
-                                        !sf.is_padding
-                                            && ((!field.is_empty() && sf.name == *field)
-                                                || sf.offset == *offset_bytes as usize)
-                                    });
-                                    if let Some(sf) = f_opt
-                                        && matches!(sf.ty, Ty::BitSet(w) if w <= 64)
-                                    {
-                                        local_types.insert(d, MirType::U64);
-                                    }
                                 }
                             }
                             Inst::RowPtr {
@@ -507,21 +524,207 @@ impl<'a> EmitCtx<'a> {
                                 } else {
                                     None
                                 };
-                                if let Some(lk) = effective_key
+                                if layout_key == "SmallVec" && field == "data" {
+                                    if let Some((sv_elem, sv_cap)) =
+                                        smallvec_ptrs.get(base_ptr).cloned()
+                                    {
+                                        field_ptr_arrays.insert(d, (sv_elem, sv_cap));
+                                    }
+                                } else if let Some(lk) = effective_key
                                     && let Some(l_idx) = self.find_layout_idx(&lk)
-                                    && let Some(sf) = self.layouts[l_idx].fields.iter().find(|sf| {
-                                        !sf.is_padding
-                                            && ((!field.is_empty() && sf.name == *field)
-                                                || sf.offset == *offset_bytes as usize)
-                                    })
-                                    && let Ty::Array { elem, len } = &sf.ty
+                                    && let Some(fty) = self.resolve_sema_field_ty(
+                                        l_idx,
+                                        field,
+                                        *offset_bytes as usize,
+                                    )
                                 {
-                                    field_ptr_arrays.insert(d, ((**elem).clone(), *len));
+                                    match fty {
+                                        Ty::Array { elem, len } => {
+                                            field_ptr_arrays.insert(d, (*elem, len));
+                                        }
+                                        Ty::SmallVec { elem, cap } => {
+                                            smallvec_ptrs.insert(d, (*elem, cap));
+                                        }
+                                        Ty::Named(ref inner_key) => {
+                                            if let Some(inner_li) = self.find_layout_idx(inner_key)
+                                                && self.layouts[inner_li].item_kind
+                                                    != SchemaItemKind::Enum
+                                            {
+                                                let is_mut = ptr_meta
+                                                    .get(base_ptr)
+                                                    .is_none_or(PtrKind::is_mut);
+                                                ptr_meta.insert(
+                                                    d,
+                                                    PtrKind::LayoutPtr {
+                                                        layout_idx: inner_li,
+                                                        is_mut,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Inst::ArrayIndex { base, .. } => {
+                                if matches!(
+                                    local_types.get(&d),
+                                    Some(MirType::Ptr | MirType::MutPtr)
+                                ) {
+                                    let is_mut = ptr_meta.get(base).is_none_or(PtrKind::is_mut);
+                                    if let Some((sema_elem, _)) =
+                                        field_ptr_arrays.get(base).cloned()
+                                    {
+                                        let stride = self
+                                            .sema_ty_size_align(&sema_elem)
+                                            .map(|(es, ea)| es.div_ceil(ea) * ea)
+                                            .unwrap_or(4);
+                                        array_index_strides.insert(d, stride);
+                                        match sema_elem {
+                                            Ty::Array {
+                                                elem: sub_e,
+                                                len: sub_l,
+                                            } => {
+                                                field_ptr_arrays.insert(d, (*sub_e, sub_l));
+                                            }
+                                            Ty::SmallVec { elem: sv_e, cap } => {
+                                                smallvec_ptrs.insert(d, (*sv_e, cap));
+                                            }
+                                            Ty::Named(ref inner_key) => {
+                                                if let Some(li) = self.find_layout_idx(inner_key)
+                                                    && self.layouts[li].item_kind
+                                                        != SchemaItemKind::Enum
+                                                {
+                                                    ptr_meta.insert(
+                                                        d,
+                                                        PtrKind::LayoutPtr {
+                                                            layout_idx: li,
+                                                            is_mut,
+                                                        },
+                                                    );
+                                                } else {
+                                                    ptr_meta.insert(
+                                                        d,
+                                                        PtrKind::ScalarPtr {
+                                                            c_pointee: self
+                                                                .c_ty_from_sema(&sema_elem),
+                                                            is_mut,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                            other_ty => {
+                                                ptr_meta.insert(
+                                                    d,
+                                                    PtrKind::ScalarPtr {
+                                                        c_pointee: self.c_ty_from_sema(&other_ty),
+                                                        is_mut,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    } else if let Some((mir_elem, _)) =
+                                        slot_mir_arrays.get(base).cloned()
+                                    {
+                                        if let MirType::Array {
+                                            elem: sub_e,
+                                            len: sub_l,
+                                        } = &mir_elem
+                                        {
+                                            slot_mir_arrays.insert(d, ((**sub_e).clone(), *sub_l));
+                                        } else if let MirType::Named(ref key) = mir_elem
+                                            && let Some(li) = self.find_layout_idx(key)
+                                        {
+                                            ptr_meta.insert(
+                                                d,
+                                                PtrKind::LayoutPtr {
+                                                    layout_idx: li,
+                                                    is_mut,
+                                                },
+                                            );
+                                        } else {
+                                            ptr_meta.insert(
+                                                d,
+                                                PtrKind::ScalarPtr {
+                                                    c_pointee: self.c_ty(&mir_elem),
+                                                    is_mut,
+                                                },
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             Inst::VecInsert { vec, .. } => {
                                 if let Some(vty) = local_types.get(vec).cloned() {
                                     local_types.insert(d, vty);
+                                }
+                            }
+                            Inst::BinOp { op, lhs, rhs, .. } => {
+                                if op == "quat_mul_vec3" {
+                                    local_types.insert(d, MirType::Vec3);
+                                } else if op == "quat_mul" {
+                                    local_types.insert(d, MirType::Vec4);
+                                } else if !matches!(
+                                    op.as_str(),
+                                    "==" | "!="
+                                        | "<"
+                                        | "<="
+                                        | ">"
+                                        | ">="
+                                        | "Eq"
+                                        | "Ne"
+                                        | "Lt"
+                                        | "Le"
+                                        | "Gt"
+                                        | "Ge"
+                                        | "&&"
+                                        | "||"
+                                        | "And"
+                                        | "Or"
+                                ) {
+                                    let vec_ty_opt = local_types
+                                        .get(lhs)
+                                        .filter(|t| {
+                                            matches!(
+                                                t,
+                                                MirType::Vec2
+                                                    | MirType::Vec3
+                                                    | MirType::Vec4
+                                                    | MirType::IVec2
+                                                    | MirType::IVec3
+                                                    | MirType::UVec2
+                                            )
+                                        })
+                                        .or_else(|| {
+                                            local_types.get(rhs).filter(|t| {
+                                                matches!(
+                                                    t,
+                                                    MirType::Vec2
+                                                        | MirType::Vec3
+                                                        | MirType::Vec4
+                                                        | MirType::IVec2
+                                                        | MirType::IVec3
+                                                        | MirType::UVec2
+                                                )
+                                            })
+                                        })
+                                        .cloned();
+                                    if let Some(vt) = vec_ty_opt
+                                        && !matches!(
+                                            local_types.get(&d),
+                                            Some(
+                                                MirType::Bool
+                                                    | MirType::Vec2
+                                                    | MirType::Vec3
+                                                    | MirType::Vec4
+                                                    | MirType::IVec2
+                                                    | MirType::IVec3
+                                                    | MirType::UVec2
+                                            )
+                                        )
+                                    {
+                                        local_types.insert(d, vt);
+                                    }
                                 }
                             }
                             Inst::Copy { val } => {
@@ -553,6 +756,15 @@ impl<'a> EmitCtx<'a> {
                                 }
                                 if let Some(arr_meta) = field_ptr_arrays.get(val).cloned() {
                                     field_ptr_arrays.entry(d).or_insert(arr_meta);
+                                }
+                                if let Some(sv_meta) = smallvec_ptrs.get(val).cloned() {
+                                    smallvec_ptrs.entry(d).or_insert(sv_meta);
+                                }
+                                if let Some(sm_meta) = slot_mir_arrays.get(val).cloned() {
+                                    slot_mir_arrays.entry(d).or_insert(sm_meta);
+                                }
+                                if let Some(st) = array_index_strides.get(val).copied() {
+                                    array_index_strides.entry(d).or_insert(st);
                                 }
                                 if let Some(pk) = ptr_meta.get(val).cloned() {
                                     ptr_meta.entry(d).or_insert(pk);
@@ -910,6 +1122,10 @@ impl<'a> EmitCtx<'a> {
                 const_defs: const_defs.clone(),
                 array_inits: array_inits.clone(),
                 field_ptr_arrays: field_ptr_arrays.clone(),
+                array_index_strides: array_index_strides.clone(),
+                slot_mir_arrays: slot_mir_arrays.clone(),
+                query_term_remaps: query_term_remaps.clone(),
+                active_checkpoints: active_checkpoints.clone(),
                 last_checkpoint: None,
                 par_query_idx: Some(qi),
             };
@@ -919,8 +1135,8 @@ impl<'a> EmitCtx<'a> {
                 if sub_labels.contains(&bb.id.0) {
                     let _ = writeln!(s, "bb_{}:;", bb.id.0);
                 }
-                for stmt in &bb.stmts {
-                    par_fc.emit_stmt(stmt, &mut s)?;
+                for (s_idx, stmt) in bb.stmts.iter().enumerate() {
+                    par_fc.emit_stmt_at(bb.id.0, s_idx, stmt, &mut s)?;
                 }
                 par_fc.emit_terminator(&bb.terminator, &mut s)?;
             }
@@ -957,7 +1173,7 @@ impl<'a> EmitCtx<'a> {
                     "    (void)entity; (void)event_data; (void)sys_ctx; (void)cmds_cache;"
                 );
             }
-            MirFnKind::Migration { .. } => {
+            MirFnKind::Migration { dst_layout, .. } => {
                 let name = sanitize_ident(&f.name);
                 let _ = writeln!(
                     s,
@@ -971,6 +1187,19 @@ impl<'a> EmitCtx<'a> {
                     "    if (src_row == NULL || dst_row == NULL) {{ return BAM_RESULT_NULL_POINTER; }}"
                 );
                 let _ = writeln!(s, "    (void)state; (void)sys_ctx; (void)cmds_cache;");
+                if let Some(l_idx) = self.find_layout_idx(dst_layout)
+                    && self.layouts[l_idx].size > 0
+                {
+                    let cty = &self.layout_c_names[l_idx];
+                    let def_fn = format!(
+                        "strata_default_{l_idx}_{}",
+                        sanitize_ident(short_name(&self.layouts[l_idx].canonical_name))
+                    );
+                    let _ = writeln!(
+                        s,
+                        "    {{ {cty} _mig_def = {def_fn}(); memcpy(dst_row, &_mig_def, sizeof(_mig_def)); }}"
+                    );
+                }
             }
             _ => {
                 let name = sanitize_ident(&f.name);
@@ -1142,6 +1371,12 @@ impl<'a> EmitCtx<'a> {
                         let _ = writeln!(s, "            }} while (msg_got == 16u);");
                         let _ = writeln!(s, "        }}");
                         let _ = writeln!(s, "    }}");
+                        if self.layouts[l_idx].size > 0 {
+                            let _ = writeln!(
+                                s,
+                                "    else if (state->res_flags[{c_idx}] != 2u && state->mod_stream_has_{c_idx} != 0u) {{\n        stream_buf_{lid} = state->mod_stream_last_{c_idx};\n    }}"
+                            );
+                        }
                     }
                 }
             }
@@ -1183,7 +1418,11 @@ impl<'a> EmitCtx<'a> {
             const_defs,
             array_inits,
             field_ptr_arrays,
-            last_checkpoint: checkpoint_locals.first().copied(),
+            array_index_strides,
+            slot_mir_arrays,
+            query_term_remaps,
+            active_checkpoints,
+            last_checkpoint: None,
             par_query_idx: None,
         };
 
@@ -1196,8 +1435,8 @@ impl<'a> EmitCtx<'a> {
             }
             if let Some(spec) = par_tasks.get(&bb.id.0) {
                 let prefix_len = bb.stmts.len().saturating_sub(1);
-                for stmt in &bb.stmts[..prefix_len] {
-                    fc.emit_stmt(stmt, &mut s)?;
+                for (s_idx, stmt) in bb.stmts[..prefix_len].iter().enumerate() {
+                    fc.emit_stmt_at(bb.id.0, s_idx, stmt, &mut s)?;
                 }
                 let qi = spec.info.query_idx;
                 let par_slot = if spec.info.is_readonly {
@@ -1253,8 +1492,8 @@ impl<'a> EmitCtx<'a> {
                 let _ = writeln!(s, "        goto bb_{};", spec.info.chunk_exit_bb);
                 let _ = writeln!(s, "    }}");
             } else {
-                for stmt in &bb.stmts {
-                    fc.emit_stmt(stmt, &mut s)?;
+                for (s_idx, stmt) in bb.stmts.iter().enumerate() {
+                    fc.emit_stmt_at(bb.id.0, s_idx, stmt, &mut s)?;
                 }
                 fc.emit_terminator(&bb.terminator, &mut s)?;
             }
@@ -1263,6 +1502,135 @@ impl<'a> EmitCtx<'a> {
         let _ = writeln!(s, "}}");
         Ok(s)
     }
+}
+
+fn compute_active_checkpoints(f: &MirFunction) -> HashMap<(u32, usize), LocalId> {
+    let mut active: HashMap<(u32, usize), LocalId> = HashMap::new();
+    if f.blocks.is_empty() {
+        return active;
+    }
+    let by_id: HashMap<u32, usize> = f
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id.0, i))
+        .collect();
+    let mut merge_closes: HashMap<u32, LocalId> = HashMap::new();
+    for bb in &f.blocks {
+        for stmt in &bb.stmts {
+            if matches!(stmt.inst, Inst::CmdCheckpoint)
+                && let Some(cp) = stmt.dst
+            {
+                let mut q: std::collections::VecDeque<(u32, usize)> =
+                    std::collections::VecDeque::new();
+                let mut seen: HashSet<(u32, usize)> = HashSet::new();
+                let push_succs =
+                    |b: &BasicBlock,
+                     depth: usize,
+                     q: &mut std::collections::VecDeque<(u32, usize)>| {
+                        match &b.terminator {
+                            Terminator::Goto(t) => q.push_back((t.0, depth)),
+                            Terminator::Branch {
+                                then_bb, else_bb, ..
+                            } => {
+                                q.push_back((then_bb.0, depth));
+                                q.push_back((else_bb.0, depth));
+                            }
+                            Terminator::Switch {
+                                cases, default_bb, ..
+                            } => {
+                                for (_, t) in cases {
+                                    q.push_back((t.0, depth));
+                                }
+                                q.push_back((default_bb.0, depth));
+                            }
+                            Terminator::Return(_) => {}
+                        }
+                    };
+                push_succs(bb, 0, &mut q);
+                while let Some((bid, mut depth)) = q.pop_front() {
+                    if !seen.insert((bid, depth)) {
+                        continue;
+                    }
+                    let Some(&bidx) = by_id.get(&bid) else {
+                        continue;
+                    };
+                    let cur = &f.blocks[bidx];
+                    if cur.label == "atomic_merge" && bid != bb.id.0 {
+                        if depth == 0 {
+                            merge_closes.insert(bid, cp);
+                            continue;
+                        }
+                        depth -= 1;
+                    }
+                    let ckpts_in_cur = cur
+                        .stmts
+                        .iter()
+                        .filter(|st| matches!(st.inst, Inst::CmdCheckpoint))
+                        .count();
+                    depth += ckpts_in_cur;
+                    push_succs(cur, depth, &mut q);
+                }
+            }
+        }
+    }
+
+    let mut visited_entry: HashMap<u32, Vec<LocalId>> = HashMap::new();
+    let mut work: std::collections::VecDeque<(u32, Vec<LocalId>)> =
+        std::collections::VecDeque::new();
+    work.push_back((f.blocks[0].id.0, Vec::new()));
+    while let Some((bid, mut stack)) = work.pop_front() {
+        if let Some(&closed_cp) = merge_closes.get(&bid)
+            && stack.last() == Some(&closed_cp)
+        {
+            stack.pop();
+        }
+        if visited_entry.get(&bid) == Some(&stack) {
+            continue;
+        }
+        visited_entry.insert(bid, stack.clone());
+        let Some(&bidx) = by_id.get(&bid) else {
+            continue;
+        };
+        let bb = &f.blocks[bidx];
+        for (stmt_idx, stmt) in bb.stmts.iter().enumerate() {
+            if let Some(&top) = stack.last() {
+                active.insert((bid, stmt_idx), top);
+            }
+            match &stmt.inst {
+                Inst::CmdCheckpoint => {
+                    if let Some(cp) = stmt.dst {
+                        stack.push(cp);
+                    }
+                }
+                Inst::CmdRollback { checkpoint } => {
+                    if let Some(pos) = stack.iter().rposition(|c| c == checkpoint) {
+                        stack.truncate(pos);
+                    }
+                }
+                _ => {}
+            }
+        }
+        match &bb.terminator {
+            Terminator::Goto(t) => work.push_back((t.0, stack)),
+            Terminator::Branch {
+                then_bb, else_bb, ..
+            } => {
+                work.push_back((then_bb.0, stack.clone()));
+                work.push_back((else_bb.0, stack));
+            }
+            Terminator::Switch {
+                cases, default_bb, ..
+            } => {
+                for (_, t) in cases {
+                    work.push_back((t.0, stack.clone()));
+                }
+                work.push_back((default_bb.0, stack));
+            }
+            Terminator::Return(_) => {}
+        }
+    }
+    active
 }
 
 pub(super) fn analyze_cfg(blocks: &[BasicBlock]) -> (HashSet<u32>, HashSet<u32>) {

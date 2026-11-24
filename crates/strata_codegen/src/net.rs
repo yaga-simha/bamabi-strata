@@ -326,9 +326,17 @@ pub fn quantize_scalar_f64(val: f64, min: f64, max: f64, bits: u8, step: Option<
     }
     let eff_bits = bits.min(32);
     let max_q = (1u64 << eff_bits) - 1;
+    let levels = max_q.max(1) as f64;
     let eff_step = match step {
         Some(s) if s.is_finite() && s > 0.0 => s,
-        _ => (max - min) / (max_q.max(1) as f64),
+        _ => {
+            let diff = max - min;
+            if diff.is_finite() {
+                diff / levels
+            } else {
+                (max / levels) - (min / levels)
+            }
+        }
     };
     if !eff_step.is_finite() || eff_step <= 0.0 {
         return 0;
@@ -338,9 +346,13 @@ pub fn quantize_scalar_f64(val: f64, min: f64, max: f64, bits: u8, step: Option<
     } else {
         val.clamp(min, max)
     };
-    ((clamped - min) / eff_step)
-        .round()
-        .clamp(0.0, max_q as f64) as u64
+    let span_val = clamped - min;
+    let q_f = if span_val.is_finite() {
+        span_val / eff_step
+    } else {
+        (clamped / eff_step) - (min / eff_step)
+    };
+    q_f.round().clamp(0.0, max_q as f64) as u64
 }
 
 /// Dequantizes a `bits`-wide (`1..=32`) unsigned integer back into `f64` in `[min, max]`.
@@ -352,14 +364,28 @@ pub fn dequantize_scalar_f64(raw: u64, min: f64, max: f64, bits: u8, step: Optio
     let eff_bits = bits.min(32);
     let max_q = (1u64 << eff_bits) - 1;
     let q = raw & max_q;
+    let levels = max_q.max(1) as f64;
     let eff_step = match step {
         Some(s) if s.is_finite() && s > 0.0 => s,
-        _ => (max - min) / (max_q.max(1) as f64),
+        _ => {
+            let diff = max - min;
+            if diff.is_finite() {
+                diff / levels
+            } else {
+                (max / levels) - (min / levels)
+            }
+        }
     };
     if !eff_step.is_finite() || eff_step <= 0.0 {
         return min;
     }
-    (min + (q as f64) * eff_step).clamp(min, max)
+    let step_off = (q as f64) * eff_step;
+    if step_off.is_finite() {
+        (min + step_off).clamp(min, max)
+    } else {
+        let half_off = (q as f64) * (eff_step * 0.5);
+        ((min + half_off) + half_off).clamp(min, max)
+    }
 }
 
 /// Packs the lowest `bits` (`0..=64`) of `val` into `buf` starting at `bit_offset` in little-endian
@@ -535,6 +561,25 @@ mod tests {
 
         // NaN / non-finite handling clamps cleanly to min.
         assert_eq!(quantize_scalar_f64(f64::NAN, -10.0, 10.0, 8, None), 0);
+
+        // NT-09: full i64::MIN..i64::MAX / wide float span must not overflow (max - min) to Inf.
+        let wide_min = -1e307_f64;
+        let wide_max = 1e307_f64;
+        assert_eq!(
+            quantize_scalar_f64(wide_max, wide_min, wide_max, 16, None),
+            65_535
+        );
+        assert_eq!(
+            quantize_scalar_f64(wide_min, wide_min, wide_max, 16, None),
+            0
+        );
+        let q_zero = quantize_scalar_f64(0.0, wide_min, wide_max, 16, None);
+        assert!((32767..=32768).contains(&q_zero), "q_zero={q_zero}");
+        let dq_mid = dequantize_scalar_f64(q_zero, wide_min, wide_max, 16, None);
+        assert!(
+            dq_mid.is_finite(),
+            "wide dequantize must remain finite: {dq_mid}"
+        );
     }
 
     #[test]
