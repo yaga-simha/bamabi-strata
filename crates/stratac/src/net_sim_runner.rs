@@ -134,6 +134,8 @@ fn prune_schedule_group(
         Some(HirScheduleGroup {
             kind: group.kind.clone(),
             name: group.name.clone(),
+            before: group.before.clone(),
+            after: group.after.clone(),
             children,
         })
     }
@@ -1741,6 +1743,7 @@ impl<'a> NetSimRunner<'a> {
             allow_filters,
             has_filters,
             changed_filters,
+            added_filters: Vec::new(),
             where_pred: None,
             on_target: None,
             up_relation: None,

@@ -423,6 +423,8 @@ pub fn run(module: &mut MirModule) {
                 HirScheduleGroup {
                     kind: "leaf".to_owned(),
                     name: rebuild_name,
+                    before: Vec::new(),
+                    after: Vec::new(),
                     children: Vec::new(),
                 },
             );
@@ -481,6 +483,8 @@ fn insert_before_earliest_reader(
                 HirScheduleGroup {
                     kind: "leaf".to_owned(),
                     name: rebuild_name.to_owned(),
+                    before: Vec::new(),
+                    after: Vec::new(),
                     children: Vec::new(),
                 },
             );

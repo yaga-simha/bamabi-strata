@@ -2225,6 +2225,7 @@ fn mir_step2_iter5_guarded_query_one_non_unit_fail_returns_zero() {
                 allow_filters: Vec::new(),
                 has_filters: Vec::new(),
                 changed_filters: Vec::new(),
+                added_filters: Vec::new(),
                 where_pred: None,
                 on_target: None,
                 up_relation: None,

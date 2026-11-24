@@ -1205,6 +1205,8 @@ pub(crate) fn augment_mir_for_sim_tests(
         .map(|name| HirScheduleGroup {
             kind: "leaf".to_owned(),
             name,
+            before: Vec::new(),
+            after: Vec::new(),
             children: Vec::new(),
         })
         .collect();

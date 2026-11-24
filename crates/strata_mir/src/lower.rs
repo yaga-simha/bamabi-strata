@@ -6066,6 +6066,7 @@ impl<'a> CfgBuilder<'a> {
                 tick,
                 p0,
                 p1,
+                radius: _,
             } => {
                 let history_name = self.resolve_spatial_resource_name(history);
                 let tick_l = self.lower_expr(tick).0;
@@ -7594,6 +7595,8 @@ fn synthesize_timer_tick_system(
     let tick_leaf = HirScheduleGroup {
         kind: "leaf".to_owned(),
         name: "strata_timer_tick".to_owned(),
+        before: Vec::new(),
+        after: Vec::new(),
         children: Vec::new(),
     };
     if let Some(fixed) = schedules.iter_mut().find(|s| s.label == "FixedUpdate") {
