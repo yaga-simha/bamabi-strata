@@ -2112,10 +2112,24 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 );
                 let _ = writeln!(s, "        uint32_t mask = 0u;");
                 for (_, start_f, end_f, bit) in window_masks {
-                    let _ = writeln!(
-                        s,
-                        "        if (frame >= {start_f}u && frame <= {end_f}u) {{ mask |= (1u << {bit}u); }}"
-                    );
+                    if *start_f == 0 && *end_f == u32::MAX {
+                        let _ = writeln!(s, "        mask |= (1u << {bit}u);");
+                    } else if *start_f == 0 {
+                        let _ = writeln!(
+                            s,
+                            "        if (frame <= {end_f}u) {{ mask |= (1u << {bit}u); }}"
+                        );
+                    } else if *end_f == u32::MAX {
+                        let _ = writeln!(
+                            s,
+                            "        if (frame >= {start_f}u) {{ mask |= (1u << {bit}u); }}"
+                        );
+                    } else {
+                        let _ = writeln!(
+                            s,
+                            "        if (frame >= {start_f}u && frame <= {end_f}u) {{ mask |= (1u << {bit}u); }}"
+                        );
+                    }
                 }
                 let _ = writeln!(s, "        memcpy({p}, &elapsed, sizeof(float));");
                 let _ = writeln!(
@@ -2212,26 +2226,37 @@ impl<'a, 'b> FnEmitCtx<'a, 'b> {
                 let trg = target
                     .map(|id| self.local_expr(id))
                     .unwrap_or_else(|| "BAM_ENTITY_NULL".to_string());
-                let (pp, psz) = if let Some(pid) = payload {
+                let (pp, psz, pp_is_addr_of) = if let Some(pid) = payload {
                     let is_ptr =
                         matches!(self.local_ty(*pid), Some(MirType::Ptr | MirType::MutPtr));
                     let pe = self.local_expr(*pid);
                     let comp_sz = self.parent.components.get(c_idx).map_or(0, |c| c.size);
                     if is_ptr {
-                        (format!("(const uint8_t*){pe}"), comp_sz)
+                        (format!("(const uint8_t*){pe}"), comp_sz, false)
                     } else {
-                        (format!("(const uint8_t*)&{pe}"), comp_sz)
+                        (format!("(const uint8_t*)&{pe}"), comp_sz, true)
                     }
                 } else {
-                    ("NULL".to_string(), 0usize)
+                    ("NULL".to_string(), 0usize, false)
                 };
                 self.ensure_cmds_snippet(s);
                 if *propagate {
-                    let buf_n = psz.max(1);
-                    let _ = writeln!(
-                        s,
-                        "    if (cmds_cache != NULL && state->api->cmd_trigger_ex != NULL) {{\n        uint8_t trg_buf[{buf_n}u];\n        memset(trg_buf, 0, sizeof(trg_buf));\n        if ({pp} != NULL && {psz}u > 0u) {{ memcpy(trg_buf, {pp}, {psz}u); }}\n        BamTriggerDesc tdesc = bam_trigger_desc(state->components[{c_idx}], {trg}, ({psz}u > 0u) ? trg_buf : NULL, {psz}u);\n        tdesc.flags = BAM_TRIGGER_FLAG_PROPAGATE;\n        (void)state->api->cmd_trigger_ex(cmds_cache, &tdesc);\n    }}"
-                    );
+                    if psz > 0 {
+                        let copy_stmt = if pp_is_addr_of {
+                            format!("memcpy(trg_buf, {pp}, {psz}u);")
+                        } else {
+                            format!("if ({pp} != NULL) {{ memcpy(trg_buf, {pp}, {psz}u); }}")
+                        };
+                        let _ = writeln!(
+                            s,
+                            "    if (cmds_cache != NULL && state->api->cmd_trigger_ex != NULL) {{\n        uint8_t trg_buf[{psz}u];\n        memset(trg_buf, 0, sizeof(trg_buf));\n        {copy_stmt}\n        BamTriggerDesc tdesc = bam_trigger_desc(state->components[{c_idx}], {trg}, trg_buf, {psz}u);\n        tdesc.flags = BAM_TRIGGER_FLAG_PROPAGATE;\n        (void)state->api->cmd_trigger_ex(cmds_cache, &tdesc);\n    }}"
+                        );
+                    } else {
+                        let _ = writeln!(
+                            s,
+                            "    if (cmds_cache != NULL && state->api->cmd_trigger_ex != NULL) {{\n        BamTriggerDesc tdesc = bam_trigger_desc(state->components[{c_idx}], {trg}, NULL, 0u);\n        tdesc.flags = BAM_TRIGGER_FLAG_PROPAGATE;\n        (void)state->api->cmd_trigger_ex(cmds_cache, &tdesc);\n    }}"
+                        );
+                    }
                 } else {
                     let _ = writeln!(
                         s,
