@@ -92,6 +92,47 @@ pub fn verify_mir(module: &MirModule) -> Result<(), Vec<MirVerifyError>> {
 
     for func in module.functions.iter().chain(module.fns.iter()) {
         verify_function(func, module.is_deterministic, &mut errors);
+        for bb in &func.blocks {
+            for stmt in &bb.stmts {
+                if let Inst::IterUpCascade { relation, .. } = &stmt.inst {
+                    let short_r = relation.rsplit("::").next().unwrap_or(relation.as_str());
+                    if short_r != "ChildOf" {
+                        let expected_short = format!("__strata_rel_parent_{short_r}");
+                        let expected_canon = if module.module_path.is_empty() {
+                            expected_short.clone()
+                        } else {
+                            format!("{}::{expected_short}", module.module_path)
+                        };
+                        let found = module.layouts.iter().find(|l| {
+                            l.canonical_name == expected_canon || l.canonical_name == expected_short
+                        });
+                        match found {
+                            None => errors.push(MirVerifyError::InvalidCfgInvariant {
+                                function: func.name.clone(),
+                                detail: format!(
+                                    "custom relation `{relation}` used in IterUpCascade missing companion layout `{expected_canon}`"
+                                ),
+                            }),
+                            Some(l)
+                                if l.size != 8
+                                    || l.align != 8
+                                    || l.fields.len() != 1
+                                    || l.fields[0].name != "parent" =>
+                            {
+                                errors.push(MirVerifyError::InvalidCfgInvariant {
+                                    function: func.name.clone(),
+                                    detail: format!(
+                                        "companion layout `{}` must be 8-byte aligned FfiEntity `parent` component",
+                                        l.canonical_name
+                                    ),
+                                });
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+            }
+        }
     }
 
     verify_network_ir(module, &mut errors);
@@ -774,17 +815,40 @@ fn verify_function(func: &MirFunction, mod_det: bool, errors: &mut Vec<MirVerify
         }
     }
 
-    for ct in &func.changed_terms {
-        let q_idx = ct.query_idx as usize;
-        let t_idx = ct.term_idx as usize;
-        let valid_q = q_idx < func.queries.len() && q_idx < func.query_bindings.len();
-        let valid_t = valid_q && t_idx < func.query_bindings[q_idx].terms.len();
-        if !valid_t {
+    for err in &func.lowering_errors {
+        errors.push(MirVerifyError::InvalidCfgInvariant {
+            function: func.name.clone(),
+            detail: err.clone(),
+        });
+    }
+
+    for (label, terms) in [
+        ("MirChangedTerm", &func.changed_terms),
+        ("MirAddedTerm", &func.added_terms),
+    ] {
+        for ct in terms {
+            let q_idx = ct.query_idx as usize;
+            let t_idx = ct.term_idx as usize;
+            let valid_q = q_idx < func.queries.len() && q_idx < func.query_bindings.len();
+            let valid_t = valid_q && t_idx < func.query_bindings[q_idx].terms.len();
+            if !valid_t {
+                errors.push(MirVerifyError::InvalidCfgInvariant {
+                    function: func.name.clone(),
+                    detail: format!(
+                        "{label} ({}, {}) out of bounds for query_bindings",
+                        ct.query_idx, ct.term_idx
+                    ),
+                });
+            }
+        }
+    }
+
+    for (q_idx, filter) in &func.added_filters {
+        if (*q_idx as usize) >= func.queries.len() {
             errors.push(MirVerifyError::InvalidCfgInvariant {
                 function: func.name.clone(),
                 detail: format!(
-                    "MirChangedTerm ({}, {}) out of bounds for query_bindings",
-                    ct.query_idx, ct.term_idx
+                    "added_filter `{filter}` query_idx {q_idx} out of bounds for queries"
                 ),
             });
         }

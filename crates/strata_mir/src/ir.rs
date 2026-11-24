@@ -832,12 +832,12 @@ impl MirQuantizeSpec {
         }
     }
 
-    /// Returns the effective quantization step size (explicit `step` or `(max - min) / max_level`).
+    /// Returns the effective quantization step size (explicit `step` or `(max / max_level) - (min / max_level)`).
     #[must_use]
     pub fn effective_step(&self) -> f64 {
         self.step.unwrap_or_else(|| {
             let levels = self.max_quantized_u64().max(1) as f64;
-            (self.max - self.min) / levels
+            (self.max / levels) - (self.min / levels)
         })
     }
 }
@@ -859,6 +859,9 @@ pub struct MirNetFieldSpec {
     pub bit_offset: u32,
     /// Total packed bit width for this field.
     pub total_bits: u32,
+    /// Optional `@soa` split struct layout name (e.g. `Comp__cold_0`) when extracted from an SoA split.
+    #[serde(default)]
+    pub stratum_layout: Option<String>,
 }
 
 /// Lowered network replication, authority, and quantized bit-packing metadata for a component/resource.
@@ -1011,9 +1014,18 @@ pub struct MirFunction {
     /// `.changed()` / `.changed<T>()` filters bound to query terms.
     #[serde(default)]
     pub changed_terms: Vec<MirChangedTerm>,
+    /// `.added()` / `.added<T>()` filters bound to query terms.
+    #[serde(default)]
+    pub added_terms: Vec<MirChangedTerm>,
+    /// Raw `.added()` / `.added<T>()` filter component names keyed by query index.
+    #[serde(default)]
+    pub added_filters: Vec<(u32, String)>,
     /// Host `Messages<M>` stream operations used by this function.
     #[serde(default)]
     pub stream_ops: Vec<MirStreamOp>,
+    /// Non-empty diagnostics collected during lowering (rejected by the MIR verifier).
+    #[serde(default)]
+    pub lowering_errors: Vec<String>,
 }
 
 impl MirFunction {
@@ -1044,7 +1056,10 @@ impl MirFunction {
             is_node_pure: false,
             node_group: None,
             changed_terms: Vec::new(),
+            added_terms: Vec::new(),
+            added_filters: Vec::new(),
             stream_ops: Vec::new(),
+            lowering_errors: Vec::new(),
         }
     }
 

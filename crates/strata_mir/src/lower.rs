@@ -249,40 +249,45 @@ impl MirLowerCtx {
         }
     }
 
-    pub(crate) fn resolve_field(&self, layout_key: &str, field_path: &str) -> (u32, MirType, Ty) {
-        let Some(mut layout) = self.find_layout(layout_key) else {
-            return (0, MirType::F32, Ty::F32);
-        };
+    pub(crate) fn try_resolve_field(
+        &self,
+        layout_key: &str,
+        field_path: &str,
+    ) -> Option<(u32, MirType, Ty)> {
+        let mut layout = self.find_layout(layout_key)?;
         let mut offset = 0usize;
         let parts: Vec<&str> = field_path.split('.').collect();
         let mut cur_ty = Ty::Unknown;
         for (i, part) in parts.iter().enumerate() {
-            if let Some(sf) = layout.fields.iter().find(|f| f.name == *part) {
-                offset += sf.offset;
-                cur_ty = sf.ty.clone();
-                if i + 1 < parts.len() {
-                    if let Ty::Named(ref inner_name) = sf.ty
-                        && let Some(inner_layout) = self.find_layout(inner_name)
-                    {
-                        layout = inner_layout;
-                        continue;
-                    }
-                    // Vector subcomponent (e.g. `pos.xy.x` -> offset + lane*4)
-                    if let Some(lane) = vec_lane_index(parts[i + 1]) {
-                        offset += (lane as usize) * 4;
-                        let (mty, hty) = match cur_ty {
-                            Ty::IVec2 | Ty::IVec3 => (MirType::I32, Ty::I32),
-                            Ty::UVec2 => (MirType::U32, Ty::U32),
-                            _ => (MirType::F32, Ty::F32),
-                        };
-                        return (offset as u32, mty, hty);
-                    }
+            let sf = layout.fields.iter().find(|f| f.name == *part)?;
+            offset += sf.offset;
+            cur_ty = sf.ty.clone();
+            if i + 1 < parts.len() {
+                if let Ty::Named(ref inner_name) = sf.ty
+                    && let Some(inner_layout) = self.find_layout(inner_name)
+                {
+                    layout = inner_layout;
+                    continue;
                 }
-            } else {
-                return (offset as u32, MirType::F32, Ty::F32);
+                // Vector subcomponent (e.g. `pos.xy.x` -> offset + lane*4)
+                if let Some(lane) = vec_lane_index(parts[i + 1]) {
+                    offset += (lane as usize) * 4;
+                    let (mty, hty) = match cur_ty {
+                        Ty::IVec2 | Ty::IVec3 => (MirType::I32, Ty::I32),
+                        Ty::UVec2 => (MirType::U32, Ty::U32),
+                        _ => (MirType::F32, Ty::F32),
+                    };
+                    return Some((offset as u32, mty, hty));
+                }
+                return None;
             }
         }
-        (offset as u32, mir_ty_from_hir(&cur_ty), cur_ty)
+        Some((offset as u32, mir_ty_from_hir(&cur_ty), cur_ty))
+    }
+
+    pub(crate) fn resolve_field(&self, layout_key: &str, field_path: &str) -> (u32, MirType, Ty) {
+        self.try_resolve_field(layout_key, field_path)
+            .unwrap_or((0, MirType::Unit, Ty::Unknown))
     }
 
     pub(crate) fn resolve_field_opt(&self, layout_key: &str, field_path: &str) -> Option<MirType> {
@@ -478,7 +483,7 @@ pub(crate) fn eval_hir_const_for_ty(
         HirExpr::Unary { op, expr, .. } => {
             let v = eval_hir_const_for_ty(expr, expected_ty, consts, enums, layouts)?;
             match (op, v) {
-                (HirUnOp::Neg, MirConstVal::Int(i)) => Some(MirConstVal::Int(-i)),
+                (HirUnOp::Neg, MirConstVal::Int(i)) => Some(MirConstVal::Int(i.wrapping_neg())),
                 (HirUnOp::Neg, MirConstVal::Float(f)) => Some(MirConstVal::Float(-f)),
                 (HirUnOp::Not, MirConstVal::Bool(b)) => Some(MirConstVal::Bool(!b)),
                 (HirUnOp::Not, MirConstVal::Int(i)) => Some(MirConstVal::Int(!i)),
@@ -493,7 +498,7 @@ pub(crate) fn eval_hir_const_for_ty(
                     HirBinOp::Add => Some(MirConstVal::Int(a.saturating_add(b))),
                     HirBinOp::Sub => Some(MirConstVal::Int(a.saturating_sub(b))),
                     HirBinOp::Mul => Some(MirConstVal::Int(a.saturating_mul(b))),
-                    HirBinOp::Div if b != 0 => Some(MirConstVal::Int(a / b)),
+                    HirBinOp::Div if b != 0 => Some(MirConstVal::Int(a.wrapping_div(b))),
                     HirBinOp::BitAnd => Some(MirConstVal::Int(a & b)),
                     HirBinOp::BitOr => Some(MirConstVal::Int(a | b)),
                     HirBinOp::Shl => Some(MirConstVal::Int(a.wrapping_shl(b as u32))),
@@ -904,6 +909,7 @@ pub(crate) struct CfgBuilder<'a> {
     pub(crate) cur_bb: BlockId,
     pub(crate) cur_terminated: bool,
     pub(crate) vars: HashMap<String, VarSlot>,
+    var_hir_tys: HashMap<String, Ty>,
     slot_layouts: HashMap<LocalId, String>,
     loop_stack: Vec<LoopTarget>,
     atomic_rollback_stack: Vec<(LocalId, BlockId)>,
@@ -920,6 +926,7 @@ impl<'a> CfgBuilder<'a> {
             cur_bb: BlockId(0),
             cur_terminated: false,
             vars: HashMap::new(),
+            var_hir_tys: HashMap::new(),
             slot_layouts: HashMap::new(),
             loop_stack: Vec::new(),
             atomic_rollback_stack: Vec::new(),
@@ -933,6 +940,196 @@ impl<'a> CfgBuilder<'a> {
     pub(crate) fn switch_to(&mut self, bb: BlockId) {
         self.cur_bb = bb;
         self.cur_terminated = false;
+    }
+
+    pub(crate) fn record_lowering_error(&mut self, msg: impl Into<String>) {
+        self.func.lowering_errors.push(msg.into());
+    }
+
+    pub(crate) fn resolve_field_checked(
+        &mut self,
+        layout_key: &str,
+        field_path: &str,
+    ) -> (u32, MirType, Ty) {
+        if let Some(found) = self.ctx.try_resolve_field(layout_key, field_path) {
+            return found;
+        }
+        if !layout_key.is_empty() && self.ctx.find_layout(layout_key).is_some() {
+            self.record_lowering_error(format!(
+                "unknown field `{field_path}` on layout `{layout_key}`"
+            ));
+        }
+        (0, MirType::Unit, Ty::Unknown)
+    }
+
+    pub(crate) fn resolve_hir_expr_ty(&self, expr: &HirExpr) -> Ty {
+        let direct = expr.ty();
+        if !matches!(direct, Ty::Unknown | Ty::Unit) {
+            return direct;
+        }
+        match expr {
+            HirExpr::Path { name, .. } => {
+                if let Some(t) = self.var_hir_tys.get(name)
+                    && !matches!(t, Ty::Unknown | Ty::Unit)
+                {
+                    return t.clone();
+                }
+                if let Some(slot) = self.vars.get(name) {
+                    match slot {
+                        VarSlot::SingleTermPtr { binding } => {
+                            if let Some(ref f) = binding.field_name {
+                                return self
+                                    .ctx
+                                    .try_resolve_field(&binding.canonical_layout, f)
+                                    .map_or(Ty::Unknown, |(_, _, t)| t);
+                            }
+                            return Ty::Named(binding.canonical_layout.clone());
+                        }
+                        VarSlot::ResPtr { layout_key, .. }
+                        | VarSlot::EventPayloadPtr { layout_key, .. }
+                            if !layout_key.is_empty() =>
+                        {
+                            return Ty::Named(layout_key.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(ce) = self.ctx.const_exprs.get(name) {
+                    let ct = ce.ty();
+                    if !matches!(ct, Ty::Unknown | Ty::Unit) {
+                        return ct;
+                    }
+                }
+                Ty::Unknown
+            }
+            HirExpr::Field { base, field, .. } => {
+                if let HirExpr::Path { name: row_name, .. } = base.as_ref()
+                    && let Some(VarSlot::RowAlias { terms, .. }) = self.vars.get(row_name)
+                    && let Some(tb) = terms.get(field)
+                {
+                    if let Some(ref pf) = tb.field_name {
+                        return self
+                            .ctx
+                            .try_resolve_field(&tb.canonical_layout, pf)
+                            .map_or(Ty::Unknown, |(_, _, t)| t);
+                    }
+                    return Ty::Named(tb.canonical_layout.clone());
+                }
+                if let HirExpr::Field {
+                    base: row_base,
+                    field: term_alias,
+                    ..
+                } = base.as_ref()
+                    && let HirExpr::Path { name: row_name, .. } = row_base.as_ref()
+                    && let Some(VarSlot::RowAlias { terms, .. }) = self.vars.get(row_name)
+                    && let Some(tb) = terms.get(term_alias)
+                {
+                    let fpath = match tb.field_name {
+                        Some(ref pf) => format!("{pf}.{field}"),
+                        None => field.to_owned(),
+                    };
+                    return self
+                        .ctx
+                        .try_resolve_field(&tb.canonical_layout, &fpath)
+                        .map_or(Ty::Unknown, |(_, _, t)| t);
+                }
+                let base_ty = self.resolve_hir_expr_ty(base);
+                let inner_ty = match base_ty {
+                    Ty::Borrow { inner, .. } | Ty::Option(inner) => *inner,
+                    other => other,
+                };
+                match inner_ty {
+                    Ty::Named(ref n) | Ty::Ref(ref n) => {
+                        let lk = self.ctx.resolve_canonical(n);
+                        self.ctx
+                            .try_resolve_field(&lk, field)
+                            .map_or(Ty::Unknown, |(_, _, t)| t)
+                    }
+                    _ => Ty::Unknown,
+                }
+            }
+            HirExpr::Index { base, .. } => match self.resolve_hir_expr_ty(base) {
+                Ty::Array { elem, .. } | Ty::SmallVec { elem, .. } => *elem,
+                _ => Ty::Unknown,
+            },
+            HirExpr::Unary {
+                op: HirUnOp::Ref | HirUnOp::RefMut,
+                expr: inner,
+                ..
+            } => self.resolve_hir_expr_ty(inner),
+            _ => Ty::Unknown,
+        }
+    }
+
+    fn resolve_place_hir_ty(&self, place: &MirPlace) -> Option<Ty> {
+        match place {
+            MirPlace::Slot { name, ty, .. } => self
+                .var_hir_tys
+                .get(name)
+                .filter(|t| !matches!(t, Ty::Unknown | Ty::Unit))
+                .cloned()
+                .or_else(|| hir_ty_hint_from_mir(ty)),
+            MirPlace::TermField {
+                binding,
+                field_path,
+                field_ty,
+            } => self
+                .ctx
+                .try_resolve_field(&binding.canonical_layout, field_path)
+                .map(|(_, _, t)| t)
+                .or_else(|| hir_ty_hint_from_mir(field_ty)),
+            MirPlace::PtrField {
+                layout_key,
+                field_path,
+                field_ty,
+                ..
+            } => self
+                .ctx
+                .try_resolve_field(layout_key, field_path)
+                .map(|(_, _, t)| t)
+                .or_else(|| hir_ty_hint_from_mir(field_ty)),
+            MirPlace::ArrayElem { base, elem_ty, .. } => {
+                if let Some(base_hir) = self.resolve_place_hir_ty(base)
+                    && let Ty::Array { elem, .. } | Ty::SmallVec { elem, .. } = base_hir
+                {
+                    return Some(*elem);
+                }
+                hir_ty_hint_from_mir(elem_ty)
+            }
+            MirPlace::Ptr { layout_key, ty, .. } => {
+                if !layout_key.is_empty() {
+                    Some(Ty::Named(layout_key.clone()))
+                } else {
+                    hir_ty_hint_from_mir(ty)
+                }
+            }
+            MirPlace::VecLane { vec_ty, .. } => match vec_ty {
+                MirType::IVec2 | MirType::IVec3 => Some(Ty::I32),
+                MirType::UVec2 => Some(Ty::U32),
+                _ => Some(Ty::F32),
+            },
+            MirPlace::RowAlias { .. } => None,
+        }
+    }
+
+    fn resolve_smallvec_info(&self, expr: &HirExpr) -> Option<(Ty, MirType, usize)> {
+        if let Ty::SmallVec { elem, cap } = self.resolve_hir_expr_ty(expr) {
+            let elem_mty = mir_ty_from_hir(&elem);
+            let elem_mty = if elem_mty == MirType::Unit {
+                MirType::F32
+            } else {
+                elem_mty
+            };
+            return Some((*elem, elem_mty, cap));
+        }
+        None
+    }
+
+    fn resolve_bitset_words(&self, expr: &HirExpr) -> Option<u32> {
+        if let Ty::BitSet(bits) = self.resolve_hir_expr_ty(expr) {
+            return Some(bits.div_ceil(32).max(1) as u32);
+        }
+        None
     }
 
     pub(crate) fn emit(&mut self, dst: Option<LocalId>, inst: Inst) {
@@ -1106,6 +1303,7 @@ impl<'a> CfgBuilder<'a> {
                         local: Some(pl),
                         layout_key: (!layout_key.is_empty()).then_some(layout_key.clone()),
                     });
+                    self.var_hir_tys.insert(p.name.clone(), p.ty.clone());
                     self.vars.insert(
                         p.name.clone(),
                         VarSlot::ResPtr {
@@ -1132,6 +1330,7 @@ impl<'a> CfgBuilder<'a> {
                         local: Some(param_local),
                         layout_key: None,
                     });
+                    self.var_hir_tys.insert(p.name.clone(), p.ty.clone());
                     self.vars.insert(
                         p.name.clone(),
                         VarSlot::Slot {
@@ -1169,6 +1368,11 @@ impl<'a> CfgBuilder<'a> {
         for f in &hq.changed_filters {
             changed_filters.insert(f.clone());
         }
+        let mut added_filters = BTreeSet::new();
+        for f in &hq.added_filters {
+            added_filters.insert(f.clone());
+            self.func.added_filters.push((query_idx, f.clone()));
+        }
         for (term_idx, t) in hq.terms.iter().enumerate() {
             let canon_comp = self.ctx.resolve_canonical(&t.canonical_component);
             let is_changed = changed_filters.iter().any(|cf| {
@@ -1178,6 +1382,19 @@ impl<'a> CfgBuilder<'a> {
             });
             if is_changed {
                 self.func.changed_terms.push(MirChangedTerm {
+                    query_idx,
+                    term_idx: term_idx as u32,
+                    storage_key: t.storage_key.clone(),
+                    canonical_component: canon_comp.clone(),
+                });
+            }
+            let is_added = added_filters.iter().any(|af| {
+                storage_keys_overlap(af, &t.storage_key)
+                    || storage_keys_overlap(af, &canon_comp)
+                    || af == &canon_comp
+            });
+            if is_added {
+                self.func.added_terms.push(MirChangedTerm {
                     query_idx,
                     term_idx: term_idx as u32,
                     storage_key: t.storage_key.clone(),
@@ -1566,6 +1783,31 @@ impl<'a> CfgBuilder<'a> {
             }
             HirExpr::Path { name, ty } => self.lower_path(name, ty),
             HirExpr::Unary { op, expr, ty } => {
+                if *op == HirUnOp::Neg
+                    && let Some((folded_val, folded_hir_ty)) = try_fold_neg_int_lit(expr)
+                {
+                    let res_ty = if *ty != Ty::Unknown && *ty != Ty::Unit {
+                        mir_ty_from_hir(ty)
+                    } else {
+                        let mty = mir_ty_from_hir(&folded_hir_ty);
+                        if mty == MirType::Unit {
+                            MirType::I64
+                        } else {
+                            mty
+                        }
+                    };
+                    if matches!(
+                        res_ty,
+                        MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64
+                    ) {
+                        let l = self.alloc_and_emit(
+                            "i",
+                            res_ty.clone(),
+                            Inst::ConstInt { value: folded_val },
+                        );
+                        return (l, res_ty);
+                    }
+                }
                 let (inner_l, inner_ty) = self.lower_expr(expr);
                 let op_s = match op {
                     HirUnOp::Neg => "-",
@@ -1611,6 +1853,39 @@ impl<'a> CfgBuilder<'a> {
                 }
                 if *op == HirBinOp::Or {
                     return self.lower_short_circuit(false, lhs, rhs);
+                }
+                if *op == HirBinOp::Mul && matches!(self.resolve_hir_expr_ty(lhs), Ty::Quat) {
+                    let rhs_hir_ty = self.resolve_hir_expr_ty(rhs);
+                    if matches!(rhs_hir_ty, Ty::Quat | Ty::Vec3) {
+                        let (mut l_id, l_ty) = self.lower_expr(lhs);
+                        let (mut r_id, r_ty) = self.lower_expr(rhs);
+                        if l_ty != MirType::Vec4 {
+                            l_id = self.coerce_local_to_ty(l_id, l_ty, &MirType::Vec4);
+                        }
+                        let (op_name, res_ty) = if matches!(rhs_hir_ty, Ty::Quat) {
+                            if r_ty != MirType::Vec4 {
+                                r_id = self.coerce_local_to_ty(r_id, r_ty, &MirType::Vec4);
+                            }
+                            ("quat_mul", MirType::Vec4)
+                        } else {
+                            if r_ty != MirType::Vec3 {
+                                r_id = self.coerce_local_to_ty(r_id, r_ty, &MirType::Vec3);
+                            }
+                            ("quat_mul_vec3", MirType::Vec3)
+                        };
+                        let allow_fma = !self.ctx.is_deterministic && !self.func.is_deterministic;
+                        let id = self.alloc_and_emit(
+                            "qmul",
+                            res_ty.clone(),
+                            Inst::BinOp {
+                                op: op_name.to_owned(),
+                                lhs: l_id,
+                                rhs: r_id,
+                                allow_fma,
+                            },
+                        );
+                        return (id, res_ty);
+                    }
                 }
                 let (mut l_id, l_ty) = self.lower_expr(lhs);
                 let (mut r_id, r_ty) = self.lower_expr(rhs);
@@ -1707,6 +1982,29 @@ impl<'a> CfgBuilder<'a> {
                     );
                     return (id, rty);
                 }
+                if let Some((_, elem_mty, _)) = self.resolve_smallvec_info(base) {
+                    let sv_ptr = self.lower_primitive_field_ptr(base);
+                    let data_ptr = self.alloc_and_emit(
+                        "sv_data",
+                        MirType::Ptr,
+                        Inst::FieldPtr {
+                            base_ptr: sv_ptr,
+                            layout_key: "SmallVec".to_owned(),
+                            field: "data".to_owned(),
+                            offset_bytes: 8,
+                        },
+                    );
+                    let (idx_l, _) = self.lower_expr(index);
+                    let id = self.alloc_and_emit(
+                        "sv_elem",
+                        elem_mty.clone(),
+                        Inst::ArrayIndex {
+                            base: data_ptr,
+                            index: idx_l,
+                        },
+                    );
+                    return (id, elem_mty);
+                }
                 let (base_l, _) = self.lower_expr(base);
                 let (idx_l, _) = self.lower_expr(index);
                 let mty = mir_ty_from_hir(ty);
@@ -1783,43 +2081,7 @@ impl<'a> CfgBuilder<'a> {
                 );
                 (id, ty)
             }
-            HirExpr::ArrayLit { elems, ty } => {
-                let mut lowered = Vec::with_capacity(elems.len());
-                for it in elems {
-                    lowered.push(self.lower_expr(it));
-                }
-                let expected_elem_ty = match ty {
-                    Ty::Array { elem, .. } | Ty::SmallVec { elem, .. } if **elem != Ty::Unknown => {
-                        let m = mir_ty_from_hir(elem);
-                        (m != MirType::Unit).then_some(m)
-                    }
-                    _ => None,
-                };
-                let elem_ty = if let Some(exp) = expected_elem_ty {
-                    exp
-                } else if let Some((_, first_t)) = lowered.first() {
-                    let mut acc = first_t.clone();
-                    for (_, t) in &lowered[1..] {
-                        if is_scalar_numeric(&acc) && is_scalar_numeric(t) {
-                            acc = unify_mir_scalar(&acc, t);
-                        }
-                    }
-                    acc
-                } else {
-                    MirType::F32
-                };
-                let mut elem_ids = Vec::with_capacity(lowered.len());
-                for (l, t) in lowered {
-                    elem_ids.push(self.coerce_local_to_ty(l, t, &elem_ty));
-                }
-                let arr_ty = MirType::Array {
-                    elem: Box::new(elem_ty),
-                    len: elem_ids.len(),
-                };
-                let id =
-                    self.alloc_and_emit("arr", arr_ty.clone(), Inst::ArrayInit { elems: elem_ids });
-                (id, arr_ty)
-            }
+            HirExpr::ArrayLit { elems, ty } => self.lower_array_lit(elems, ty, None),
             HirExpr::Tuple { elems, .. } => {
                 if elems.is_empty() {
                     let u = self.alloc_and_emit(
@@ -1923,6 +2185,105 @@ impl<'a> CfgBuilder<'a> {
             ),
             HirExpr::Match(hm) => self.lower_match(hm),
             HirExpr::For(hf) => self.lower_for(hf),
+        }
+    }
+
+    fn lower_array_lit(
+        &mut self,
+        elems: &[HirExpr],
+        ty: &Ty,
+        expected_ty: Option<&Ty>,
+    ) -> (LocalId, MirType) {
+        let eff_ty = expected_ty
+            .filter(|t| !matches!(t, Ty::Unknown | Ty::Unit))
+            .unwrap_or(ty);
+        let expected_elem_hir = match eff_ty {
+            Ty::Array { elem, .. } | Ty::SmallVec { elem, .. }
+                if !matches!(**elem, Ty::Unknown | Ty::Unit) =>
+            {
+                Some(elem.as_ref())
+            }
+            _ => match ty {
+                Ty::Array { elem, .. } | Ty::SmallVec { elem, .. }
+                    if !matches!(**elem, Ty::Unknown | Ty::Unit) =>
+                {
+                    Some(elem.as_ref())
+                }
+                _ => None,
+            },
+        };
+        let mut lowered = Vec::with_capacity(elems.len());
+        for it in elems {
+            lowered.push(self.lower_expr_for_ty(it, expected_elem_hir));
+        }
+        let expected_elem_ty = expected_elem_hir
+            .map(mir_ty_from_hir)
+            .filter(|m| *m != MirType::Unit);
+        let elem_ty = if let Some(exp) = expected_elem_ty {
+            exp
+        } else if let Some((_, first_t)) = lowered.first() {
+            let mut acc = first_t.clone();
+            for (_, t) in &lowered[1..] {
+                if is_scalar_numeric(&acc) && is_scalar_numeric(t) {
+                    acc = unify_mir_scalar(&acc, t);
+                }
+            }
+            acc
+        } else {
+            MirType::F32
+        };
+        let mut elem_ids = Vec::with_capacity(lowered.len());
+        for (l, t) in lowered {
+            elem_ids.push(self.coerce_local_to_ty(l, t, &elem_ty));
+        }
+        let arr_ty = MirType::Array {
+            elem: Box::new(elem_ty),
+            len: elem_ids.len(),
+        };
+        let id = self.alloc_and_emit("arr", arr_ty.clone(), Inst::ArrayInit { elems: elem_ids });
+        (id, arr_ty)
+    }
+
+    pub(crate) fn lower_expr_for_ty(
+        &mut self,
+        expr: &HirExpr,
+        expected_ty: Option<&Ty>,
+    ) -> (LocalId, MirType) {
+        let Some(exp) = expected_ty.filter(|t| !matches!(t, Ty::Unknown | Ty::Unit)) else {
+            if let HirExpr::Call(call) = expr
+                && call.receiver.is_none()
+                && call.callee.rsplit("::").next() == Some("bits")
+                && matches!(call.ty, Ty::BitSet(b) if b > 64)
+            {
+                return self.lower_bits_call(call, Some(&call.ty));
+            }
+            return self.lower_expr(expr);
+        };
+        match expr {
+            HirExpr::Call(call)
+                if call.receiver.is_none() && call.callee.rsplit("::").next() == Some("bits") =>
+            {
+                self.lower_bits_call(call, Some(exp))
+            }
+            HirExpr::ArrayLit { elems, ty } => self.lower_array_lit(elems, ty, Some(exp)),
+            HirExpr::Block { stmts, tail, ty } => {
+                let saved_vars = self.vars.clone();
+                self.lower_stmts(stmts);
+                let out = if let Some(t) = tail {
+                    self.lower_expr_for_ty(t, Some(exp))
+                } else {
+                    let rty = mir_ty_from_hir(ty);
+                    let u = self.alloc_and_emit(
+                        "blk_unit",
+                        rty.clone(),
+                        Inst::ConstBool { value: false },
+                    );
+                    (u, rty)
+                };
+                self.vars = saved_vars;
+                out
+            }
+            _ => self.lower_expr(expr),
         }
     }
 
@@ -2806,14 +3167,7 @@ impl<'a> CfgBuilder<'a> {
                 .as_ref()
                 .and_then(|l| l.fields.iter().find(|sf| sf.name == *fname))
                 .map(|sf| sf.ty.clone());
-            let (fl, _) = if let HirExpr::Call(call) = fexpr
-                && call.receiver.is_none()
-                && call.callee.rsplit("::").next() == Some("bits")
-            {
-                self.lower_bits_call(call, sf_ty.as_ref())
-            } else {
-                self.lower_expr(fexpr)
-            };
+            let (fl, _) = self.lower_expr_for_ty(fexpr, sf_ty.as_ref());
             out.push((fname.clone(), fl));
         }
         if let Some(defs) = self.ctx.layout_defaults(comp_name).cloned() {
@@ -2937,7 +3291,7 @@ impl<'a> CfgBuilder<'a> {
                     ptr_local,
                     layout_key,
                 } => {
-                    let (offset, fty, _) = self.ctx.resolve_field(&layout_key, field);
+                    let (offset, fty, _) = self.resolve_field_checked(&layout_key, field);
                     let id = self.alloc_and_emit(
                         &format!("fld_{field}"),
                         fty.clone(),
@@ -3002,7 +3356,7 @@ impl<'a> CfgBuilder<'a> {
                 Inst::TriggerPayload { event: ev.clone() },
             );
             let layout_key = self.ctx.resolve_canonical(&ev);
-            let (offset, fty, _) = self.ctx.resolve_field(&layout_key, field);
+            let (offset, fty, _) = self.resolve_field_checked(&layout_key, field);
             let id = self.alloc_and_emit(
                 &format!("ev_{field}"),
                 fty.clone(),
@@ -3038,7 +3392,12 @@ impl<'a> CfgBuilder<'a> {
             {
                 layout_key = lk.clone();
             }
-            let (offset, fty, _) = self.ctx.resolve_field(&layout_key, field);
+            if layout_key.is_empty()
+                && let Ty::Named(n) | Ty::Ref(n) = self.resolve_hir_expr_ty(base)
+            {
+                layout_key = self.ctx.resolve_canonical(&n);
+            }
+            let (offset, fty, _) = self.resolve_field_checked(&layout_key, field);
             let id = self.alloc_and_emit(
                 &format!("fld_{field}"),
                 fty.clone(),
@@ -3055,41 +3414,65 @@ impl<'a> CfgBuilder<'a> {
         // Table cell field (`CropSpec[key].growth_ticks`)
         if matches!(base, HirExpr::Index { .. })
             && let MirType::Named(ref tname) = base_ty
-            && let Some(last_stmt) = self.func.blocks[self.cur_bb.0 as usize].stmts.last_mut()
-            && let Inst::TableLoad {
-                ref table_name,
-                field: ref mut tf,
-                ..
-            } = last_stmt.inst
-            && let bare_tname = tname
+        {
+            let bare_tname = tname
                 .strip_prefix("__table_row::")
                 .unwrap_or(tname.as_str())
-            && table_name == bare_tname
-            && tf.is_empty()
-        {
-            *tf = field.to_owned();
-            let fty = self
-                .ctx
-                .tables
-                .get(bare_tname)
-                .and_then(|t| t.fields.iter().find(|(fnm, _)| fnm == field))
-                .map_or_else(|| mir_ty_from_hir(ty), |(_, ft)| mir_ty_from_hir(ft));
-            let fty = if fty == MirType::Unit {
-                MirType::F32
-            } else {
-                fty
-            };
-            if let Some(dst) = last_stmt.dst {
-                self.func.locals[dst.0 as usize].ty = fty.clone();
-                return (dst, fty);
+                .to_owned();
+            let mut matched_table = false;
+            let mut tbl_dst: Option<LocalId> = None;
+            let mut tbl_err: Option<String> = None;
+            if let Some(last_stmt) = self.func.blocks[self.cur_bb.0 as usize].stmts.last_mut()
+                && let Inst::TableLoad {
+                    ref table_name,
+                    field: ref mut tf,
+                    ..
+                } = last_stmt.inst
+                && table_name == &bare_tname
+                && tf.is_empty()
+            {
+                matched_table = true;
+                *tf = field.to_owned();
+                tbl_dst = last_stmt.dst;
+            }
+            if matched_table {
+                let fty_opt = self
+                    .ctx
+                    .tables
+                    .get(&bare_tname)
+                    .and_then(|t| t.fields.iter().find(|(fnm, _)| fnm == field))
+                    .map(|(_, ft)| mir_ty_from_hir(ft));
+                let fty = match fty_opt {
+                    Some(MirType::Unit) | None => {
+                        if self.ctx.tables.contains_key(&bare_tname) {
+                            tbl_err =
+                                Some(format!("unknown field `{field}` on table `{bare_tname}`"));
+                        }
+                        MirType::Unit
+                    }
+                    Some(t) => t,
+                };
+                if let Some(err) = tbl_err {
+                    self.record_lowering_error(err);
+                }
+                if let Some(dst) = tbl_dst {
+                    self.func.locals[dst.0 as usize].ty = fty.clone();
+                    return (dst, fty);
+                }
             }
         }
         if let MirType::Named(ref n) = base_ty {
             let layout_key = self.ctx.resolve_canonical(n);
-            if self.ctx.find_layout(&layout_key).is_some()
-                && self.ctx.resolve_field_opt(&layout_key, field).is_some()
-            {
-                let (offset, fty, _) = self.ctx.resolve_field(&layout_key, field);
+            if self.ctx.find_layout(&layout_key).is_some() {
+                let (offset, fty, _) = self.resolve_field_checked(&layout_key, field);
+                if fty == MirType::Unit {
+                    let u = self.alloc_and_emit(
+                        &format!("bad_fld_{field}"),
+                        MirType::Unit,
+                        Inst::ConstBool { value: false },
+                    );
+                    return (u, MirType::Unit);
+                }
                 let id = self.alloc_and_emit(
                     &format!("fld_{field}"),
                     fty.clone(),
@@ -3124,7 +3507,7 @@ impl<'a> CfgBuilder<'a> {
 
     fn emit_term_field_load(&mut self, tb: &TermAccessBinding, field: &str) -> (LocalId, MirType) {
         let base_ptr = tb.row_ptr.unwrap_or(tb.col_ptr);
-        let (offset, fty, _) = self.ctx.resolve_field(&tb.canonical_layout, field);
+        let (offset, fty, _) = self.resolve_field_checked(&tb.canonical_layout, field);
         let id = self.alloc_and_emit(
             &format!("t_{field}"),
             fty.clone(),
@@ -3185,26 +3568,17 @@ impl<'a> CfgBuilder<'a> {
             }
         }
         let place = self.resolve_lvalue_place(target);
-        let (rhs_l, rhs_ty) = if op == HirAssignOp::Set
-            && let HirExpr::Call(call) = value
-            && call.receiver.is_none()
-            && call.callee.rsplit("::").next() == Some("bits")
-        {
-            let target_bs = place.as_ref().and_then(|p| match p {
-                MirPlace::Slot { ty, .. }
-                | MirPlace::TermField { field_ty: ty, .. }
-                | MirPlace::PtrField { field_ty: ty, .. }
-                | MirPlace::ArrayElem { elem_ty: ty, .. } => {
-                    bitset_bits_from_mir_ty(ty).map(Ty::BitSet)
-                }
-                _ => None,
-            });
-            self.lower_bits_call(call, target_bs.as_ref())
+        let target_hir_ty = place.as_ref().and_then(|p| self.resolve_place_hir_ty(p));
+        let (rhs_l, rhs_ty) = if op == HirAssignOp::Set {
+            self.lower_expr_for_ty(value, target_hir_ty.as_ref())
         } else {
             self.lower_expr(value)
         };
+        let is_quat_mul = op == HirAssignOp::MulAssign
+            && matches!(target_hir_ty, Some(Ty::Quat))
+            && matches!(self.resolve_hir_expr_ty(value), Ty::Quat);
         if let Some(place) = place {
-            self.write_place(&place, op, rhs_l, rhs_ty);
+            self.write_place(&place, op, rhs_l, rhs_ty, is_quat_mul);
         }
     }
 
@@ -3239,7 +3613,7 @@ impl<'a> CfgBuilder<'a> {
         }
     }
 
-    fn resolve_local_place(&self, name: &str) -> Option<MirPlace> {
+    fn resolve_local_place(&mut self, name: &str) -> Option<MirPlace> {
         let slot = self.vars.get(name)?.clone();
         match slot {
             VarSlot::Slot { slot_local, ty } => Some(MirPlace::Slot {
@@ -3258,7 +3632,7 @@ impl<'a> CfgBuilder<'a> {
             VarSlot::RowAlias { terms, .. } => Some(MirPlace::RowAlias { terms }),
             VarSlot::SingleTermPtr { binding } => {
                 if let Some(ref proj) = binding.field_name {
-                    let (_, fty, _) = self.ctx.resolve_field(&binding.canonical_layout, proj);
+                    let (_, fty, _) = self.resolve_field_checked(&binding.canonical_layout, proj);
                     Some(MirPlace::TermField {
                         binding: binding.clone(),
                         field_path: proj.clone(),
@@ -3322,7 +3696,7 @@ impl<'a> CfgBuilder<'a> {
             MirPlace::RowAlias { terms } => {
                 let tb = terms.get(field)?.clone();
                 if let Some(proj_field) = tb.field_name.clone() {
-                    let (_, fty, _) = self.ctx.resolve_field(&tb.canonical_layout, &proj_field);
+                    let (_, fty, _) = self.resolve_field_checked(&tb.canonical_layout, &proj_field);
                     Some(MirPlace::TermField {
                         binding: tb,
                         field_path: proj_field,
@@ -3359,7 +3733,7 @@ impl<'a> CfgBuilder<'a> {
                 } else {
                     format!("{field_path}.{field}")
                 };
-                let (_, fty, _) = self.ctx.resolve_field(&binding.canonical_layout, &nested);
+                let (_, fty, _) = self.resolve_field_checked(&binding.canonical_layout, &nested);
                 Some(MirPlace::TermField {
                     binding,
                     field_path: nested,
@@ -3371,7 +3745,7 @@ impl<'a> CfgBuilder<'a> {
                 layout_key,
                 ..
             } => {
-                let (_, fty, _) = self.ctx.resolve_field(&layout_key, field);
+                let (_, fty, _) = self.resolve_field_checked(&layout_key, field);
                 Some(MirPlace::PtrField {
                     ptr_local,
                     layout_key,
@@ -3400,7 +3774,7 @@ impl<'a> CfgBuilder<'a> {
                     });
                 }
                 let nested = format!("{field_path}.{field}");
-                let (_, fty, _) = self.ctx.resolve_field(&layout_key, &nested);
+                let (_, fty, _) = self.resolve_field_checked(&layout_key, &nested);
                 Some(MirPlace::PtrField {
                     ptr_local,
                     layout_key,
@@ -3439,7 +3813,7 @@ impl<'a> CfgBuilder<'a> {
                 } else {
                     slot_local
                 };
-                let (_, fty, _) = self.ctx.resolve_field(&layout_key, field);
+                let (_, fty, _) = self.resolve_field_checked(&layout_key, field);
                 Some(MirPlace::PtrField {
                     ptr_local: ptr,
                     layout_key,
@@ -3465,7 +3839,29 @@ impl<'a> CfgBuilder<'a> {
                         lane,
                     });
                 }
-                None
+                let elem_place = MirPlace::ArrayElem {
+                    base,
+                    index,
+                    elem_ty: elem_ty.clone(),
+                };
+                let layout_key = match &elem_ty {
+                    MirType::Named(n) => self.ctx.resolve_canonical(n),
+                    _ => match self.resolve_place_hir_ty(&elem_place) {
+                        Some(Ty::Named(n) | Ty::Ref(n)) => self.ctx.resolve_canonical(&n),
+                        _ => String::new(),
+                    },
+                };
+                if layout_key.is_empty() {
+                    return None;
+                }
+                let elem_ptr = self.resolve_place_ptr(&elem_place)?;
+                let (_, fty, _) = self.resolve_field_checked(&layout_key, field);
+                Some(MirPlace::PtrField {
+                    ptr_local: elem_ptr,
+                    layout_key,
+                    field_path: field.to_owned(),
+                    field_ty: fty,
+                })
             }
             MirPlace::VecLane { .. } => None,
         }
@@ -3484,8 +3880,22 @@ impl<'a> CfgBuilder<'a> {
             | MirPlace::PtrField {
                 field_ty: MirType::Array { elem, .. },
                 ..
+            }
+            | MirPlace::ArrayElem {
+                elem_ty: MirType::Array { elem, .. },
+                ..
+            }
+            | MirPlace::Ptr {
+                ty: MirType::Array { elem, .. },
+                ..
             } => Some((**elem).clone()),
-            _ => None,
+            _ => match self.resolve_place_hir_ty(&base) {
+                Some(Ty::Array { elem, .. } | Ty::SmallVec { elem, .. }) => {
+                    let m = mir_ty_from_hir(&elem);
+                    (m != MirType::Unit).then_some(m)
+                }
+                _ => None,
+            },
         };
         let elem_ty = base_elem.unwrap_or_else(|| {
             let m = mir_ty_from_hir(ty);
@@ -3519,7 +3929,7 @@ impl<'a> CfgBuilder<'a> {
                 field_path,
                 ..
             } => {
-                let (offset, fty, _) = self.ctx.resolve_field(layout_key, field_path);
+                let (offset, fty, _) = self.resolve_field_checked(layout_key, field_path);
                 let v = self.alloc_and_emit(
                     field_path,
                     fty.clone(),
@@ -3555,6 +3965,19 @@ impl<'a> CfgBuilder<'a> {
                 index,
                 elem_ty,
             } => {
+                if matches!(self.resolve_place_hir_ty(base), Some(Ty::SmallVec { .. }))
+                    && let Some(arr_ptr) = self.resolve_array_base_ptr(base)
+                {
+                    let el = self.alloc_and_emit(
+                        "sv_elem",
+                        elem_ty.clone(),
+                        Inst::ArrayIndex {
+                            base: arr_ptr,
+                            index: *index,
+                        },
+                    );
+                    return (el, elem_ty.clone());
+                }
                 let (arr_val, _) = self.read_place(base);
                 let el = self.alloc_and_emit(
                     "arr_elem",
@@ -3575,7 +3998,14 @@ impl<'a> CfgBuilder<'a> {
         }
     }
 
-    fn write_place(&mut self, place: &MirPlace, op: HirAssignOp, rhs_l: LocalId, rhs_ty: MirType) {
+    fn write_place(
+        &mut self,
+        place: &MirPlace,
+        op: HirAssignOp,
+        rhs_l: LocalId,
+        rhs_ty: MirType,
+        is_quat_mul: bool,
+    ) {
         match place {
             MirPlace::Slot {
                 name,
@@ -3588,14 +4018,23 @@ impl<'a> CfgBuilder<'a> {
                 } else {
                     let cur =
                         self.alloc_and_emit(name, ty.clone(), Inst::SlotLoad { slot: *slot_local });
-                    let allow_fma = !self.ctx.is_deterministic
-                        && !self.func.is_deterministic
-                        && matches!(ty, MirType::F32 | MirType::F64);
+                    let allow_fma = if is_quat_mul {
+                        !self.ctx.is_deterministic && !self.func.is_deterministic
+                    } else {
+                        !self.ctx.is_deterministic
+                            && !self.func.is_deterministic
+                            && matches!(ty, MirType::F32 | MirType::F64)
+                    };
+                    let bin_op = if is_quat_mul {
+                        "quat_mul"
+                    } else {
+                        assign_op_str(op)
+                    };
                     self.alloc_and_emit(
                         "upd",
                         ty.clone(),
                         Inst::BinOp {
-                            op: assign_op_str(op).to_owned(),
+                            op: bin_op.to_owned(),
                             lhs: cur,
                             rhs: coerced_rhs,
                             allow_fma,
@@ -3613,7 +4052,7 @@ impl<'a> CfgBuilder<'a> {
                 ..
             } => {
                 if !field_path.is_empty() {
-                    self.store_term_field(binding, field_path, op, rhs_l, rhs_ty);
+                    self.store_term_field(binding, field_path, op, rhs_l, rhs_ty, is_quat_mul);
                 }
             }
             MirPlace::PtrField {
@@ -3622,7 +4061,15 @@ impl<'a> CfgBuilder<'a> {
                 field_path,
                 ..
             } => {
-                self.store_ptr_field(*ptr_local, layout_key, field_path, op, rhs_l, rhs_ty);
+                self.store_ptr_field(
+                    *ptr_local,
+                    layout_key,
+                    field_path,
+                    op,
+                    rhs_l,
+                    rhs_ty,
+                    is_quat_mul,
+                );
             }
             MirPlace::VecLane {
                 inner,
@@ -3668,7 +4115,7 @@ impl<'a> CfgBuilder<'a> {
                         val: scalar_val,
                     },
                 );
-                self.write_place(inner, HirAssignOp::Set, new_vec, vec_ty.clone());
+                self.write_place(inner, HirAssignOp::Set, new_vec, vec_ty.clone(), false);
             }
             MirPlace::ArrayElem {
                 base,
@@ -3680,14 +4127,23 @@ impl<'a> CfgBuilder<'a> {
                     coerced_rhs
                 } else {
                     let (cur_el, _) = self.read_place(place);
-                    let allow_fma = !self.ctx.is_deterministic
-                        && !self.func.is_deterministic
-                        && matches!(elem_ty, MirType::F32 | MirType::F64);
+                    let allow_fma = if is_quat_mul {
+                        !self.ctx.is_deterministic && !self.func.is_deterministic
+                    } else {
+                        !self.ctx.is_deterministic
+                            && !self.func.is_deterministic
+                            && matches!(elem_ty, MirType::F32 | MirType::F64)
+                    };
+                    let bin_op = if is_quat_mul {
+                        "quat_mul"
+                    } else {
+                        assign_op_str(op)
+                    };
                     self.alloc_and_emit(
                         "arr_upd",
                         elem_ty.clone(),
                         Inst::BinOp {
-                            op: assign_op_str(op).to_owned(),
+                            op: bin_op.to_owned(),
                             lhs: cur_el,
                             rhs: coerced_rhs,
                             allow_fma,
@@ -3707,9 +4163,23 @@ impl<'a> CfgBuilder<'a> {
         }
     }
 
-    fn resolve_array_base_ptr(&mut self, base: &MirPlace) -> Option<LocalId> {
-        match base {
-            MirPlace::Slot { slot_local, .. } => Some(*slot_local),
+    fn resolve_place_ptr(&mut self, place: &MirPlace) -> Option<LocalId> {
+        match place {
+            MirPlace::Slot {
+                name,
+                slot_local,
+                ty,
+            } => {
+                if matches!(ty, MirType::Ptr | MirType::MutPtr) {
+                    Some(self.alloc_and_emit(
+                        name,
+                        MirType::MutPtr,
+                        Inst::SlotLoad { slot: *slot_local },
+                    ))
+                } else {
+                    Some(*slot_local)
+                }
+            }
             MirPlace::Ptr { ptr_local, .. } => Some(*ptr_local),
             MirPlace::TermField {
                 binding,
@@ -3717,9 +4187,95 @@ impl<'a> CfgBuilder<'a> {
                 ..
             } => {
                 let base_ptr = binding.row_ptr.unwrap_or(binding.col_ptr);
-                let (offset, _, _) = self
-                    .ctx
-                    .resolve_field(&binding.canonical_layout, field_path);
+                if field_path.is_empty() {
+                    Some(base_ptr)
+                } else {
+                    let (offset, _, _) =
+                        self.resolve_field_checked(&binding.canonical_layout, field_path);
+                    Some(self.alloc_and_emit(
+                        &format!("ptr_{field_path}"),
+                        MirType::MutPtr,
+                        Inst::FieldPtr {
+                            base_ptr,
+                            layout_key: binding.canonical_layout.clone(),
+                            field: field_path.clone(),
+                            offset_bytes: offset,
+                        },
+                    ))
+                }
+            }
+            MirPlace::PtrField {
+                ptr_local,
+                layout_key,
+                field_path,
+                ..
+            } => {
+                let (offset, _, _) = self.resolve_field_checked(layout_key, field_path);
+                Some(self.alloc_and_emit(
+                    &format!("ptr_{field_path}"),
+                    MirType::MutPtr,
+                    Inst::FieldPtr {
+                        base_ptr: *ptr_local,
+                        layout_key: layout_key.clone(),
+                        field: field_path.clone(),
+                        offset_bytes: offset,
+                    },
+                ))
+            }
+            MirPlace::ArrayElem { base, index, .. } => {
+                let arr_ptr = self.resolve_array_base_ptr(base)?;
+                Some(self.alloc_and_emit(
+                    "arr_elem_ptr",
+                    MirType::MutPtr,
+                    Inst::ArrayIndex {
+                        base: arr_ptr,
+                        index: *index,
+                    },
+                ))
+            }
+            MirPlace::RowAlias { .. } | MirPlace::VecLane { .. } => None,
+        }
+    }
+
+    fn resolve_array_base_ptr(&mut self, base: &MirPlace) -> Option<LocalId> {
+        if matches!(self.resolve_place_hir_ty(base), Some(Ty::SmallVec { .. })) {
+            let sv_ptr = self.resolve_place_ptr(base)?;
+            return Some(self.alloc_and_emit(
+                "sv_data_ptr",
+                MirType::MutPtr,
+                Inst::FieldPtr {
+                    base_ptr: sv_ptr,
+                    layout_key: "SmallVec".to_owned(),
+                    field: "data".to_owned(),
+                    offset_bytes: 8,
+                },
+            ));
+        }
+        match base {
+            MirPlace::Slot {
+                name,
+                slot_local,
+                ty,
+            } => {
+                if matches!(ty, MirType::Ptr | MirType::MutPtr) {
+                    Some(self.alloc_and_emit(
+                        name,
+                        MirType::MutPtr,
+                        Inst::SlotLoad { slot: *slot_local },
+                    ))
+                } else {
+                    Some(*slot_local)
+                }
+            }
+            MirPlace::Ptr { ptr_local, .. } => Some(*ptr_local),
+            MirPlace::TermField {
+                binding,
+                field_path,
+                ..
+            } => {
+                let base_ptr = binding.row_ptr.unwrap_or(binding.col_ptr);
+                let (offset, _, _) =
+                    self.resolve_field_checked(&binding.canonical_layout, field_path);
                 Some(self.alloc_and_emit(
                     &format!("arr_ptr_{field_path}"),
                     MirType::MutPtr,
@@ -3737,7 +4293,7 @@ impl<'a> CfgBuilder<'a> {
                 field_path,
                 ..
             } => {
-                let (offset, _, _) = self.ctx.resolve_field(layout_key, field_path);
+                let (offset, _, _) = self.resolve_field_checked(layout_key, field_path);
                 Some(self.alloc_and_emit(
                     &format!("arr_ptr_{field_path}"),
                     MirType::MutPtr,
@@ -3749,10 +4305,26 @@ impl<'a> CfgBuilder<'a> {
                     },
                 ))
             }
+            MirPlace::ArrayElem {
+                base: outer_base,
+                index: outer_idx,
+                ..
+            } => {
+                let outer_arr_ptr = self.resolve_array_base_ptr(outer_base)?;
+                Some(self.alloc_and_emit(
+                    "arr_elem_ptr",
+                    MirType::MutPtr,
+                    Inst::ArrayIndex {
+                        base: outer_arr_ptr,
+                        index: *outer_idx,
+                    },
+                ))
+            }
             _ => None,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn store_term_field(
         &mut self,
         tb: &TermAccessBinding,
@@ -3760,11 +4332,21 @@ impl<'a> CfgBuilder<'a> {
         op: HirAssignOp,
         rhs_l: LocalId,
         rhs_ty: MirType,
+        is_quat_mul: bool,
     ) {
         let base_ptr = tb.row_ptr.unwrap_or(tb.col_ptr);
-        self.store_ptr_field(base_ptr, &tb.canonical_layout, field, op, rhs_l, rhs_ty);
+        self.store_ptr_field(
+            base_ptr,
+            &tb.canonical_layout,
+            field,
+            op,
+            rhs_l,
+            rhs_ty,
+            is_quat_mul,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn store_ptr_field(
         &mut self,
         base_ptr: LocalId,
@@ -3773,8 +4355,9 @@ impl<'a> CfgBuilder<'a> {
         op: HirAssignOp,
         rhs_l: LocalId,
         rhs_ty: MirType,
+        is_quat_mul: bool,
     ) {
-        let (offset, fty, _) = self.ctx.resolve_field(layout_key, field);
+        let (offset, fty, _) = self.resolve_field_checked(layout_key, field);
         let coerced_rhs = self.coerce_local_to_ty(rhs_l, rhs_ty, &fty);
         let final_val = if op == HirAssignOp::Set {
             coerced_rhs
@@ -3790,14 +4373,23 @@ impl<'a> CfgBuilder<'a> {
                     field_ty: fty.clone(),
                 },
             );
-            let allow_fma = !self.ctx.is_deterministic
-                && !self.func.is_deterministic
-                && matches!(fty, MirType::F32 | MirType::F64);
+            let allow_fma = if is_quat_mul {
+                !self.ctx.is_deterministic && !self.func.is_deterministic
+            } else {
+                !self.ctx.is_deterministic
+                    && !self.func.is_deterministic
+                    && matches!(fty, MirType::F32 | MirType::F64)
+            };
+            let bin_op = if is_quat_mul {
+                "quat_mul"
+            } else {
+                assign_op_str(op)
+            };
             self.alloc_and_emit(
                 &format!("{field}_upd"),
                 fty,
                 Inst::BinOp {
-                    op: assign_op_str(op).to_owned(),
+                    op: bin_op.to_owned(),
                     lhs: cur,
                     rhs: coerced_rhs,
                     allow_fma,
@@ -3973,7 +4565,8 @@ impl<'a> CfgBuilder<'a> {
                 return (id, MirType::UVec2);
             }
             "bits" => {
-                return self.lower_bits_call(call, None);
+                let target_ty = matches!(call.ty, Ty::BitSet(b) if b > 64).then_some(&call.ty);
+                return self.lower_bits_call(call, target_ty);
             }
             "meters" | "sec" | "ms" | "rad" | "deg" | "mps" | "mps2" | "hz" | "frames" => {
                 if let Some(a0) = call.args.first() {
@@ -4089,26 +4682,32 @@ impl<'a> CfgBuilder<'a> {
             "query_segment_at" => {
                 let raw_name = receiver_resource_name(receiver);
                 let history_name = self.resolve_spatial_resource_name(&raw_name);
-                let zero_v = self.alloc_and_emit(
-                    "zv",
-                    MirType::Vec3,
-                    Inst::ConstVec {
-                        dims: 3,
-                        values: [0.0; 4],
-                    },
-                );
-                let start = if let Some(a) = args.first() {
+                let tick_offset = self.arg_or_int(args, 0, 0, MirType::U32);
+                let start = if let Some(a) = args.get(1) {
                     self.lower_expr(a).0
                 } else {
-                    zero_v
+                    self.alloc_and_emit(
+                        "zv",
+                        MirType::Vec3,
+                        Inst::ConstVec {
+                            dims: 3,
+                            values: [0.0; 4],
+                        },
+                    )
                 };
-                let end = if let Some(a) = args.get(1) {
+                let end = if let Some(a) = args.get(2) {
                     self.lower_expr(a).0
                 } else {
-                    zero_v
+                    self.alloc_and_emit(
+                        "zv",
+                        MirType::Vec3,
+                        Inst::ConstVec {
+                            dims: 3,
+                            values: [0.0; 4],
+                        },
+                    )
                 };
-                let radius = self.arg_or_float(args, 2, 1.0);
-                let tick_offset = self.arg_or_int(args, 3, 0, MirType::U32);
+                let radius = self.arg_or_float(args, 3, 0.5);
                 let id = self.alloc_and_emit(
                     "seg_iter",
                     MirType::QueryIter,
@@ -4142,14 +4741,22 @@ impl<'a> CfgBuilder<'a> {
             "clear" => {
                 let ptr = self.lower_primitive_field_ptr(receiver);
                 if args.is_empty() {
-                    self.emit_void(Inst::GraceClear { ptr });
-                } else {
-                    let words = match receiver.ty() {
-                        Ty::BitSet(b) => b.div_ceil(32).max(1) as u32,
-                        _ => 1,
-                    };
-                    let bit = self.lower_expr(&args[0]).0;
+                    let recv_hir = self.resolve_hir_expr_ty(receiver);
+                    if !matches!(recv_hir, Ty::GraceWindow | Ty::Unknown) {
+                        self.record_lowering_error(format!(
+                            "`.clear()` with 0 args requires GraceWindow receiver, found `{recv_hir:?}`"
+                        ));
+                    } else {
+                        self.emit_void(Inst::GraceClear { ptr });
+                    }
+                } else if let Some(words) = self.resolve_bitset_words(receiver).or_else(|| {
+                    let recv_hir = self.resolve_hir_expr_ty(receiver);
+                    matches!(recv_hir, Ty::Unknown).then(|| bitset_words(receiver))
+                }) {
+                    let bit = self.arg_or_int(args, 0, 0, MirType::U32);
                     self.emit_void(Inst::BitSetClear { ptr, words, bit });
+                } else {
+                    self.record_lowering_error("`.clear(bit)` requires a BitSet receiver");
                 }
                 let u =
                     self.alloc_and_emit("unit", MirType::Unit, Inst::ConstBool { value: false });
@@ -4157,6 +4764,109 @@ impl<'a> CfgBuilder<'a> {
             }
             "push" => {
                 let ptr = self.lower_primitive_field_ptr(receiver);
+                if let Some((elem_hir, elem_mty, cap)) = self.resolve_smallvec_info(receiver) {
+                    let cur_len = self.alloc_and_emit(
+                        "sv_len",
+                        MirType::U32,
+                        Inst::FieldLoad {
+                            base_ptr: ptr,
+                            layout_key: "SmallVec".to_owned(),
+                            field: "len".to_owned(),
+                            offset_bytes: 0,
+                            field_ty: MirType::U32,
+                        },
+                    );
+                    let cap_l = self.alloc_and_emit(
+                        "sv_cap",
+                        MirType::U32,
+                        Inst::ConstInt { value: cap as i64 },
+                    );
+                    let in_bounds = self.alloc_and_emit(
+                        "sv_ok",
+                        MirType::Bool,
+                        Inst::BinOp {
+                            op: "<".to_owned(),
+                            lhs: cur_len,
+                            rhs: cap_l,
+                            allow_fma: false,
+                        },
+                    );
+                    let push_bb = self.new_block("sv_push_ok");
+                    let done_bb = self.new_block("sv_push_done");
+                    self.terminate(Terminator::Branch {
+                        cond: in_bounds,
+                        then_bb: push_bb,
+                        else_bb: done_bb,
+                    });
+                    self.switch_to(push_bb);
+                    let data_ptr = self.alloc_and_emit(
+                        "sv_data",
+                        MirType::MutPtr,
+                        Inst::FieldPtr {
+                            base_ptr: ptr,
+                            layout_key: "SmallVec".to_owned(),
+                            field: "data".to_owned(),
+                            offset_bytes: 8,
+                        },
+                    );
+                    let (raw_val, raw_ty) = if let Some(arg) = args.first() {
+                        self.lower_expr_for_ty(arg, Some(&elem_hir))
+                    } else {
+                        self.record_lowering_error("`SmallVec::push` requires 1 argument");
+                        let z = self.alloc_and_emit(
+                            "sv_z",
+                            elem_mty.clone(),
+                            Inst::ConstInt { value: 0 },
+                        );
+                        (z, elem_mty.clone())
+                    };
+                    let val_coerced = self.coerce_local_to_ty(raw_val, raw_ty, &elem_mty);
+                    self.emit_void(Inst::ArrayStore {
+                        base_ptr: data_ptr,
+                        index: cur_len,
+                        val: val_coerced,
+                        elem_ty: elem_mty,
+                    });
+                    let one =
+                        self.alloc_and_emit("sv_1", MirType::U32, Inst::ConstInt { value: 1 });
+                    let nxt_len = self.alloc_and_emit(
+                        "sv_nlen",
+                        MirType::U32,
+                        Inst::BinOp {
+                            op: "+".to_owned(),
+                            lhs: cur_len,
+                            rhs: one,
+                            allow_fma: false,
+                        },
+                    );
+                    self.emit_void(Inst::FieldStore {
+                        base_ptr: ptr,
+                        layout_key: "SmallVec".to_owned(),
+                        field: "len".to_owned(),
+                        offset_bytes: 0,
+                        val: nxt_len,
+                    });
+                    self.terminate(Terminator::Goto(done_bb));
+                    self.switch_to(done_bb);
+                    let u = self.alloc_and_emit(
+                        "unit",
+                        MirType::Unit,
+                        Inst::ConstBool { value: false },
+                    );
+                    return (u, MirType::Unit);
+                }
+                let recv_hir = self.resolve_hir_expr_ty(receiver);
+                if !matches!(recv_hir, Ty::InputBuffer { .. } | Ty::Unknown) {
+                    self.record_lowering_error(format!(
+                        "`.push()` requires SmallVec or InputBuffer receiver, found `{recv_hir:?}`"
+                    ));
+                    let u = self.alloc_and_emit(
+                        "unit",
+                        MirType::Unit,
+                        Inst::ConstBool { value: false },
+                    );
+                    return (u, MirType::Unit);
+                }
                 let cap = input_buf_cap(receiver);
                 let action_id = self.arg_or_int(args, 0, 0, MirType::U16);
                 let window_sec = self.arg_or_float(args, 1, 0.1);
@@ -4169,6 +4879,59 @@ impl<'a> CfgBuilder<'a> {
                 let u =
                     self.alloc_and_emit("unit", MirType::Unit, Inst::ConstBool { value: false });
                 return (u, MirType::Unit);
+            }
+            "len" => {
+                if self.resolve_smallvec_info(receiver).is_some() {
+                    let ptr = self.lower_primitive_field_ptr(receiver);
+                    let id = self.alloc_and_emit(
+                        "sv_len",
+                        MirType::U32,
+                        Inst::FieldLoad {
+                            base_ptr: ptr,
+                            layout_key: "SmallVec".to_owned(),
+                            field: "len".to_owned(),
+                            offset_bytes: 0,
+                            field_ty: MirType::U32,
+                        },
+                    );
+                    return (id, MirType::U32);
+                }
+                match self.resolve_hir_expr_ty(receiver) {
+                    Ty::Array { len, .. } => {
+                        let id = self.alloc_and_emit(
+                            "arr_len",
+                            MirType::U32,
+                            Inst::ConstInt { value: len as i64 },
+                        );
+                        return (id, MirType::U32);
+                    }
+                    Ty::InlineStr(_) => {
+                        let ptr = self.lower_primitive_field_ptr(receiver);
+                        let id = self.alloc_and_emit(
+                            "str_len",
+                            MirType::U32,
+                            Inst::FieldLoad {
+                                base_ptr: ptr,
+                                layout_key: "InlineStr".to_owned(),
+                                field: "len".to_owned(),
+                                offset_bytes: 0,
+                                field_ty: MirType::U32,
+                            },
+                        );
+                        return (id, MirType::U32);
+                    }
+                    other => {
+                        self.record_lowering_error(format!(
+                            "`.len()` not supported on `{other:?}`"
+                        ));
+                        let z = self.alloc_and_emit(
+                            "len_err",
+                            MirType::U32,
+                            Inst::ConstInt { value: 0 },
+                        );
+                        return (z, MirType::U32);
+                    }
+                }
             }
             "consume" => {
                 let ptr = self.lower_primitive_field_ptr(receiver);
@@ -4201,24 +4964,38 @@ impl<'a> CfgBuilder<'a> {
                 return (id, MirType::Bool);
             }
             "set" => {
-                let ptr = self.lower_primitive_field_ptr(receiver);
-                let words = bitset_words(receiver);
-                let bit = self.arg_or_int(args, 0, 0, MirType::U32);
-                self.emit_void(Inst::BitSetSet { ptr, words, bit });
+                if let Some(words) = self.resolve_bitset_words(receiver).or_else(|| {
+                    let recv_hir = self.resolve_hir_expr_ty(receiver);
+                    matches!(recv_hir, Ty::Unknown).then(|| bitset_words(receiver))
+                }) {
+                    let ptr = self.lower_primitive_field_ptr(receiver);
+                    let bit = self.arg_or_int(args, 0, 0, MirType::U32);
+                    self.emit_void(Inst::BitSetSet { ptr, words, bit });
+                } else {
+                    self.record_lowering_error("`.set(bit)` requires a BitSet receiver");
+                }
                 let u =
                     self.alloc_and_emit("unit", MirType::Unit, Inst::ConstBool { value: false });
                 return (u, MirType::Unit);
             }
-            "get" => {
-                let ptr = self.lower_primitive_field_ptr(receiver);
-                let words = bitset_words(receiver);
-                let bit = self.arg_or_int(args, 0, 0, MirType::U32);
-                let id = self.alloc_and_emit(
-                    "bit_get",
-                    MirType::Bool,
-                    Inst::BitSetGet { ptr, words, bit },
-                );
-                return (id, MirType::Bool);
+            "get" | "has" => {
+                if let Some(words) = self.resolve_bitset_words(receiver).or_else(|| {
+                    let recv_hir = self.resolve_hir_expr_ty(receiver);
+                    matches!(recv_hir, Ty::Unknown).then(|| bitset_words(receiver))
+                }) {
+                    let ptr = self.lower_primitive_field_ptr(receiver);
+                    let bit = self.arg_or_int(args, 0, 0, MirType::U32);
+                    let id = self.alloc_and_emit(
+                        "bit_get",
+                        MirType::Bool,
+                        Inst::BitSetGet { ptr, words, bit },
+                    );
+                    return (id, MirType::Bool);
+                }
+                self.record_lowering_error(format!("`.{method}(bit)` requires a BitSet receiver"));
+                let f =
+                    self.alloc_and_emit("bit_err", MirType::Bool, Inst::ConstBool { value: false });
+                return (f, MirType::Bool);
             }
             "in" => {
                 let ptr = self.lower_primitive_field_ptr(receiver);
@@ -4278,23 +5055,55 @@ impl<'a> CfgBuilder<'a> {
                 }
                 return self.lower_expr(receiver);
             }
+            "sin" | "cos" | "tan" | "atan2" | "sqrt" | "abs" | "min" | "max" | "clamp"
+            | "floor" | "ceil" | "round" | "pow" | "exp" | "ln" | "lerp" | "dot" | "length"
+            | "distance" | "normalize" | "cross" => {
+                let mut arg_ids = vec![self.lower_expr(receiver).0];
+                for a in args {
+                    arg_ids.push(self.lower_expr(a).0);
+                }
+                let rty = mir_ty_from_hir(ty);
+                let rty = if rty == MirType::Unit {
+                    MirType::F32
+                } else {
+                    rty
+                };
+                let id = self.alloc_and_emit(
+                    method,
+                    rty.clone(),
+                    Inst::IntrinsicMath {
+                        name: method.to_owned(),
+                        args: arg_ids,
+                        deterministic: self.ctx.is_deterministic || self.func.is_deterministic,
+                    },
+                );
+                return (id, rty);
+            }
+            "sqr" | "signum" | "length_sq" | "distance_sq" | "remap" => {
+                let mut call_args = vec![self.lower_expr(receiver).0];
+                for a in args {
+                    call_args.push(self.lower_expr(a).0);
+                }
+                let rty = mir_ty_from_hir(ty);
+                let id = self.alloc_and_emit(
+                    method,
+                    rty.clone(),
+                    Inst::Call {
+                        callee: method.to_owned(),
+                        args: call_args,
+                    },
+                );
+                return (id, rty);
+            }
             _ => {}
         }
 
-        let mut call_args = vec![self.lower_expr(receiver).0];
-        for a in args {
-            call_args.push(self.lower_expr(a).0);
-        }
-        let rty = mir_ty_from_hir(ty);
-        let id = self.alloc_and_emit(
-            method,
-            rty.clone(),
-            Inst::Call {
-                callee: method.to_owned(),
-                args: call_args,
-            },
-        );
-        (id, rty)
+        self.record_lowering_error(format!(
+            "unsupported or unknown method `{method}` on receiver `{:?}`",
+            self.resolve_hir_expr_ty(receiver)
+        ));
+        let u = self.alloc_and_emit("bad_meth", MirType::Unit, Inst::ConstBool { value: false });
+        (u, MirType::Unit)
     }
 
     fn resolve_optional_term_binding(
@@ -4330,7 +5139,7 @@ impl<'a> CfgBuilder<'a> {
             && let Some(ref f) = binding.field_name
         {
             let base_ptr = binding.row_ptr.unwrap_or(binding.col_ptr);
-            let (offset, _, _) = self.ctx.resolve_field(&binding.canonical_layout, f);
+            let (offset, _, _) = self.resolve_field_checked(&binding.canonical_layout, f);
             return self.alloc_and_emit(
                 &format!("ptr_{f}"),
                 MirType::MutPtr,
@@ -4358,7 +5167,7 @@ impl<'a> CfgBuilder<'a> {
                     Some(ref p) => format!("{p}.{field}"),
                     None => field.clone(),
                 };
-                let (offset, _, _) = self.ctx.resolve_field(&tb.canonical_layout, &fpath);
+                let (offset, _, _) = self.resolve_field_checked(&tb.canonical_layout, &fpath);
                 return self.alloc_and_emit(
                     &format!("ptr_{field}"),
                     MirType::MutPtr,
@@ -4386,7 +5195,7 @@ impl<'a> CfgBuilder<'a> {
                             None => field.clone(),
                         };
                         let (offset, _, _) =
-                            self.ctx.resolve_field(&binding.canonical_layout, &fpath);
+                            self.resolve_field_checked(&binding.canonical_layout, &fpath);
                         return self.alloc_and_emit(
                             &format!("ptr_{field}"),
                             MirType::MutPtr,
@@ -4403,7 +5212,7 @@ impl<'a> CfgBuilder<'a> {
                         layout_key,
                         ..
                     } => {
-                        let (offset, _, _) = self.ctx.resolve_field(&layout_key, field);
+                        let (offset, _, _) = self.resolve_field_checked(&layout_key, field);
                         return self.alloc_and_emit(
                             &format!("ptr_{field}"),
                             MirType::MutPtr,
@@ -4418,6 +5227,11 @@ impl<'a> CfgBuilder<'a> {
                     _ => {}
                 }
             }
+        }
+        if let Some(place) = self.resolve_expr_place(receiver)
+            && let Some(ptr) = self.resolve_place_ptr(&place)
+        {
+            return ptr;
         }
         self.lower_expr(receiver).0
     }
@@ -5119,15 +5933,7 @@ impl<'a> CfgBuilder<'a> {
                 hir_ty: explicit_ty.cloned().unwrap_or_else(|| expr.ty()),
             };
         }
-        let (local, mir_ty) = if matches!(explicit_ty, Some(Ty::BitSet(_)))
-            && let HirExpr::Call(call) = expr
-            && call.receiver.is_none()
-            && call.callee.rsplit("::").next() == Some("bits")
-        {
-            self.lower_bits_call(call, explicit_ty)
-        } else {
-            self.lower_expr(expr)
-        };
+        let (local, mir_ty) = self.lower_expr_for_ty(expr, explicit_ty);
         let resolved_ty = explicit_ty
             .map(mir_ty_from_hir)
             .filter(|t| *t != MirType::Unit)
@@ -5506,6 +6312,9 @@ impl<'a> CfgBuilder<'a> {
                     if self.ctx.find_layout(&canon).is_some() {
                         self.slot_layouts.insert(slot_local, canon);
                     }
+                }
+                if !matches!(hir_ty, Ty::Unknown | Ty::Unit) {
+                    self.var_hir_tys.insert(name.clone(), hir_ty.clone());
                 }
                 self.vars.insert(
                     name.clone(),
@@ -6066,14 +6875,17 @@ impl<'a> CfgBuilder<'a> {
                 tick,
                 p0,
                 p1,
-                radius: _,
+                radius,
             } => {
                 let history_name = self.resolve_spatial_resource_name(history);
                 let tick_l = self.lower_expr(tick).0;
                 let s_l = self.lower_expr(p0).0;
                 let e_l = self.lower_expr(p1).0;
-                let r_l =
-                    self.alloc_and_emit("r_def", MirType::F32, Inst::ConstFloat { value: 0.5 });
+                let r_l = if let Some(r_expr) = radius {
+                    self.lower_expr(r_expr).0
+                } else {
+                    self.alloc_and_emit("r_def", MirType::F32, Inst::ConstFloat { value: 0.5 })
+                };
                 let sp_l = self.alloc_and_emit(
                     "seg_iter",
                     MirType::QueryIter,
@@ -6238,7 +7050,7 @@ impl<'a> CfgBuilder<'a> {
     ) {
         if let Some(chunk) = self.func.par_chunk {
             let has_mut = hq.terms.iter().any(|t| t.mode.is_mutable());
-            if self.func.par_read_only || !has_mut {
+            if !has_mut {
                 self.emit_void(Inst::ParForEachChunkReadonly {
                     query_idx: qi,
                     chunk_size: chunk,
@@ -6621,17 +7433,57 @@ impl<'a> CfgBuilder<'a> {
         let mut acc_slots = Vec::with_capacity(reduce.len());
         let mut acc_tys = Vec::with_capacity(reduce.len());
         for entry in reduce {
-            let (id_val, id_ty) = self.lower_expr(&entry.identity);
-            let ty = if entry.ty != Ty::Unknown && entry.ty != Ty::Unit {
-                mir_ty_from_hir(&entry.ty)
+            let op_lower = entry.op.to_ascii_lowercase();
+            let is_unit_val =
+                matches!(&entry.value, HirExpr::Tuple { elems, ty: Ty::Unit } if elems.is_empty());
+            let is_pred_1arg = is_unit_val && matches!(op_lower.as_str(), "count" | "any" | "all");
+            let (norm_op, id_val, ty) = if is_pred_1arg {
+                match op_lower.as_str() {
+                    "count" => {
+                        let zero = self.alloc_and_emit(
+                            "red_id",
+                            MirType::U32,
+                            Inst::ConstInt { value: 0 },
+                        );
+                        ("count".to_owned(), zero, MirType::U32)
+                    }
+                    "any" => {
+                        let f = self.alloc_and_emit(
+                            "red_id",
+                            MirType::Bool,
+                            Inst::ConstBool { value: false },
+                        );
+                        ("any".to_owned(), f, MirType::Bool)
+                    }
+                    _ => {
+                        let t = self.alloc_and_emit(
+                            "red_id",
+                            MirType::Bool,
+                            Inst::ConstBool { value: true },
+                        );
+                        ("all".to_owned(), t, MirType::Bool)
+                    }
+                }
             } else {
-                id_ty
+                let norm = match op_lower.as_str() {
+                    "count" | "any" | "all" | "sum" | "prod" | "min" | "max" => op_lower,
+                    _ => entry.op.clone(),
+                };
+                let (id_val, id_ty) = self.lower_expr(&entry.identity);
+                let ty = if norm == "count" {
+                    MirType::U32
+                } else if entry.ty != Ty::Unknown && entry.ty != Ty::Unit {
+                    mir_ty_from_hir(&entry.ty)
+                } else {
+                    id_ty
+                };
+                (norm, id_val, ty)
             };
             let init_l = self.alloc_and_emit(
                 &format!("red_init_{}", entry.name),
                 ty.clone(),
                 Inst::ReduceInit {
-                    op: entry.op.clone(),
+                    op: norm_op.clone(),
                     identity: id_val,
                 },
             );
@@ -6641,17 +7493,25 @@ impl<'a> CfgBuilder<'a> {
                 Inst::SlotAlloc { ty: ty.clone() },
             );
             self.emit_void(Inst::SlotStore { slot, val: init_l });
-            acc_slots.push((entry, slot, ty.clone()));
+            acc_slots.push((entry, norm_op, is_pred_1arg, slot, ty.clone()));
             acc_tys.push(ty);
         }
 
-        // Emit `ParForEachChunkReadonly`
+        // Emit `ParForEachChunkReadonly` only when query has no mutable terms (PM-15)
         let chunk_size = self.func.par_chunk.unwrap_or(512);
-        self.emit_void(Inst::ParForEachChunkReadonly {
-            query_idx: qi,
-            chunk_size,
-            deterministic_order: self.ctx.is_deterministic || self.func.is_deterministic,
-        });
+        let has_mut = hq.terms.iter().any(|t| t.mode.is_mutable());
+        if !has_mut {
+            self.emit_void(Inst::ParForEachChunkReadonly {
+                query_idx: qi,
+                chunk_size,
+                deterministic_order: self.ctx.is_deterministic || self.func.is_deterministic,
+            });
+        } else {
+            self.emit_void(Inst::ParForEachChunk {
+                query_idx: qi,
+                chunk_size,
+            });
+        }
 
         let chunk_hdr = self.new_block(&format!("red{qi}_chunk_hdr"));
         let chunk_body = self.new_block(&format!("red{qi}_chunk_body"));
@@ -6787,15 +7647,24 @@ impl<'a> CfgBuilder<'a> {
                     binding: tb.clone(),
                 });
         }
-        for (entry, slot, ty) in &acc_slots {
-            let (val_l, _) = self.lower_expr(&entry.value);
+        for (entry, norm_op, is_pred_1arg, slot, ty) in &acc_slots {
+            let (val_l, val_ty) = if *is_pred_1arg {
+                self.lower_expr(&entry.identity)
+            } else {
+                self.lower_expr(&entry.value)
+            };
+            let val_l = if *is_pred_1arg && val_ty != MirType::Bool {
+                self.coerce_local_to_ty(val_l, val_ty, &MirType::Bool)
+            } else {
+                val_l
+            };
             let cur = self.alloc_and_emit("acc_cur", ty.clone(), Inst::SlotLoad { slot: *slot });
             let nxt = self.alloc_and_emit(
                 "acc_nxt",
                 ty.clone(),
                 Inst::ReduceAccum {
                     acc: cur,
-                    op: entry.op.clone(),
+                    op: norm_op.clone(),
                     val: val_l,
                 },
             );
@@ -6824,13 +7693,13 @@ impl<'a> CfgBuilder<'a> {
         self.switch_to(chunk_exit);
         self.vars = saved_vars;
         if acc_slots.len() == 1 {
-            let (_, slot, ty) = &acc_slots[0];
+            let (_, _, _, slot, ty) = &acc_slots[0];
             let final_l =
                 self.alloc_and_emit("red_out", ty.clone(), Inst::SlotLoad { slot: *slot });
             (final_l, ty.clone())
         } else {
             let mut fields = Vec::with_capacity(acc_slots.len());
-            for (i, (_, slot, ty)) in acc_slots.iter().enumerate() {
+            for (i, (_, _, _, slot, ty)) in acc_slots.iter().enumerate() {
                 let fl = self.alloc_and_emit(
                     &format!("red_out_{i}"),
                     ty.clone(),
@@ -6923,6 +7792,50 @@ fn resolve_timeline_window_bit(
         }
     }
     0
+}
+
+fn try_fold_neg_int_lit(expr: &HirExpr) -> Option<(i64, Ty)> {
+    match expr {
+        HirExpr::IntLit { value, ty } => Some((value.wrapping_neg(), ty.clone())),
+        HirExpr::Unary {
+            op: HirUnOp::Neg,
+            expr: inner,
+            ty,
+        } => {
+            let (v, inner_ty) = try_fold_neg_int_lit(inner)?;
+            let res_ty = if !matches!(ty, Ty::Unknown | Ty::Unit) {
+                ty.clone()
+            } else {
+                inner_ty
+            };
+            Some((v.wrapping_neg(), res_ty))
+        }
+        _ => None,
+    }
+}
+
+fn hir_ty_hint_from_mir(ty: &MirType) -> Option<Ty> {
+    match ty {
+        MirType::Array { elem, len } => hir_ty_hint_from_mir(elem).map(|e| Ty::Array {
+            elem: Box::new(e),
+            len: *len,
+        }),
+        MirType::Named(n) => bitset_bits_from_mir_ty(ty).map(Ty::BitSet).or_else(|| {
+            if n.starts_with("SmallVec<") {
+                None
+            } else {
+                Some(Ty::Named(n.clone()))
+            }
+        }),
+        MirType::F32 => Some(Ty::F32),
+        MirType::F64 => Some(Ty::F64),
+        MirType::I32 => Some(Ty::I32),
+        MirType::I64 => Some(Ty::I64),
+        MirType::U32 => Some(Ty::U32),
+        MirType::U64 => Some(Ty::U64),
+        MirType::Bool => Some(Ty::Bool),
+        _ => None,
+    }
 }
 
 fn input_buf_cap(expr: &HirExpr) -> u32 {
@@ -7138,7 +8051,7 @@ pub fn lower_to_mir(analyzed: &AnalyzedModule) -> MirModule {
     synthesize_timer_tick_system(&ctx, &mut functions, &mut schedules);
 
     let net_components = lower_net_components(&ctx, &analyzed.net_components);
-    let rpcs = lower_rpcs(&analyzed.rpcs);
+    let rpcs = lower_rpcs(&ctx, &analyzed.rpcs);
     let net_sim_tests = lower_net_sim_tests(&analyzed.net_sim_tests);
     let net_handshake = build_net_handshake(
         &analyzed.module_path,
@@ -7178,6 +8091,8 @@ pub fn lower_to_mir(analyzed: &AnalyzedModule) -> MirModule {
     // Canonical pass pipeline:
     // 1. State machines (`timeline`, `task`, `fsm`)
     passes::state_machines::run(&mut mir);
+    // Synthesize 8-byte companion parent components for custom relations used in `.up<R>()` (EQ-05 / GF-02)
+    synthesize_relation_parent_layouts(&mut mir);
     // 2. Spatial CSR synthesis + pre-reader schedule ordering
     passes::spatial_csr::run(&mut mir);
     // 3. Per-function CFG passes (`optional_split`, `tick_coalesce`, `atomic_tx`)
@@ -7351,8 +8266,9 @@ fn synthesize_timer_tick_system(
         return;
     };
 
-    // Identify every component / `@soa` stratum layout with `GraceWindow` or `InputBuffer` fields
-    let mut timer_targets: Vec<(&SolvedLayout, Vec<(String, u32, TimerFieldKind)>)> = Vec::new();
+    // Identify every component / `@soa` stratum layout with direct or nested `GraceWindow` or
+    // `InputBuffer` fields (inside nested structs, fixed arrays, or `SmallVec`s).
+    let mut timer_targets: Vec<&SolvedLayout> = Vec::new();
     for l in &ctx.all_layouts {
         if !matches!(
             l.item_kind,
@@ -7360,24 +8276,12 @@ fn synthesize_timer_tick_system(
         ) {
             continue;
         }
-        let mut fields = Vec::new();
-        for f in &l.fields {
-            match &f.ty {
-                Ty::GraceWindow => {
-                    fields.push((f.name.clone(), f.offset as u32, TimerFieldKind::Grace));
-                }
-                Ty::InputBuffer { cap, .. } => {
-                    fields.push((
-                        f.name.clone(),
-                        f.offset as u32,
-                        TimerFieldKind::InputBuf(*cap as u32),
-                    ));
-                }
-                _ => {}
-            }
-        }
-        if !fields.is_empty() {
-            timer_targets.push((l, fields));
+        let mut visited = HashSet::new();
+        if l.fields
+            .iter()
+            .any(|f| !f.is_padding && ty_has_timer_fields(ctx, &f.ty, &mut visited))
+        {
+            timer_targets.push(l);
         }
     }
 
@@ -7422,7 +8326,7 @@ fn synthesize_timer_tick_system(
         },
     );
 
-    for (qi, (comp_layout, timer_fields)) in timer_targets.into_iter().enumerate() {
+    for (qi, comp_layout) in timer_targets.into_iter().enumerate() {
         let qi = qi as u32;
         let short_comp = comp_layout
             .canonical_name
@@ -7547,26 +8451,18 @@ fn synthesize_timer_tick_system(
                 is_sparse,
             },
         );
-        for (fname, foff, kind) in timer_fields {
-            let fptr = b.alloc_and_emit(
-                &format!("fptr_{fname}"),
-                MirType::MutPtr,
-                Inst::FieldPtr {
-                    base_ptr: rptr,
-                    layout_key: comp_layout.canonical_name.clone(),
-                    field: fname,
-                    offset_bytes: foff,
-                },
-            );
-            match kind {
-                TimerFieldKind::Grace => b.emit_void(Inst::GraceTick { ptr: fptr, dt_sec }),
-                TimerFieldKind::InputBuf(cap) => b.emit_void(Inst::InputBufTick {
-                    ptr: fptr,
-                    capacity: cap,
-                    dt_sec,
-                }),
-            }
-        }
+        let mut decay_visited = HashSet::new();
+        emit_struct_timer_decay(
+            ctx,
+            &mut b,
+            rptr,
+            &comp_layout.canonical_name,
+            &comp_layout.fields,
+            "",
+            0,
+            dt_sec,
+            &mut decay_visited,
+        );
         let one = b.alloc_and_emit("one", MirType::U32, Inst::ConstInt { value: 1 });
         let nxt = b.alloc_and_emit(
             "r_nxt",
@@ -7611,9 +8507,452 @@ fn synthesize_timer_tick_system(
     }
 }
 
-enum TimerFieldKind {
-    Grace,
-    InputBuf(u32),
+fn synthesize_relation_parent_layouts(mir: &mut MirModule) {
+    let env = strata_sema::layout::LayoutEnv::default();
+    let mut seen_rels = HashSet::new();
+    let mut custom_rels = Vec::new();
+    for func in mir.fns.iter().chain(mir.functions.iter()) {
+        for bb in &func.blocks {
+            for stmt in &bb.stmts {
+                if let Inst::IterUpCascade { relation, .. } = &stmt.inst {
+                    let short = relation
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(relation.as_str())
+                        .to_owned();
+                    if short != "ChildOf" && seen_rels.insert(short.clone()) {
+                        custom_rels.push(short);
+                    }
+                }
+            }
+        }
+    }
+    for short_r in custom_rels {
+        let comp_short = format!("__strata_rel_parent_{short_r}");
+        let canon = if mir.module_path.is_empty() {
+            comp_short
+        } else {
+            format!("{}::{comp_short}", mir.module_path)
+        };
+        if mir.layouts.iter().any(|l| l.canonical_name == canon) {
+            continue;
+        }
+        if let Ok(solved) = strata_sema::layout::solve_pod_layout(
+            &canon,
+            SchemaItemKind::Component,
+            &[("parent".to_owned(), Ty::Ref("Entity".to_owned()))],
+            0,
+            Vec::new(),
+            &env,
+        ) {
+            mir.layouts.push(solved);
+        }
+    }
+}
+
+fn ty_has_timer_fields(ctx: &MirLowerCtx, ty: &Ty, visited: &mut HashSet<String>) -> bool {
+    match ty {
+        Ty::GraceWindow | Ty::InputBuffer { .. } => true,
+        Ty::Array { elem, .. } | Ty::SmallVec { elem, .. } => {
+            ty_has_timer_fields(ctx, elem, visited)
+        }
+        Ty::Named(n) => {
+            let Some(sub) = ctx.find_layout(n) else {
+                return false;
+            };
+            if sub.item_kind == SchemaItemKind::Enum || !visited.insert(sub.canonical_name.clone())
+            {
+                return false;
+            }
+            let has = sub
+                .fields
+                .iter()
+                .any(|f| !f.is_padding && ty_has_timer_fields(ctx, &f.ty, visited));
+            visited.remove(&sub.canonical_name);
+            has
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_struct_timer_decay(
+    ctx: &MirLowerCtx,
+    b: &mut CfgBuilder<'_>,
+    base_ptr: LocalId,
+    layout_key: &str,
+    fields: &[strata_sema::layout::SolvedField],
+    field_prefix: &str,
+    base_off: u32,
+    dt_sec: LocalId,
+    visited: &mut HashSet<String>,
+) {
+    for sf in fields {
+        if sf.is_padding {
+            continue;
+        }
+        let mut check_vis = visited.clone();
+        if !ty_has_timer_fields(ctx, &sf.ty, &mut check_vis) {
+            continue;
+        }
+        let fpath = if field_prefix.is_empty() {
+            sf.name.clone()
+        } else {
+            format!("{field_prefix}.{}", sf.name)
+        };
+        let foff = base_off + sf.offset as u32;
+        match &sf.ty {
+            Ty::GraceWindow => {
+                let fptr = b.alloc_and_emit(
+                    &format!("fptr_{}", sf.name),
+                    MirType::MutPtr,
+                    Inst::FieldPtr {
+                        base_ptr,
+                        layout_key: layout_key.to_owned(),
+                        field: fpath,
+                        offset_bytes: foff,
+                    },
+                );
+                b.emit_void(Inst::GraceTick { ptr: fptr, dt_sec });
+            }
+            Ty::InputBuffer { cap, .. } => {
+                let fptr = b.alloc_and_emit(
+                    &format!("fptr_{}", sf.name),
+                    MirType::MutPtr,
+                    Inst::FieldPtr {
+                        base_ptr,
+                        layout_key: layout_key.to_owned(),
+                        field: fpath,
+                        offset_bytes: foff,
+                    },
+                );
+                b.emit_void(Inst::InputBufTick {
+                    ptr: fptr,
+                    capacity: *cap as u32,
+                    dt_sec,
+                });
+            }
+            Ty::Named(n) => {
+                if let Some(sub) = ctx.find_layout(n)
+                    && sub.item_kind != SchemaItemKind::Enum
+                    && visited.insert(sub.canonical_name.clone())
+                {
+                    emit_struct_timer_decay(
+                        ctx,
+                        b,
+                        base_ptr,
+                        layout_key,
+                        &sub.fields,
+                        &fpath,
+                        foff,
+                        dt_sec,
+                        visited,
+                    );
+                    visited.remove(&sub.canonical_name);
+                }
+            }
+            Ty::Array { elem, len } => {
+                let arr_ptr = b.alloc_and_emit(
+                    &format!("arr_tmr_{}", sf.name),
+                    MirType::MutPtr,
+                    Inst::FieldPtr {
+                        base_ptr,
+                        layout_key: layout_key.to_owned(),
+                        field: fpath,
+                        offset_bytes: foff,
+                    },
+                );
+                emit_array_timer_decay(ctx, b, arr_ptr, elem, *len, dt_sec, visited);
+            }
+            Ty::SmallVec { elem, cap } => {
+                let sv_ptr = b.alloc_and_emit(
+                    &format!("sv_tmr_{}", sf.name),
+                    MirType::MutPtr,
+                    Inst::FieldPtr {
+                        base_ptr,
+                        layout_key: layout_key.to_owned(),
+                        field: fpath,
+                        offset_bytes: foff,
+                    },
+                );
+                emit_smallvec_timer_decay(ctx, b, sv_ptr, elem, *cap, dt_sec, visited);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn emit_value_timer_decay(
+    ctx: &MirLowerCtx,
+    b: &mut CfgBuilder<'_>,
+    elem_ptr: LocalId,
+    ty: &Ty,
+    dt_sec: LocalId,
+    visited: &mut HashSet<String>,
+) {
+    match ty {
+        Ty::GraceWindow => b.emit_void(Inst::GraceTick {
+            ptr: elem_ptr,
+            dt_sec,
+        }),
+        Ty::InputBuffer { cap, .. } => b.emit_void(Inst::InputBufTick {
+            ptr: elem_ptr,
+            capacity: *cap as u32,
+            dt_sec,
+        }),
+        Ty::Named(n) => {
+            if let Some(sub) = ctx.find_layout(n)
+                && sub.item_kind != SchemaItemKind::Enum
+                && visited.insert(sub.canonical_name.clone())
+            {
+                emit_struct_timer_decay(
+                    ctx,
+                    b,
+                    elem_ptr,
+                    &sub.canonical_name,
+                    &sub.fields,
+                    "",
+                    0,
+                    dt_sec,
+                    visited,
+                );
+                visited.remove(&sub.canonical_name);
+            }
+        }
+        Ty::Array { elem, len } => {
+            emit_array_timer_decay(ctx, b, elem_ptr, elem, *len, dt_sec, visited);
+        }
+        Ty::SmallVec { elem, cap } => {
+            emit_smallvec_timer_decay(ctx, b, elem_ptr, elem, *cap, dt_sec, visited);
+        }
+        _ => {}
+    }
+}
+
+fn emit_array_timer_decay(
+    ctx: &MirLowerCtx,
+    b: &mut CfgBuilder<'_>,
+    arr_ptr: LocalId,
+    elem: &Ty,
+    len: usize,
+    dt_sec: LocalId,
+    visited: &mut HashSet<String>,
+) {
+    if len == 0 {
+        return;
+    }
+    let idx_slot = b.alloc_and_emit(
+        "tmr_arr_i",
+        MirType::MutPtr,
+        Inst::SlotAlloc { ty: MirType::U32 },
+    );
+    let z = b.alloc_and_emit("tmr_z", MirType::U32, Inst::ConstInt { value: 0 });
+    b.emit_void(Inst::SlotStore {
+        slot: idx_slot,
+        val: z,
+    });
+    let hdr = b.new_block("tmr_arr_hdr");
+    let body = b.new_block("tmr_arr_body");
+    let done = b.new_block("tmr_arr_done");
+    b.terminate(Terminator::Goto(hdr));
+
+    b.switch_to(hdr);
+    let idx = b.alloc_and_emit("tmr_i", MirType::U32, Inst::SlotLoad { slot: idx_slot });
+    let len_l = b.alloc_and_emit(
+        "tmr_len",
+        MirType::U32,
+        Inst::ConstInt { value: len as i64 },
+    );
+    let cond = b.alloc_and_emit(
+        "tmr_cond",
+        MirType::Bool,
+        Inst::BinOp {
+            op: "<".to_owned(),
+            lhs: idx,
+            rhs: len_l,
+            allow_fma: false,
+        },
+    );
+    b.terminate(Terminator::Branch {
+        cond,
+        then_bb: body,
+        else_bb: done,
+    });
+
+    b.switch_to(body);
+    let elem_ptr = b.alloc_and_emit(
+        "tmr_el_ptr",
+        MirType::MutPtr,
+        Inst::ArrayIndex {
+            base: arr_ptr,
+            index: idx,
+        },
+    );
+    emit_value_timer_decay(ctx, b, elem_ptr, elem, dt_sec, visited);
+    let one = b.alloc_and_emit("tmr_1", MirType::U32, Inst::ConstInt { value: 1 });
+    let nxt = b.alloc_and_emit(
+        "tmr_nxt",
+        MirType::U32,
+        Inst::BinOp {
+            op: "+".to_owned(),
+            lhs: idx,
+            rhs: one,
+            allow_fma: false,
+        },
+    );
+    b.emit_void(Inst::SlotStore {
+        slot: idx_slot,
+        val: nxt,
+    });
+    b.terminate(Terminator::Goto(hdr));
+    b.switch_to(done);
+}
+
+fn emit_smallvec_timer_decay(
+    ctx: &MirLowerCtx,
+    b: &mut CfgBuilder<'_>,
+    sv_ptr: LocalId,
+    elem: &Ty,
+    cap: usize,
+    dt_sec: LocalId,
+    visited: &mut HashSet<String>,
+) {
+    if cap == 0 {
+        return;
+    }
+    let cur_len = b.alloc_and_emit(
+        "tmr_sv_len",
+        MirType::U32,
+        Inst::FieldLoad {
+            base_ptr: sv_ptr,
+            layout_key: "SmallVec".to_owned(),
+            field: "len".to_owned(),
+            offset_bytes: 0,
+            field_ty: MirType::U32,
+        },
+    );
+    let data_ptr = b.alloc_and_emit(
+        "tmr_sv_data",
+        MirType::MutPtr,
+        Inst::FieldPtr {
+            base_ptr: sv_ptr,
+            layout_key: "SmallVec".to_owned(),
+            field: "data".to_owned(),
+            offset_bytes: 8,
+        },
+    );
+    let idx_slot = b.alloc_and_emit(
+        "tmr_sv_i",
+        MirType::MutPtr,
+        Inst::SlotAlloc { ty: MirType::U32 },
+    );
+    let z = b.alloc_and_emit("tmr_z", MirType::U32, Inst::ConstInt { value: 0 });
+    b.emit_void(Inst::SlotStore {
+        slot: idx_slot,
+        val: z,
+    });
+    let hdr = b.new_block("tmr_sv_hdr");
+    let body = b.new_block("tmr_sv_body");
+    let done = b.new_block("tmr_sv_done");
+    b.terminate(Terminator::Goto(hdr));
+
+    b.switch_to(hdr);
+    let idx = b.alloc_and_emit("tmr_i", MirType::U32, Inst::SlotLoad { slot: idx_slot });
+    let cap_l = b.alloc_and_emit(
+        "tmr_cap",
+        MirType::U32,
+        Inst::ConstInt { value: cap as i64 },
+    );
+    let lt_len = b.alloc_and_emit(
+        "tmr_lt_len",
+        MirType::Bool,
+        Inst::BinOp {
+            op: "<".to_owned(),
+            lhs: idx,
+            rhs: cur_len,
+            allow_fma: false,
+        },
+    );
+    let lt_cap = b.alloc_and_emit(
+        "tmr_lt_cap",
+        MirType::Bool,
+        Inst::BinOp {
+            op: "<".to_owned(),
+            lhs: idx,
+            rhs: cap_l,
+            allow_fma: false,
+        },
+    );
+    let cond = b.alloc_and_emit(
+        "tmr_cond",
+        MirType::Bool,
+        Inst::BinOp {
+            op: "&&".to_owned(),
+            lhs: lt_len,
+            rhs: lt_cap,
+            allow_fma: false,
+        },
+    );
+    b.terminate(Terminator::Branch {
+        cond,
+        then_bb: body,
+        else_bb: done,
+    });
+
+    b.switch_to(body);
+    let elem_ptr = b.alloc_and_emit(
+        "tmr_el_ptr",
+        MirType::MutPtr,
+        Inst::ArrayIndex {
+            base: data_ptr,
+            index: idx,
+        },
+    );
+    emit_value_timer_decay(ctx, b, elem_ptr, elem, dt_sec, visited);
+    let one = b.alloc_and_emit("tmr_1", MirType::U32, Inst::ConstInt { value: 1 });
+    let nxt = b.alloc_and_emit(
+        "tmr_nxt",
+        MirType::U32,
+        Inst::BinOp {
+            op: "+".to_owned(),
+            lhs: idx,
+            rhs: one,
+            allow_fma: false,
+        },
+    );
+    b.emit_void(Inst::SlotStore {
+        slot: idx_slot,
+        val: nxt,
+    });
+    b.terminate(Terminator::Goto(hdr));
+    b.switch_to(done);
+}
+
+fn is_quantizable_hir_ty(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::U8
+            | Ty::U16
+            | Ty::U32
+            | Ty::U64
+            | Ty::I8
+            | Ty::I16
+            | Ty::I32
+            | Ty::I64
+            | Ty::F32
+            | Ty::F64
+            | Ty::Fix32
+            | Ty::Fix64
+            | Ty::UnitScalar { .. }
+            | Ty::Vec2
+            | Ty::Vec3
+            | Ty::Vec3a
+            | Ty::Vec4
+            | Ty::IVec2
+            | Ty::IVec3
+            | Ty::UVec2
+            | Ty::Quat
+    )
 }
 
 fn quantize_lane_count(ty: &Ty) -> u8 {
@@ -7625,9 +8964,16 @@ fn quantize_lane_count(ty: &Ty) -> u8 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pack_quantized_fields(
+    ctx: &MirLowerCtx,
     fields: &[strata_sema::layout::SolvedField],
     specs: &[HirQuantizeSpec],
+    stratum_layout: Option<&str>,
+    base_offset: usize,
+    prefix: &str,
+    inherited_wildcard: Option<&HirQuantizeSpec>,
+    visited: &mut HashSet<String>,
     cursor_bits: &mut u32,
     quantize_specs: &mut Vec<MirQuantizeSpec>,
     wire_fields: &mut Vec<MirNetFieldSpec>,
@@ -7637,18 +8983,53 @@ fn pack_quantized_fields(
         if field.is_padding {
             continue;
         }
-        let mir_ty = mir_wire_ty_from_hir(&field.ty);
-        let spec_opt = specs
+        let full_name = if prefix.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{prefix}.{}", field.name)
+        };
+        let abs_offset = base_offset + field.offset;
+        let direct_spec = specs.iter().find(|q| q.field_name == full_name);
+        let child_prefix = format!("{full_name}.");
+        let has_nested_specs = specs
             .iter()
-            .find(|q| q.field_name == field.name)
-            .or(wildcard_spec);
+            .any(|q| q.field_name.starts_with(&child_prefix));
+
+        if let Ty::Named(ref inner_name) = field.ty
+            && let Some(sub_layout) = ctx.find_layout(inner_name)
+            && sub_layout.item_kind != SchemaItemKind::Enum
+            && (has_nested_specs || direct_spec.is_some() || inherited_wildcard.is_some())
+            && visited.insert(sub_layout.canonical_name.clone())
+        {
+            pack_quantized_fields(
+                ctx,
+                &sub_layout.fields,
+                specs,
+                stratum_layout,
+                abs_offset,
+                &full_name,
+                direct_spec.or(inherited_wildcard),
+                visited,
+                cursor_bits,
+                quantize_specs,
+                wire_fields,
+            );
+            visited.remove(&sub_layout.canonical_name);
+            continue;
+        }
+
+        let mir_ty = mir_wire_ty_from_hir(&field.ty);
+        let spec_opt = direct_spec
+            .or(inherited_wildcard)
+            .or(wildcard_spec)
+            .filter(|_| is_quantizable_hir_ty(&field.ty));
         if let Some(spec) = spec_opt {
             let lane_count = quantize_lane_count(&field.ty);
             let total_bits = u32::from(spec.bits) * u32::from(lane_count);
             let bit_offset = *cursor_bits;
             *cursor_bits += total_bits;
             let mq = MirQuantizeSpec {
-                field_name: field.name.clone(),
+                field_name: full_name.clone(),
                 lane_count,
                 bits: spec.bits,
                 min: spec.min,
@@ -7656,31 +9037,33 @@ fn pack_quantized_fields(
                 step: spec.step,
                 bit_offset,
                 total_bits,
-                field_byte_offset: field.offset as u32,
+                field_byte_offset: abs_offset as u32,
                 field_ty: mir_ty.clone(),
             };
             quantize_specs.push(mq.clone());
             wire_fields.push(MirNetFieldSpec {
-                field_name: field.name.clone(),
-                byte_offset: field.offset as u32,
+                field_name: full_name,
+                byte_offset: abs_offset as u32,
                 byte_size: field.size as u32,
                 ty: mir_ty,
                 quantize: Some(mq),
                 bit_offset,
                 total_bits,
+                stratum_layout: stratum_layout.map(str::to_owned),
             });
         } else {
             let total_bits = (field.size as u32) * 8;
             let bit_offset = *cursor_bits;
             *cursor_bits += total_bits;
             wire_fields.push(MirNetFieldSpec {
-                field_name: field.name.clone(),
-                byte_offset: field.offset as u32,
+                field_name: full_name,
+                byte_offset: abs_offset as u32,
                 byte_size: field.size as u32,
                 ty: mir_ty,
                 quantize: None,
                 bit_offset,
                 total_bits,
+                stratum_layout: stratum_layout.map(str::to_owned),
             });
         }
     }
@@ -7695,10 +9078,20 @@ fn lower_net_components(ctx: &MirLowerCtx, metas: &[NetComponentMeta]) -> Vec<Mi
         let mut cursor_bits = 0u32;
         let mut quantize_specs = Vec::new();
         let mut wire_fields = Vec::new();
+        let mut visited = HashSet::new();
+        visited.insert(layout.canonical_name.clone());
 
+        let hot_stratum =
+            (layout.item_kind == SchemaItemKind::SoaHot).then_some(layout.canonical_name.as_str());
         pack_quantized_fields(
+            ctx,
             &layout.fields,
             &nc.quantized_fields,
+            hot_stratum,
+            0,
+            "",
+            None,
+            &mut visited,
             &mut cursor_bits,
             &mut quantize_specs,
             &mut wire_fields,
@@ -7710,9 +9103,17 @@ fn lower_net_components(ctx: &MirLowerCtx, metas: &[NetComponentMeta]) -> Vec<Mi
                     && l.canonical_name.starts_with(&cold_prefix)
                     && l.required_components.first() == Some(&nc.canonical_name)
                 {
+                    let mut cold_visited = HashSet::new();
+                    cold_visited.insert(l.canonical_name.clone());
                     pack_quantized_fields(
+                        ctx,
                         &l.fields,
                         &nc.quantized_fields,
+                        Some(l.canonical_name.as_str()),
+                        0,
+                        "",
+                        None,
+                        &mut cold_visited,
                         &mut cursor_bits,
                         &mut quantize_specs,
                         &mut wire_fields,
@@ -7756,7 +9157,7 @@ fn lower_net_components(ctx: &MirLowerCtx, metas: &[NetComponentMeta]) -> Vec<Mi
     out
 }
 
-fn lower_rpcs(rpcs: &[HirRpc]) -> Vec<MirRpc> {
+fn lower_rpcs(ctx: &MirLowerCtx, rpcs: &[HirRpc]) -> Vec<MirRpc> {
     use bamabi_sys::{fnv1a_64_init, fnv1a_64_update_bytes, fnv1a_64_update_u64};
 
     let mut out = Vec::new();
@@ -7777,9 +9178,17 @@ fn lower_rpcs(rpcs: &[HirRpc]) -> Vec<MirRpc> {
         let mut cursor_bits = 0u32;
         let mut quantize_specs = Vec::new();
         let mut wire_fields = Vec::new();
+        let mut visited = HashSet::new();
+        visited.insert(rpc.payload_layout.canonical_name.clone());
         pack_quantized_fields(
+            ctx,
             &rpc.payload_layout.fields,
             &rpc.quantized_fields,
+            None,
+            0,
+            "",
+            None,
+            &mut visited,
             &mut cursor_bits,
             &mut quantize_specs,
             &mut wire_fields,

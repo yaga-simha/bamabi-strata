@@ -2600,3 +2600,643 @@ schedule FixedUpdate { step_mask }
         "runtime C_MASK materialization must emit ConstInt {{ value: 5 }}"
     );
 }
+
+#[test]
+fn mir_wave2a_pm04_quat_mul_pm07_reduce_pm15_par_mut_pm16_i64_min() {
+    use strata_mir::MirType;
+    let src = r#"
+module test::wave2a_pm @version(1.0.0);
+
+const C_MIN: i64 = -9223372036854775808;
+
+component Body {
+    rot: quat = quat(0.0, 0.0, 0.0, 1.0),
+    dir: vec3 = vec3(1.0, 0.0, 0.0),
+    hp: i32 = 10,
+    flag: bool = true,
+}
+
+component Counters {
+    c: u32 = 0,
+    any_alive: bool = false,
+    all_flag: bool = false,
+    min_val: i64 = 0,
+}
+
+component DummyTag {}
+
+@deterministic
+fn det_rot_step(q1: quat, q2: quat, v: vec3) -> vec3 {
+    let mut qr = q1 * q2;
+    qr *= q2;
+    qr * v
+}
+
+sys rot_and_lit(out: &mut Counters) {
+    let _m: i64 = -9223372036854775808;
+    let _c = C_MIN;
+    for row in query(b: &mut Body) {
+        let q = row.b.rot * row.b.rot;
+        row.b.rot = q;
+        row.b.dir = row.b.rot * row.b.dir;
+    }
+    out.min_val = _m;
+}
+
+sys count_and_check(out: &mut Counters) {
+    let (cnt, has_any, every_flag) = for row in query(b: &Body) reduce (
+        cnt: count(row.b.hp > 0),
+        has_any: any(row.b.hp > 5),
+        every_flag: all(row.b.flag)
+    );
+    out.c = cnt;
+    out.any_alive = has_any;
+    out.all_flag = every_flag;
+}
+
+@par(chunk = 64, read_only)
+sys par_mut_guard() {
+    for _t in query(t: &DummyTag) {}
+    for row in query(b: &mut Body) {
+        row.b.hp += 1;
+    }
+}
+
+schedule FixedUpdate { rot_and_lit, count_and_check, par_mut_guard }
+"#;
+    let analyzed = analyze_source("wave2a_pm.strata", src);
+    assert!(analyzed.ok(), "sema failed: {:?}", analyzed.diagnostics);
+    let mir = lower_to_mir(&analyzed);
+    verify_mir(&mir).expect("wave2a PM MIR must verify");
+
+    // PM-04: quat * quat and quat * vec3 emit quat_mul / quat_mul_vec3 (both fn and sys)
+    let det_fn = mir
+        .fns
+        .iter()
+        .find(|f| f.name == "det_rot_step")
+        .expect("det_rot_step");
+    let qmul_count = det_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .filter(|s| matches!(&s.inst, Inst::BinOp { op, .. } if op == "quat_mul"))
+        .count();
+    let has_det_qvec = det_fn.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+        s.dst
+            .is_some_and(|d| det_fn.locals[d.0 as usize].ty == MirType::Vec3)
+            && matches!(&s.inst, Inst::BinOp { op, .. } if op == "quat_mul_vec3")
+    });
+    assert_eq!(
+        qmul_count, 2,
+        "quat * quat and quat *= quat must emit 2 quat_mul ops"
+    );
+    assert!(
+        has_det_qvec,
+        "quat * vec3 must emit BinOp(quat_mul_vec3) -> Vec3"
+    );
+
+    // PM-16: i64::MIN literal intact without overflow
+    let rot_fn = mir
+        .functions
+        .iter()
+        .find(|f| f.name == "rot_and_lit")
+        .expect("rot_and_lit");
+    assert!(
+        rot_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .any(|s| matches!(
+                s.inst,
+                Inst::ConstInt { value } if value == i64::MIN
+            )),
+        "i64::MIN literal must lower cleanly without overflow"
+    );
+
+    // PM-07: 1-arg count/any/all accumulate inside row_body (not before loop)
+    let sys_fn = mir
+        .functions
+        .iter()
+        .find(|f| f.name == "count_and_check")
+        .expect("count_and_check");
+    let has_row_count = sys_fn.blocks.iter().any(|b| {
+        b.label.contains("row_body")
+            && b.stmts.iter().any(|s| {
+                matches!(
+                    &s.inst,
+                    Inst::ReduceAccum { op, val, .. }
+                        if op == "count" && sys_fn.locals[val.0 as usize].ty == MirType::Bool
+                )
+            })
+    });
+    let has_row_any = sys_fn.blocks.iter().any(|b| {
+        b.label.contains("row_body")
+            && b.stmts
+                .iter()
+                .any(|s| matches!(&s.inst, Inst::ReduceAccum { op, .. } if op == "any"))
+    });
+    let has_row_all = sys_fn.blocks.iter().any(|b| {
+        b.label.contains("row_body")
+            && b.stmts
+                .iter()
+                .any(|s| matches!(&s.inst, Inst::ReduceAccum { op, .. } if op == "all"))
+    });
+    assert!(has_row_count && has_row_any && has_row_all);
+    let entry_red_init_cnt = sys_fn.blocks.iter().any(|b| {
+        !b.label.contains("row_body")
+            && b.stmts.iter().any(|s| {
+                matches!(&s.inst, Inst::ReduceInit { op, .. } if op == "count")
+                    && s.dst
+                        .is_some_and(|d| sys_fn.locals[d.0 as usize].ty == MirType::U32)
+            })
+    });
+    assert!(entry_red_init_cnt, "count(pred) init must be U32(0)");
+
+    // PM-15: @par(read_only) with a &mut query must emit ParForEachChunk for the &mut query
+    let par_fn = mir
+        .functions
+        .iter()
+        .find(|f| f.name == "par_mut_guard")
+        .expect("par_mut_guard");
+    let stmts: Vec<_> = par_fn.blocks.iter().flat_map(|b| &b.stmts).collect();
+    assert_eq!(
+        stmts
+            .iter()
+            .filter(|s| matches!(s.inst, Inst::ParForEachChunk { .. }))
+            .count(),
+        1,
+        "@par(read_only) mutable query must emit ParForEachChunk"
+    );
+    assert_eq!(
+        stmts
+            .iter()
+            .filter(|s| matches!(s.inst, Inst::ParForEachChunkReadonly { .. }))
+            .count(),
+        1,
+        "only the readonly query may emit ParForEachChunkReadonly"
+    );
+}
+
+#[test]
+fn mir_wave2a_nested_lvalues_bitset_prop_smallvec_and_unknown_method_reject() {
+    use strata_mir::MirType;
+    use strata_sema::hir::{HirBinOp, HirCall, HirExpr, HirFn, HirParam, HirParamKind, HirStmt};
+    use strata_sema::types::Ty;
+
+    let src = r#"
+module test::wave2a_tl @version(1.0.0);
+
+struct Item {
+    hp: i32 = 10,
+    bs: BitSet<128> = bits(0),
+}
+
+struct Bag {
+    arr128: [BitSet<128>; 2] = [bits(0, 70), bits(1, 90)],
+}
+
+component NestedState {
+    mat: [[f32; 2]; 2] = [[1.0, 2.0], [3.0, 4.0]],
+    cube: [[[i32; 2]; 2]; 2] = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]],
+    items: [Item; 2] = [Item {}, Item {}],
+    arr128: [BitSet<128>; 2] = [bits(0, 70), bits(1, 90)],
+    sv: SmallVec<i32, 4>,
+    has_bit70: bool = false,
+    sv_len: u32 = 0,
+    sv_first: i32 = 0,
+}
+
+sys step_tl() {
+    let mut local_bs128: BitSet<128> = bits(0, 70);
+    local_bs128 = bits(1, 80);
+    let mut local_arr128: [BitSet<128>; 2] = [bits(2, 75), bits(3, 95)];
+    local_arr128 = [bits(4, 100), bits(5, 110)];
+    let _bag = Bag { arr128: [bits(6, 72), bits(7, 120)] };
+
+    for row in query(s: &mut NestedState) {
+        row.s.mat[1][0] = 9.5;
+        row.s.cube[1][0][1] = 42;
+        row.s.items[1].hp = 99;
+        row.s.arr128[1].set(70);
+        row.s.arr128[1].clear(90);
+        row.s.has_bit70 = row.s.arr128[1].has(70);
+        row.s.sv.push(11);
+        row.s.sv_len = row.s.sv.len();
+        row.s.sv_first = row.s.sv[0];
+        row.s.sv[0] = 22;
+    }
+}
+
+schedule FixedUpdate { step_tl }
+"#;
+    let analyzed = analyze_source("wave2a_tl.strata", src);
+    assert!(analyzed.ok(), "sema failed: {:?}", analyzed.diagnostics);
+    let mir = lower_to_mir(&analyzed);
+    verify_mir(&mir).expect("wave2a TL MIR must verify");
+
+    let step = mir
+        .functions
+        .iter()
+        .find(|f| f.name == "step_tl")
+        .expect("step_tl");
+    let stmts: Vec<_> = step.blocks.iter().flat_map(|b| &b.stmts).collect();
+
+    // BUG-TL-01: expected BitSet<128> propagates into bits(...) via let, Assign, ArrayLit, StructLit
+    let has_4word_arr = stmts.iter().any(|s| {
+        matches!(
+            &s.inst,
+            Inst::ArrayInit { elems } if elems.len() == 4
+        )
+    });
+    assert!(
+        has_4word_arr,
+        "BitSet<128> bits() must lower to 4-word ArrayInit"
+    );
+    // Word 2 for bit 70 (70 - 64 = 6 -> 1 << 6 = 64)
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s.inst, Inst::ConstInt { value: 64 })),
+        "bit 70 must pack into word 2 (ConstInt 64)"
+    );
+
+    // BUG-TL-06: nested lvalues emit ArrayIndex with MutPtr dst + ArrayStore / FieldStore / BitSet*
+    let has_ptr_arr_idx = stmts.iter().any(|s| {
+        matches!(s.inst, Inst::ArrayIndex { .. })
+            && s.dst
+                .is_some_and(|d| matches!(step.locals[d.0 as usize].ty, MirType::MutPtr))
+    });
+    assert!(
+        has_ptr_arr_idx,
+        "nested lvalue mat[i][j]/cube[i][j][k]/items[i].hp/arr128[i] must chain ArrayIndex -> MutPtr"
+    );
+    assert!(
+        stmts
+            .iter()
+            .any(|s| matches!(s.inst, Inst::BitSetSet { words: 4, .. }))
+            && stmts
+                .iter()
+                .any(|s| matches!(s.inst, Inst::BitSetClear { words: 4, .. }))
+            && stmts
+                .iter()
+                .any(|s| matches!(s.inst, Inst::BitSetGet { words: 4, .. })),
+        "arr128[1].set/clear/has must lower with words=4"
+    );
+
+    // BUG-TL-09a: SmallVec.push MUST NOT emit InputBufPush; lowers via len/data/ArrayStore
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| matches!(s.inst, Inst::InputBufPush { .. })),
+        "SmallVec.push must NEVER emit InputBufPush"
+    );
+    assert!(
+        stmts.iter().any(|s| matches!(
+            &s.inst,
+            Inst::FieldLoad { layout_key, field, offset_bytes: 0, .. }
+                if layout_key == "SmallVec" && field == "len"
+        )) && stmts.iter().any(|s| matches!(
+            &s.inst,
+            Inst::FieldPtr { layout_key, field, offset_bytes: 8, .. }
+                if layout_key == "SmallVec" && field == "data"
+        )),
+        "SmallVec push/len/index must access SmallVec len@0 and data@8"
+    );
+
+    // BUG-TL-02 & EQ-08: Unknown method and unknown field on known layout fail cleanly (never silent fallback)
+    let mut bad_analyzed = analyzed.clone();
+    bad_analyzed.fns.push(HirFn {
+        name: "bad_method_fn".to_owned(),
+        generic_params: Vec::new(),
+        params: vec![HirParam {
+            name: "x".to_owned(),
+            ty: Ty::F32,
+            kind: HirParamKind::Value,
+            default: None,
+            trigger_target: None,
+        }],
+        ret_ty: Ty::Unit,
+        body: vec![HirStmt::Expr(HirExpr::Call(HirCall {
+            receiver: Some(Box::new(HirExpr::Path {
+                name: "x".to_owned(),
+                ty: Ty::F32,
+            })),
+            callee: "totally_unknown_method".to_owned(),
+            generic_args: Vec::new(),
+            args: Vec::new(),
+            arg_names: Vec::new(),
+            ty: Ty::Unit,
+        }))],
+        tail: None,
+        byte_range: (0, 0),
+        is_node_pure: false,
+        node_group: None,
+    });
+    let bad_mir = lower_to_mir(&bad_analyzed);
+    assert!(
+        verify_mir(&bad_mir).is_err(),
+        "unknown method call must fail MIR verification cleanly instead of silent fallback"
+    );
+
+    // EQ-08: unknown field on known Item layout must fail cleanly
+    let mut bad_field_analyzed = analyzed;
+    bad_field_analyzed.fns.push(HirFn {
+        name: "bad_field_fn".to_owned(),
+        generic_params: Vec::new(),
+        params: vec![HirParam {
+            name: "it".to_owned(),
+            ty: Ty::Named("Item".to_owned()),
+            kind: HirParamKind::Value,
+            default: None,
+            trigger_target: None,
+        }],
+        ret_ty: Ty::F32,
+        body: Vec::new(),
+        tail: Some(HirExpr::Field {
+            base: Box::new(HirExpr::Path {
+                name: "it".to_owned(),
+                ty: Ty::Named("Item".to_owned()),
+            }),
+            field: "nonexistent".to_owned(),
+            ty: Ty::F32,
+        }),
+        byte_range: (0, 0),
+        is_node_pure: false,
+        node_group: None,
+    });
+    let bad_field_mir = lower_to_mir(&bad_field_analyzed);
+    assert!(
+        verify_mir(&bad_field_mir).is_err(),
+        "unknown field on known layout must fail verification cleanly instead of (0, F32)"
+    );
+    let _ = HirBinOp::Add;
+}
+
+#[test]
+fn mir_wave2a_spatial_radius_added_filters_and_custom_relation_parent() {
+    use strata_mir::MirType;
+    let src = r#"
+module test::wave2a_rel_sw @version(1.0.0);
+
+component Pos { xyz: vec3 = vec3(0.0, 0.0, 0.0), val: f32 = 0.0 }
+component PosAdd { val: f32 = 0.0 }
+component PosRel { val: f32 = 0.0 }
+component PosBuiltIn { val: f32 = 0.0 }
+relation Follows [exclusive];
+relation ChildOf [exclusive];
+
+spatial_history Hist(
+    frames: 8,
+    cell_size: 4.0_m,
+    bounds: vec2(-32.0_m, -32.0_m)..vec2(32.0_m, 32.0_m),
+    capacity: 64,
+) over Pos by Pos.xyz;
+
+sys seg_queries(h: &Hist, t: u32) {
+    let p0 = vec3(0.0, 0.0, 0.0);
+    let p1 = vec3(10.0, 0.0, 0.0);
+    for hit in h.query_segment_at(t, p0, p1, 2.25) {
+        let _e = hit.entity;
+    }
+    let _it = h.query_segment_at(t, p0, p1, 3.75);
+    let _it_def = h.query_segment_at(t, p0, p1);
+}
+
+sys added_step() {
+    for row in query(p: &mut PosAdd).added<PosAdd>() {
+        row.p.val += 1.0;
+    }
+}
+
+sys rel_follows() {
+    for row in query(p: &PosRel).up<Follows>() {
+        let _v = row.p.val;
+    }
+}
+
+sys rel_childof() {
+    for row in query(p: &PosBuiltIn).up<ChildOf>() {
+        let _v2 = row.p.val;
+    }
+}
+
+schedule FixedUpdate { seg_queries, added_step, rel_follows, rel_childof }
+"#;
+    let analyzed = analyze_source("wave2a_rel_sw.strata", src);
+    assert!(analyzed.ok(), "sema failed: {:?}", analyzed.diagnostics);
+    let mir = lower_to_mir(&analyzed);
+    verify_mir(&mir).expect("wave2a rel/spatial MIR must verify");
+
+    // BUG-SW-01: explicit radius in both SpatialSegmentAt loop and query_segment_at call, default 0.5
+    let sys_fn = mir
+        .functions
+        .iter()
+        .find(|f| f.name == "seg_queries")
+        .expect("seg_queries");
+    let seg_insts: Vec<_> = sys_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .filter_map(|s| match &s.inst {
+            Inst::SpatialQuerySegmentAt {
+                start,
+                end,
+                radius,
+                tick_offset,
+                ..
+            } => Some((*tick_offset, *start, *end, *radius)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seg_insts.len(), 3);
+    let const_float_for = |lid| {
+        sys_fn.blocks.iter().flat_map(|b| &b.stmts).find_map(|s| {
+            if s.dst == Some(lid)
+                && let Inst::ConstFloat { value } = s.inst
+            {
+                Some(value)
+            } else {
+                None
+            }
+        })
+    };
+    assert_eq!(const_float_for(seg_insts[0].3), Some(2.25));
+    assert_eq!(const_float_for(seg_insts[1].3), Some(3.75));
+    assert_eq!(const_float_for(seg_insts[2].3), Some(0.5));
+    // First arg (tick_offset) must match parameter `t` local (U32)
+    assert_eq!(sys_fn.locals[seg_insts[0].0.0 as usize].ty, MirType::U32);
+    let added_fn = mir
+        .functions
+        .iter()
+        .find(|f| f.name == "added_step")
+        .expect("added_step");
+    assert!(
+        !added_fn.added_terms.is_empty(),
+        "added_terms must capture .added()"
+    );
+
+    // EQ-05 & GF-02: companion 8-byte FfiEntity component for Follows, NONE for ChildOf
+    let follows_comp = mir
+        .layouts
+        .iter()
+        .find(|l| l.canonical_name == "test::wave2a_rel_sw::__strata_rel_parent_Follows")
+        .expect("companion parent layout for custom Follows relation");
+    assert_eq!(follows_comp.size, 8);
+    assert_eq!(follows_comp.align, 8);
+    assert_eq!(follows_comp.fields.len(), 1);
+    assert_eq!(follows_comp.fields[0].name, "parent");
+    assert!(
+        !mir.layouts
+            .iter()
+            .any(|l| l.canonical_name.contains("__strata_rel_parent_ChildOf")),
+        "built-in ChildOf must NOT synthesize companion __strata_rel_parent_ChildOf"
+    );
+
+    // Negative verifier check for missing companion layout
+    let mut missing_comp = mir.clone();
+    missing_comp
+        .layouts
+        .retain(|l| l.canonical_name != "test::wave2a_rel_sw::__strata_rel_parent_Follows");
+    assert!(
+        verify_mir(&missing_comp).is_err(),
+        "verify_mir must reject custom IterUpCascade without companion parent layout"
+    );
+}
+
+#[test]
+fn mir_wave2a_recursive_timer_tick_and_net_soa_nested_quantize_effective_step() {
+    use strata_mir::{MirQuantizeSpec, MirType};
+
+    // NT-09: effective_step avoids infinity on wide ranges (-1e308..1e308)
+    let wide_q = MirQuantizeSpec {
+        field_name: "wide".to_owned(),
+        lane_count: 1,
+        bits: 8,
+        min: -1e308,
+        max: 1e308,
+        step: None,
+        bit_offset: 0,
+        total_bits: 8,
+        field_byte_offset: 0,
+        field_ty: MirType::F64,
+    };
+    let step_val = wide_q.effective_step();
+    assert!(step_val.is_finite() && step_val > 0.0, "got {step_val}");
+
+    // BUG-TL-07a + NT-03 + NT-10b
+    let src = r#"
+module test::wave2a_net_tmr @version(1.0.0);
+
+enum Attack {
+    Slash,
+}
+resource Clock { dt: f32 = 0.016 }
+
+struct SubTimers {
+    g: GraceWindow,
+    b: InputBuffer<Attack, 2>,
+}
+
+component NestedTimers {
+    sub: SubTimers,
+    arr_g: [GraceWindow; 2],
+    sv_g: SmallVec<GraceWindow, 3>,
+}
+
+struct InnerQuant {
+    @quantize(min = -10.0, max = 10.0, bits = 8)
+    z: f32,
+}
+
+struct SubPos {
+    @quantize(min = -100.0, max = 100.0, bits = 12)
+    x: f32,
+    inner: InnerQuant,
+    flags: u16,
+}
+
+@soa
+@net(reliable, channel = 0)
+component SoaBody {
+    hot { x: f32 = 0.0 }
+    cold meta { hp: f32 = 10.0 }
+}
+
+@net(reliable, channel = 1)
+component NestedQuantComp {
+    pad_hdr: u32 = 0,
+    sub: SubPos,
+}
+
+@net_rpc(client_to_server, channel = 2)
+rpc NestedQuantRpc {
+    sub: SubPos,
+}
+"#;
+    let analyzed = analyze_source("wave2a_net_tmr.strata", src);
+    assert!(analyzed.ok(), "sema failed: {:?}", analyzed.diagnostics);
+    let mir = lower_to_mir(&analyzed);
+    verify_mir(&mir).expect("wave2a timer/net MIR must verify");
+
+    // BUG-TL-07a: strata_timer_tick ticks nested struct, array, and SmallVec timers
+    let tmr = mir
+        .functions
+        .iter()
+        .find(|f| f.name == "strata_timer_tick")
+        .expect("strata_timer_tick");
+    let tmr_stmts: Vec<_> = tmr.blocks.iter().flat_map(|b| &b.stmts).collect();
+    let grace_ticks = tmr_stmts
+        .iter()
+        .filter(|s| matches!(s.inst, Inst::GraceTick { .. }))
+        .count();
+    let input_ticks = tmr_stmts
+        .iter()
+        .filter(|s| matches!(s.inst, Inst::InputBufTick { .. }))
+        .count();
+    assert!(
+        grace_ticks >= 3,
+        "expected nested/array/SmallVec GraceTick >= 3, got {grace_ticks}"
+    );
+    assert_eq!(input_ticks, 1, "expected nested InputBufTick");
+
+    // NT-03: SoaBody wire_fields carry exact stratum_layout for hot and cold strata
+    let soa_nc = mir
+        .net_components
+        .iter()
+        .find(|c| c.name == "SoaBody")
+        .expect("SoaBody");
+    assert_eq!(
+        soa_nc.wire_fields[0].stratum_layout.as_deref(),
+        Some("test::wave2a_net_tmr::SoaBody")
+    );
+    assert_eq!(
+        soa_nc.wire_fields[1].stratum_layout.as_deref(),
+        Some("test::wave2a_net_tmr::SoaBody__meta")
+    );
+
+    // NT-10b: NestedQuantComp and NestedQuantRpc emit dotted "sub.x" & "sub.inner.z" without parent "sub"
+    let nqc = mir
+        .net_components
+        .iter()
+        .find(|c| c.name == "NestedQuantComp")
+        .expect("NestedQuantComp");
+    assert_eq!(nqc.quantize_specs.len(), 2);
+    assert_eq!(nqc.quantize_specs[0].field_name, "sub.x");
+    assert_eq!(nqc.quantize_specs[0].field_byte_offset, 4);
+    assert_eq!(nqc.quantize_specs[1].field_name, "sub.inner.z");
+    assert_eq!(nqc.quantize_specs[1].field_byte_offset, 8);
+    assert!(
+        !nqc.wire_fields
+            .iter()
+            .any(|w| w.field_name == "sub" || w.field_name == "sub.inner"),
+        "parent structs `sub`/`sub.inner` must be flattened into leaf wire_fields"
+    );
+    let nqr = mir
+        .rpcs
+        .iter()
+        .find(|r| r.name == "NestedQuantRpc")
+        .expect("NestedQuantRpc");
+    assert_eq!(nqr.quantize_specs.len(), 2);
+    assert_eq!(nqr.quantize_specs[0].field_name, "sub.x");
+    assert_eq!(nqr.quantize_specs[1].field_name, "sub.inner.z");
+}
