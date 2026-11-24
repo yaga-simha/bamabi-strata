@@ -467,26 +467,52 @@ pub(super) fn collect_guest_fn_const_info(
                                 slot_table_ptrs.insert(*slot, tp);
                                 changed = true;
                             }
+                        } else if let Some(tp) = table_ptrs.get(val).cloned()
+                            && tp.1.is_empty()
+                        {
+                            if slot_table_ptrs.get(slot) != Some(&tp) {
+                                slot_table_ptrs.insert(*slot, tp);
+                                changed = true;
+                            }
+                            if let Some(t) = ptr_sema_tys.get(val).cloned()
+                                && slot_ptr_tys.get(slot) != Some(&t)
+                            {
+                                slot_ptr_tys.insert(*slot, t);
+                                changed = true;
+                            }
                         }
                     }
                     Inst::SlotLoad { slot } => {
-                        if let Some(d) = st.dst
-                            && matches!(slot_types.get(slot), Some(MirType::Ptr | MirType::MutPtr))
-                        {
-                            if let Some(t) = slot_ptr_tys.get(slot).cloned()
-                                && ptr_sema_tys.get(&d) != Some(&t)
+                        if let Some(d) = st.dst {
+                            if matches!(slot_types.get(slot), Some(MirType::Ptr | MirType::MutPtr))
                             {
-                                ptr_sema_tys.insert(d, t);
-                                changed = true;
-                            }
-                            if slot_sub_ptrs.contains(slot) && sub_ptrs.insert(d) {
-                                changed = true;
-                            }
-                            if let Some(tp) = slot_table_ptrs.get(slot).cloned()
-                                && table_ptrs.get(&d) != Some(&tp)
-                            {
-                                table_ptrs.insert(d, tp);
-                                changed = true;
+                                if let Some(t) = slot_ptr_tys.get(slot).cloned()
+                                    && ptr_sema_tys.get(&d) != Some(&t)
+                                {
+                                    ptr_sema_tys.insert(d, t);
+                                    changed = true;
+                                }
+                                if slot_sub_ptrs.contains(slot) && sub_ptrs.insert(d) {
+                                    changed = true;
+                                }
+                                if let Some(tp) = slot_table_ptrs.get(slot).cloned()
+                                    && table_ptrs.get(&d) != Some(&tp)
+                                {
+                                    table_ptrs.insert(d, tp);
+                                    changed = true;
+                                }
+                            } else if slot_table_ptrs.contains_key(slot) {
+                                let tp = (d, String::new());
+                                if table_ptrs.get(&d) != Some(&tp) {
+                                    table_ptrs.insert(d, tp);
+                                    changed = true;
+                                }
+                                if let Some(t) = slot_ptr_tys.get(slot).cloned()
+                                    && ptr_sema_tys.get(&d) != Some(&t)
+                                {
+                                    ptr_sema_tys.insert(d, t);
+                                    changed = true;
+                                }
                             }
                         }
                     }

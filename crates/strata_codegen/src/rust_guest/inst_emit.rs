@@ -1280,10 +1280,10 @@ pub(super) fn emit_inst(
         Inst::DirtyRunInit { run_start, run_len } => {
             writeln!(
                 out,
-                "                if let StrataPtr::Slot {{ sid, .. }} = locals[{}].as_ptr() {{ slots[sid] = StrataVal::U32(0); }}\n\
-                 \x20               if let StrataPtr::Slot {{ sid, .. }} = locals[{}].as_ptr() {{ slots[sid] = StrataVal::U32(0); }}\n\
+                "                if let StrataPtr::Slot {{ sid, .. }} = locals[{}].as_ptr() {{ slots[sid] = StrataVal::U32(0); }} else {{ locals[{}] = StrataVal::U32(0); }}\n\
+                 \x20               if let StrataPtr::Slot {{ sid, .. }} = locals[{}].as_ptr() {{ slots[sid] = StrataVal::U32(0); }} else {{ locals[{}] = StrataVal::U32(0); }}\n\
                  \x20               dirty_runs.insert({}, (0, 0));",
-                run_start.0, run_len.0, run_start.0
+                run_start.0, run_start.0, run_len.0, run_len.0, run_start.0
             )
             .ok();
         }
@@ -1296,8 +1296,8 @@ pub(super) fn emit_inst(
                 out,
                 "                {{\n\
                  \x20                   let _row = locals[{}].as_u32();\n\
-                 \x20                   let _cur_s = match locals[{}].as_ptr() {{ StrataPtr::Slot {{ sid, .. }} => slots[sid].as_u32(), _ => 0 }};\n\
-                 \x20                   let _cur_l = match locals[{}].as_ptr() {{ StrataPtr::Slot {{ sid, .. }} => slots[sid].as_u32(), _ => 0 }};\n\
+                 \x20                   let _cur_s = match locals[{}].as_ptr() {{ StrataPtr::Slot {{ sid, .. }} => slots[sid].as_u32(), _ => locals[{}].as_u32() }};\n\
+                 \x20                   let _cur_l = match locals[{}].as_ptr() {{ StrataPtr::Slot {{ sid, .. }} => slots[sid].as_u32(), _ => locals[{}].as_u32() }};\n\
                  \x20                   let (_ns, _nl) = if _cur_l == 0 {{\n\
                  \x20                       (_row, 1)\n\
                  \x20                   }} else if _row == _cur_s + _cur_l {{\n\
@@ -1305,10 +1305,10 @@ pub(super) fn emit_inst(
                  \x20                   }} else {{\n\
                  \x20                       (_cur_s, (_row + 1).saturating_sub(_cur_s).max(_cur_l))\n\
                  \x20                   }};\n\
-                 \x20                   if let StrataPtr::Slot {{ sid, .. }} = locals[{}].as_ptr() {{ slots[sid] = StrataVal::U32(_ns); }}\n\
-                 \x20                   if let StrataPtr::Slot {{ sid, .. }} = locals[{}].as_ptr() {{ slots[sid] = StrataVal::U32(_nl); }}\n\
+                 \x20                   if let StrataPtr::Slot {{ sid, .. }} = locals[{}].as_ptr() {{ slots[sid] = StrataVal::U32(_ns); }} else {{ locals[{}] = StrataVal::U32(_ns); }}\n\
+                 \x20                   if let StrataPtr::Slot {{ sid, .. }} = locals[{}].as_ptr() {{ slots[sid] = StrataVal::U32(_nl); }} else {{ locals[{}] = StrataVal::U32(_nl); }}\n\
                  \x20               }}",
-                row_idx.0, run_start.0, run_len.0, run_start.0, run_len.0
+                row_idx.0, run_start.0, run_start.0, run_len.0, run_len.0, run_start.0, run_start.0, run_len.0, run_len.0
             )
             .ok();
         }
