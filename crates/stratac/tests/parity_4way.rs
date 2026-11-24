@@ -5693,7 +5693,10 @@ schedule FixedUpdate {
             "{label} childof_sum"
         );
         assert_eq!(r_i32(&fb, fo_off("squad_sum")), 231, "{label} squad_sum");
-        assert_eq!(r_i32(&fb, fo_off("prop_sum")), 56, "{label} prop_sum");
+        // `trigger(..., propagate: true)` flushes via `Commands` after `run_prop_and_atomic` returns,
+        // so tick 4 observes the 3 prior flushes (`3 * 2 * 7 = 42`) before the 4th flush brings
+        // `RelChild.got_prop` across ChildNode + RootNode to 56.
+        assert_eq!(r_i32(&fb, fo_off("prop_sum")), 42, "{label} prop_sum");
         assert!(r_u32(&fb, fo_off("tl_fired")) >= 1, "{label} tl_fired");
         assert_eq!(fb[fo_off("tl_w31_active")], 1, "{label} tl_w31_active");
         assert_eq!(

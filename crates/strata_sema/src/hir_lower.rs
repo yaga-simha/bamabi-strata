@@ -451,21 +451,25 @@ pub(crate) fn lower_literal_token(tok: &SyntaxToken) -> Option<HirExpr> {
                 let value = parse_radix_u128(&cleaned)? as f64;
                 return Some(HirExpr::FloatLit {
                     value,
-                    ty: suffix_ty,
+                    ty: suffix_ty.unwrap_or(Ty::F32),
                 });
             }
             let raw = parse_radix_u128(&cleaned)?;
             let value = i64::try_from(raw).unwrap_or(raw as i64);
-            Some(HirExpr::IntLit {
-                value,
-                ty: suffix_ty,
-            })
+            let ty = suffix_ty.unwrap_or_else(|| {
+                if raw > u32::MAX as u128 {
+                    Ty::I64
+                } else {
+                    Ty::I32
+                }
+            });
+            Some(HirExpr::IntLit { value, ty })
         }
         _ => None,
     }
 }
 
-fn split_int_suffix(text: &str) -> (&str, Ty, bool) {
+fn split_int_suffix(text: &str) -> (&str, Option<Ty>, bool) {
     const INT_SUFFIXES: &[(&str, Ty, bool)] = &[
         ("_u16", Ty::U16, false),
         ("_u32", Ty::U32, false),
@@ -480,10 +484,10 @@ fn split_int_suffix(text: &str) -> (&str, Ty, bool) {
     ];
     for (suf, ty, is_f) in INT_SUFFIXES {
         if let Some(stem) = text.strip_suffix(suf) {
-            return (stem, ty.clone(), *is_f);
+            return (stem, Some(ty.clone()), *is_f);
         }
     }
-    (text, Ty::I32, false)
+    (text, None, false)
 }
 
 fn parse_radix_u128(s: &str) -> Option<u128> {
