@@ -3268,7 +3268,7 @@ pub(super) fn emit_tables_and_curves(out: &mut String, ctx: &NativeCtx<'_>) {
         row_entries.sort_by_key(|(d, _)| *d);
         row_entries.dedup_by_key(|(d, _)| *d);
 
-        let entry_lits: Vec<String> = row_entries
+        let entry_literals: Vec<String> = row_entries
             .iter()
             .map(|(d, lit)| format!("({d}i64, {lit})"))
             .collect();
@@ -3293,7 +3293,7 @@ pub(super) fn emit_tables_and_curves(out: &mut String, ctx: &NativeCtx<'_>) {
              \x20   }}\n\
              \x20   {row_struct}::strata_default()\n\
              }}\n",
-            entry_lits.join(",\n    ")
+            entry_literals.join(",\n    ")
         )
         .ok();
     }

@@ -607,11 +607,11 @@ pub(super) fn emit_inst(
             );
         }
         Inst::VecSwizzle { vec, lanes } => {
-            let lane_lits: Vec<String> = lanes.iter().map(|l| format!("{l}u8")).collect();
+            let lane_literals: Vec<String> = lanes.iter().map(|l| format!("{l}u8")).collect();
             let expr = format!(
                 "strata_vec_swizzle_lanes(&locals[{}], &[{}])",
                 vec.0,
-                lane_lits.join(", ")
+                lane_literals.join(", ")
             );
             assign_dst(out, &expr);
         }

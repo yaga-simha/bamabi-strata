@@ -5390,8 +5390,8 @@ timeline WinTl @rate(60_hz) @duration(10_f) {
     }
     src.push_str(
         r#"    at 2_f => {
-        for o in query(fo: &mut FlowOut) {
-            o.fo.tl_fired += 1_u32;
+        for o in query(flow_out: &mut FlowOut) {
+            o.flow_out.tl_fired += 1_u32;
         }
     }
 }
@@ -5405,14 +5405,14 @@ fsm PersistFsm @require(FlowOut) {
         local_cnt: i32 = 0,
         on_enter {
             local_cnt = 10;
-            for o in query(fo: &mut FlowOut) {
-                o.fo.fsm_local_val = local_cnt;
+            for o in query(flow_out: &mut FlowOut) {
+                o.flow_out.fsm_local_val = local_cnt;
             }
         }
         on_tick {
             local_cnt += 1;
-            for o in query(fo: &mut FlowOut) {
-                o.fo.fsm_local_val = local_cnt;
+            for o in query(flow_out: &mut FlowOut) {
+                o.flow_out.fsm_local_val = local_cnt;
             }
         }
         to Active when false;
@@ -5421,13 +5421,13 @@ fsm PersistFsm @require(FlowOut) {
 
 @sparse
 task BranchRaceTask(flag: bool)
-    on (fo: &mut FlowOut)
+    on (flow_out: &mut FlowOut)
     using (clk: &res SimClock)
 {
     if flag {
-        fo.task_if_val += 1;
+        flow_out.task_if_val += 1;
         yield_tick;
-        fo.task_if_val += 10;
+        flow_out.task_if_val += 10;
     }
     race {
         branch {
@@ -5435,12 +5435,12 @@ task BranchRaceTask(flag: bool)
         }
         branch {
             loop {
-                fo.task_race_ticks += 1;
+                flow_out.task_race_ticks += 1;
                 yield_tick;
             }
         }
     }
-    fo.task_if_val += 100;
+    flow_out.task_if_val += 100;
 }
 
 sys init_links() {
@@ -5450,7 +5450,7 @@ sys init_links() {
     insert_relation<ChildOf>(c_ent, root);
     insert_relation<Squad>(s_ent, root, Squad { power: 5 });
     let _b = spawn { BornComp { tag_id: 1 } };
-    let act = query_one(fo: &FlowOut).on(ActorNode).unwrap().id;
+    let act = query_one(flow_out: &FlowOut).on(ActorNode).unwrap().id;
     insert(act, PersistFsm::start());
     insert(act, WinTl::start());
     insert(act, BranchRaceTask::start(true));
@@ -5581,13 +5581,13 @@ schedule FixedUpdate {
 "#;
     let (_tmp, mir, mut w_jit, mut w_c99, mut w_rg, tier3) =
         setup_four_way_apps("wave3_ecs_flow", &src, tier3_driver);
-    let fo_layout = mir
+    let flow_out_layout = mir
         .layouts
         .iter()
         .find(|l| l.canonical_name.ends_with("FlowOut"))
         .unwrap();
-    let fo_off = |name: &str| {
-        fo_layout
+    let flow_out_off = |name: &str| {
+        flow_out_layout
             .fields
             .iter()
             .find(|f| !f.is_padding && f.name == name)
@@ -5679,38 +5679,61 @@ schedule FixedUpdate {
     }
 
     for (label, app) in [("jit", &w_jit), ("c99", &w_c99), ("rust_guest", &w_rg)] {
-        let fb = read_single_comp_bytes_by_u32_id(app.world(), "FlowOut", fo_off("id"), 1);
+        let fb = read_single_comp_bytes_by_u32_id(app.world(), "FlowOut", flow_out_off("id"), 1);
         let r_u32 = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
         let r_i32 = |b: &[u8], o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
         let r_f32 = |b: &[u8], o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
 
-        assert_eq!(r_u32(&fb, fo_off("sel_changed")), 1, "{label} sel_changed");
-        assert_eq!(r_u32(&fb, fo_off("ret_changed")), 1, "{label} ret_changed");
-        assert_eq!(r_u32(&fb, fo_off("added_seen")), 1, "{label} added_seen");
         assert_eq!(
-            r_i32(&fb, fo_off("childof_sum")),
+            r_u32(&fb, flow_out_off("sel_changed")),
+            1,
+            "{label} sel_changed"
+        );
+        assert_eq!(
+            r_u32(&fb, flow_out_off("ret_changed")),
+            1,
+            "{label} ret_changed"
+        );
+        assert_eq!(
+            r_u32(&fb, flow_out_off("added_seen")),
+            1,
+            "{label} added_seen"
+        );
+        assert_eq!(
+            r_i32(&fb, flow_out_off("childof_sum")),
             221,
             "{label} childof_sum"
         );
-        assert_eq!(r_i32(&fb, fo_off("squad_sum")), 231, "{label} squad_sum");
+        assert_eq!(
+            r_i32(&fb, flow_out_off("squad_sum")),
+            231,
+            "{label} squad_sum"
+        );
         // `trigger(..., propagate: true)` flushes via `Commands` after `run_prop_and_atomic` returns,
         // so tick 4 observes the 3 prior flushes (`3 * 2 * 7 = 42`) before the 4th flush brings
         // `RelChild.got_prop` across ChildNode + RootNode to 56.
-        assert_eq!(r_i32(&fb, fo_off("prop_sum")), 42, "{label} prop_sum");
-        assert!(r_u32(&fb, fo_off("tl_fired")) >= 1, "{label} tl_fired");
-        assert_eq!(fb[fo_off("tl_w31_active")], 1, "{label} tl_w31_active");
+        assert_eq!(r_i32(&fb, flow_out_off("prop_sum")), 42, "{label} prop_sum");
+        assert!(
+            r_u32(&fb, flow_out_off("tl_fired")) >= 1,
+            "{label} tl_fired"
+        );
         assert_eq!(
-            r_i32(&fb, fo_off("task_if_val")),
+            fb[flow_out_off("tl_w31_active")],
+            1,
+            "{label} tl_w31_active"
+        );
+        assert_eq!(
+            r_i32(&fb, flow_out_off("task_if_val")),
             111,
             "{label} task_if_val"
         );
         assert_eq!(
-            r_i32(&fb, fo_off("task_race_ticks")),
+            r_i32(&fb, flow_out_off("task_race_ticks")),
             2,
             "{label} task_race_ticks"
         );
         assert_eq!(
-            r_i32(&fb, fo_off("fsm_local_val")),
+            r_i32(&fb, flow_out_off("fsm_local_val")),
             13,
             "{label} fsm_local_val"
         );

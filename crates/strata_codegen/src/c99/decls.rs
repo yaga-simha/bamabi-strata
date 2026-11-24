@@ -1993,7 +1993,7 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
             );
         }
         if !sys.before_names.is_empty() {
-            let bef_lits: Vec<String> = sys
+            let bef_literals: Vec<String> = sys
                 .before_names
                 .iter()
                 .map(|b| format!("\"{}\"", c_escape(b)))
@@ -2001,14 +2001,14 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
             let _ = writeln!(
                 self.out,
                 "        static const char* const sys_before_{s_idx}[{}] = {{ {} }};",
-                bef_lits.len(),
-                bef_lits.join(", ")
+                bef_literals.len(),
+                bef_literals.join(", ")
             );
             let _ = writeln!(self.out, "        sdesc.before = sys_before_{s_idx};");
             let _ = writeln!(
                 self.out,
                 "        sdesc.before_count = {}u;",
-                bef_lits.len()
+                bef_literals.len()
             );
         }
         if !sys.in_sets.is_empty() {
