@@ -863,7 +863,9 @@ pub(crate) fn lower_comp_init_list(
             .find_layout(&component)
             .map(|l| l.canonical_name.clone());
         let fields = ast::child::<ast::FieldInitList>(ci.syntax())
-            .map(|fil| lower_field_init_list(fil.syntax(), env, scope, queries))
+            .map(|fil| {
+                lower_field_init_list_for_owner(fil.syntax(), env, scope, queries, Some(&component))
+            })
             .unwrap_or_default();
         out.push(HirCompInit {
             component,
@@ -880,15 +882,28 @@ pub(crate) fn lower_field_init_list(
     scope: &mut ScopeStack,
     queries: &[QueryAccessDesc],
 ) -> Vec<(String, HirExpr)> {
+    lower_field_init_list_for_owner(fil, env, scope, queries, None)
+}
+
+pub(crate) fn lower_field_init_list_for_owner(
+    fil: &SyntaxNode,
+    env: &LowerEnv<'_>,
+    scope: &mut ScopeStack,
+    queries: &[QueryAccessDesc],
+    owner: Option<&str>,
+) -> Vec<(String, HirExpr)> {
+    let owner_fields = owner.and_then(|name| env.find_item_fields(name));
     let mut out = Vec::new();
     for fi in ast::children::<ast::FieldInit>(fil) {
         let fname = ast::first_ident(fi.syntax()).map_or_else(String::new, |t| t.text().to_owned());
+        let expected_field_ty =
+            owner_fields.and_then(|fs| fs.iter().find(|(k, _)| k == &fname).map(|(_, ty)| ty));
         let expr = if let Some(expr_node) = fi
             .syntax()
             .children()
             .find(|c| is_expr_or_block_node(c.kind()))
         {
-            lower_expr(&expr_node, env, scope, queries)
+            lower_expr_with_expected(&expr_node, env, scope, queries, expected_field_ty)
         } else {
             let ty = lookup_var_ty(&fname, env, scope);
             HirExpr::Path {
@@ -2159,7 +2174,9 @@ pub(crate) fn lower_expr_with_expected(
                 .find(|c| c.kind() == SyntaxKind::PathExpr)
                 .map_or_else(String::new, |p| p.text().to_string().trim().to_owned());
             let fields = ast::child::<ast::FieldInitList>(node)
-                .map(|fil| lower_field_init_list(fil.syntax(), env, scope, queries))
+                .map(|fil| {
+                    lower_field_init_list_for_owner(fil.syntax(), env, scope, queries, Some(&name))
+                })
                 .unwrap_or_default();
             HirExpr::StructLit {
                 name: name.clone(),
@@ -2422,6 +2439,7 @@ fn lower_postfix_call(
                 allow_filters: Vec::new(),
                 has_filters: Vec::new(),
                 changed_filters: Vec::new(),
+                added_filters: Vec::new(),
                 where_pred: None,
                 on_target: None,
                 up_relation: None,
@@ -2524,6 +2542,23 @@ fn lower_postfix_call(
                     for g in generic_args {
                         if !q.changed_filters.contains(&g) {
                             q.changed_filters.push(g);
+                        }
+                    }
+                }
+                push_unexpected_args(&mut pre_stmts, scope);
+                return wrap_query(pre_stmts, q);
+            }
+            "added" => {
+                if generic_args.is_empty() {
+                    for t in &q.terms {
+                        if !q.added_filters.contains(&t.storage_key) {
+                            q.added_filters.push(t.storage_key.clone());
+                        }
+                    }
+                } else {
+                    for g in generic_args {
+                        if !q.added_filters.contains(&g) {
+                            q.added_filters.push(g);
                         }
                     }
                 }
@@ -3013,7 +3048,8 @@ fn lower_for_expr(
             if !matches!(recv.as_ref(), HirExpr::Path { .. }) {
                 pre_stmts.push(HirStmt::Expr(*recv));
             }
-            for extra in args.iter().skip(3) {
+            let radius = args.get(3).cloned().map(Box::new);
+            for extra in args.iter().skip(4) {
                 pre_stmts.push(HirStmt::Expr(extra.clone()));
             }
             HirForIter::SpatialSegmentAt {
@@ -3021,6 +3057,7 @@ fn lower_for_expr(
                 tick: Box::new(args[0].clone()),
                 p0: Box::new(args[1].clone()),
                 p1: Box::new(args[2].clone()),
+                radius,
             }
         }
         other => HirForIter::Expr(Box::new(other)),
@@ -4190,7 +4227,7 @@ fn find_net_query_call(expr: &HirExpr) -> Option<&HirCall> {
         }
         if matches!(
             c.callee.as_str(),
-            "on" | "unwrap" | "with" | "without" | "changed" | "allow" | "has"
+            "on" | "unwrap" | "with" | "without" | "changed" | "added" | "allow" | "has"
         ) && let Some(ref recv) = c.receiver
         {
             cur = recv.as_ref();

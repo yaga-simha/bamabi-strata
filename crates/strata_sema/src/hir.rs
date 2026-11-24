@@ -326,6 +326,9 @@ pub struct HirQuery {
     /// `.changed()` / `.changed<T>()` change-detection filters.
     #[serde(default)]
     pub changed_filters: Vec<String>,
+    /// `.added()` / `.added<T>()` addition-detection filters.
+    #[serde(default)]
+    pub added_filters: Vec<String>,
     /// Optional `.where(predicate)` row filter expression.
     pub where_pred: Option<Box<HirExpr>>,
     /// Optional `.on(target)` entity/object expression for `query_one(...)`.
@@ -548,7 +551,7 @@ pub enum HirForIter {
         /// Disc radius expression.
         radius: Box<HirExpr>,
     },
-    /// Spatial history lag-compensated segment sweep (`hist.query_segment_at(tick, p0, p1)`).
+    /// Spatial history lag-compensated segment sweep (`hist.query_segment_at(tick, p0, p1, radius?)`).
     SpatialSegmentAt {
         /// Spatial history resource name.
         history: String,
@@ -558,6 +561,9 @@ pub enum HirForIter {
         p0: Box<HirExpr>,
         /// Segment end position.
         p1: Box<HirExpr>,
+        /// Optional sweep radius expression (`args[3]` when provided).
+        #[serde(default)]
+        radius: Option<Box<HirExpr>>,
     },
     /// Fallback generic iterable expression.
     Expr(Box<HirExpr>),
@@ -1250,6 +1256,12 @@ pub struct HirScheduleGroup {
     pub kind: String,
     /// Group or system name.
     pub name: String,
+    /// Explicit `before(...)` ordering constraints on this schedule node.
+    #[serde(default)]
+    pub before: Vec<String>,
+    /// Explicit `after(...)` ordering constraints on this schedule node.
+    #[serde(default)]
+    pub after: Vec<String>,
     /// Nested children.
     pub children: Vec<HirScheduleGroup>,
 }

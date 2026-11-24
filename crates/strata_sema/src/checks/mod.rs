@@ -4,6 +4,7 @@ mod attrs;
 mod effects;
 mod items;
 mod schema;
+mod type_check;
 
 pub use schema::{SolvedModuleLayouts, extract_schema_signature_text, solve_module_layouts};
 
@@ -143,6 +144,7 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
     let mut node_groups: IndexMap<String, String> = IndexMap::new();
     let mut authorities: IndexMap<String, AuthorityKind> = IndexMap::new();
     let mut net_components: Vec<NetComponentMeta> = Vec::new();
+    let struct_quantizes = collect_struct_quantize_map(&sf);
 
     // Pass A: collect constants, tables, curves, tags, relations, spatial indices, objects,
     // fn sigs, RPCs, node groups, authorities, and net component metadata.
@@ -170,6 +172,7 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
                     false,
                     auth,
                     is_pred,
+                    &struct_quantizes,
                 ) {
                     net_components.push(meta);
                 }
@@ -190,6 +193,7 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
                     true,
                     auth,
                     is_pred,
+                    &struct_quantizes,
                 ) {
                     net_components.push(meta);
                 }
@@ -206,7 +210,7 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
                         None,
                     ));
                 } else {
-                    let hir_rpc = analyze_rpc(&module_path, rpc, &mut env);
+                    let hir_rpc = analyze_rpc(&module_path, rpc, &mut env, &struct_quantizes);
                     rpcs.push(hir_rpc);
                 }
             }
@@ -413,7 +417,27 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
         }
     }
 
+    // Enforce `E0111` array/SmallVec literal mismatches and `E0301` query/field resolution.
+    type_check::validate_module_types(
+        file,
+        src,
+        &sf,
+        &lower_env,
+        &consts,
+        &objects,
+        &field_defaults,
+        &fns,
+        &callables,
+        &tasks,
+        &fsms,
+        &timelines,
+        &sim_tests,
+        &net_sim_tests,
+        &mut diags,
+    );
+
     // Enforce `E0501` authority isolation via the unified provenance abstract interpreter.
+    let server_res_items = collect_server_res_usages(&sf, &module_path);
     crate::authority::validate_module_authority(
         file,
         src,
@@ -424,6 +448,25 @@ pub fn analyze_module_full(file: &str, src: &str) -> AnalyzedModule {
         &item_fields,
         &fns,
         &callables,
+        &tasks,
+        &fsms,
+        &timelines,
+        &objects,
+        &server_res_items,
+        &mut diags,
+    );
+
+    // Enforce `PM-06` helper resource propagation, `PM-15` `@par(read_only)`, resource
+    // aliasing, and `NT-10c` transitive `effects(...)` before `ConcurrencyGraph` / `assert_par`.
+    finalize_effects_par_and_aliasing(
+        file,
+        src,
+        &fns,
+        &mut callables,
+        &mut tasks,
+        &mut fsms,
+        &timelines,
+        &layouts,
         &mut diags,
     );
 
@@ -925,6 +968,7 @@ pub(crate) fn assemble_analyzed_module(
     let mut pure_fns = Vec::new();
     let mut node_groups: IndexMap<String, String> = IndexMap::new();
     let mut net_components: Vec<NetComponentMeta> = Vec::new();
+    let struct_quantizes = collect_struct_quantize_map(&sf);
 
     validate_all_attributes(file, src, &sf, &mut diags);
 
@@ -943,6 +987,7 @@ pub(crate) fn assemble_analyzed_module(
                     false,
                     auth,
                     is_pred,
+                    &struct_quantizes,
                 ) {
                     net_components.push(meta);
                 }
@@ -959,6 +1004,7 @@ pub(crate) fn assemble_analyzed_module(
                     true,
                     auth,
                     is_pred,
+                    &struct_quantizes,
                 ) {
                     net_components.push(meta);
                 }
@@ -975,7 +1021,12 @@ pub(crate) fn assemble_analyzed_module(
                         None,
                     ));
                 } else {
-                    rpcs.push(analyze_rpc(&module_path, rpc, &mut layout_env));
+                    rpcs.push(analyze_rpc(
+                        &module_path,
+                        rpc,
+                        &mut layout_env,
+                        &struct_quantizes,
+                    ));
                 }
             }
             _ => {}
@@ -1176,6 +1227,25 @@ pub(crate) fn assemble_analyzed_module(
         }
     }
 
+    type_check::validate_module_types(
+        file,
+        src,
+        &sf,
+        &lower_env,
+        &consts,
+        &objects,
+        &field_defaults,
+        &fns,
+        &callables,
+        &tasks,
+        &fsms,
+        &timelines,
+        &sim_tests,
+        &net_sim_tests,
+        &mut diags,
+    );
+
+    let server_res_items = collect_server_res_usages(&sf, &module_path);
     crate::authority::validate_module_authority(
         file,
         src,
@@ -1186,6 +1256,23 @@ pub(crate) fn assemble_analyzed_module(
         &env_summary.item_fields,
         &fns,
         &callables,
+        &tasks,
+        &fsms,
+        &timelines,
+        &objects,
+        &server_res_items,
+        &mut diags,
+    );
+
+    finalize_effects_par_and_aliasing(
+        file,
+        src,
+        &fns,
+        &mut callables,
+        &mut tasks,
+        &mut fsms,
+        &timelines,
+        &layouts,
         &mut diags,
     );
 
@@ -1237,4 +1324,32 @@ pub(crate) fn assemble_analyzed_module(
         pure_fns,
         authorities: env_summary.authorities.clone(),
     }
+}
+
+fn collect_server_res_usages(sf: &ast::SourceFile, module_path: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for item in sf.items() {
+        let node = match item {
+            ast::Item::Fn(n) => n.syntax().clone(),
+            ast::Item::Sys(n) => n.syntax().clone(),
+            ast::Item::Obs(n) => n.syntax().clone(),
+            ast::Item::Task(n) => n.syntax().clone(),
+            ast::Item::Fsm(n) => n.syntax().clone(),
+            ast::Item::Timeline(n) => n.syntax().clone(),
+            _ => continue,
+        };
+        let has_server_res = node.descendants().any(|d| {
+            d.kind() == strata_syntax::SyntaxKind::PostfixCallExpr
+                && d.first_child().is_some_and(|fc| {
+                    fc.kind() == strata_syntax::SyntaxKind::PathExpr
+                        && fc.text().to_string().trim() == "server_res"
+                })
+        });
+        if has_server_res && let Some(ident) = ast::first_ident(&node) {
+            let short = ident.text().to_owned();
+            out.insert(format!("{module_path}::{short}"));
+            out.insert(short);
+        }
+    }
+    out
 }

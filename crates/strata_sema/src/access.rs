@@ -158,6 +158,23 @@ pub struct FilteredAccessSet {
     pub is_par: bool,
     /// `true` if `@par(read_only, ...)` was attached.
     pub is_read_only_par: bool,
+    /// Singleton resource parameter borrows `(resource_name, is_mut, byte_start, byte_end)`.
+    #[serde(default)]
+    pub res_param_borrows: Vec<(String, bool, u32, u32)>,
+    /// Direct or transitive singleton resource body accesses `(resource_name, is_mut, byte_start, byte_end)`.
+    #[serde(default)]
+    pub res_body_accesses: Vec<(String, bool, u32, u32)>,
+}
+
+/// Returns `true` if two resource names refer to the same singleton resource
+/// (comparing exact canonical paths or unqualified short names).
+pub(crate) fn same_resource_name(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_short = a.rsplit("::").next().unwrap_or(a);
+    let b_short = b.rsplit("::").next().unwrap_or(b);
+    a_short == b_short && (!a.contains("::") || !b.contains("::"))
 }
 
 /// Reason two systems must serialize instead of running in parallel.
@@ -308,7 +325,57 @@ pub fn validate_system_accesses(
         }
     }
 
+    // Singleton resource parameter vs parameter aliasing (`&mut res R` + `&mut res R`,
+    // or `&res R` + `&mut res R`).
+    for i in 0..access.res_param_borrows.len() {
+        for j in (i + 1)..access.res_param_borrows.len() {
+            let (ref ra, ma, _, _) = access.res_param_borrows[i];
+            let (ref rb, mb, sb, eb) = access.res_param_borrows[j];
+            if same_resource_name(ra, rb) && (ma || mb) {
+                diags.push(Diagnostic::error(
+                    codes::E0201_ALIASING_CONFLICT,
+                    Span::from_bytes(file, src, sb, eb),
+                    format!(
+                        "singleton resource aliasing conflict in `{}`: `{rb}` cannot have overlapping mutable and shared/mutable parameter borrows",
+                        access.system_name
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+
+    check_res_param_body_aliasing(file, src, access, &access.res_body_accesses, &mut diags);
+
     diags
+}
+
+/// Checks parameter resource borrows against a list of body `res<R>()` / `res_mut<R>()`
+/// accesses and appends [`codes::E0201_ALIASING_CONFLICT`] diagnostics on conflicts.
+pub(crate) fn check_res_param_body_aliasing(
+    file: &str,
+    src: &str,
+    access: &FilteredAccessSet,
+    body_accesses: &[(String, bool, u32, u32)],
+    diags: &mut Vec<Diagnostic>,
+) {
+    for (pr, p_mut, _, _) in &access.res_param_borrows {
+        for (br, b_mut, sb, eb) in body_accesses {
+            if same_resource_name(pr, br) && (*p_mut || *b_mut) {
+                let kind = if *b_mut { "res_mut" } else { "res" };
+                diags.push(Diagnostic::error(
+                    codes::E0201_ALIASING_CONFLICT,
+                    Span::from_bytes(file, src, *sb, *eb),
+                    format!(
+                        "singleton resource aliasing conflict in `{}`: parameter borrow of `{pr}` conflicts with `{kind}<{br}>()` access in body",
+                        access.system_name
+                    ),
+                    None,
+                ));
+                break;
+            }
+        }
+    }
 }
 
 /// Returns `true` iff two data-access modes conflict (both access component storage and at least
@@ -339,12 +406,16 @@ pub fn system_conflicts(a: &FilteredAccessSet, b: &FilteredAccessSet) -> Vec<Str
     let mut reasons = Vec::new();
 
     for r in &a.res_writes {
-        if b.res_reads.contains(r) || b.res_writes.contains(r) {
+        if b.res_reads.iter().any(|x| same_resource_name(r, x))
+            || b.res_writes.iter().any(|x| same_resource_name(r, x))
+        {
             reasons.push(format!("resource `{r}` (write in `{}`)", a.system_name));
         }
     }
     for r in &b.res_writes {
-        if a.res_reads.contains(r) && !a.res_writes.contains(r) {
+        if a.res_reads.iter().any(|x| same_resource_name(r, x))
+            && !a.res_writes.iter().any(|x| same_resource_name(r, x))
+        {
             reasons.push(format!("resource `{r}` (write in `{}`)", b.system_name));
         }
     }

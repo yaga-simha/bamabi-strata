@@ -2,7 +2,9 @@
 
 use crate::diagnostics::{Diagnostic, FixIt, Span, codes};
 use crate::hir::{HirBinOp, HirExpr, HirUnOp, SemVerInfo};
-use crate::hir_lower::{LowerEnv, ScopeStack, is_expr_node, lower_expr};
+use crate::hir_lower::{
+    LowerEnv, ScopeStack, is_expr_node, is_type_node, lower_expr_with_expected,
+};
 use crate::layout::{
     EnumDef, LayoutEnv, SchemaItemKind, SolvedLayout, flags_from_attr_names, solve_pod_layout,
     solve_task_state_layout, solve_timeline_layout,
@@ -1163,6 +1165,12 @@ pub(super) fn extract_field_defaults_list(
         let Some(fname) = fd.name().map(|t| t.text().to_owned()) else {
             continue;
         };
+        let expected_ty = fd
+            .syntax()
+            .children()
+            .find(|c| is_type_node(c.kind()))
+            .map(|tn| parse_type_node_with_user_types(&tn, lower_env.user_types))
+            .filter(|t| *t != Ty::Unknown);
         let mut saw_eq = false;
         for el in fd.syntax().children_with_tokens() {
             match el {
@@ -1170,7 +1178,16 @@ pub(super) fn extract_field_defaults_list(
                     saw_eq = true;
                 }
                 NodeOrToken::Node(n) if saw_eq && is_expr_node(n.kind()) => {
-                    map.insert(fname, lower_expr(&n, lower_env, &mut scope, &[]));
+                    map.insert(
+                        fname,
+                        lower_expr_with_expected(
+                            &n,
+                            lower_env,
+                            &mut scope,
+                            &[],
+                            expected_ty.as_ref(),
+                        ),
+                    );
                     break;
                 }
                 _ => {}

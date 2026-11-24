@@ -13,8 +13,9 @@
 
 use crate::diagnostics::{Diagnostic, Span, codes};
 use crate::hir::{
-    AuthorityKind, HirAssignOp, HirCall, HirCompInit, HirExpr, HirFn, HirForIter, HirLValue,
-    HirParamKind, HirPattern, HirQuery, HirQueryTerm, HirStmt, HirUnOp,
+    AuthorityKind, HirAssignOp, HirCall, HirCompInit, HirExpr, HirFn, HirForIter, HirFsm,
+    HirLValue, HirObject, HirParamKind, HirPattern, HirQuery, HirQueryTerm, HirStmt, HirTask,
+    HirTimeline, HirUnOp,
 };
 use crate::layout::{EnumDef, SolvedLayout};
 use crate::types::Ty;
@@ -123,6 +124,11 @@ pub(crate) struct Provenance {
     elem_join: Option<Box<Provenance>>,
     /// Symbolic 0-based helper `fn` parameter indices flowing into this value directly.
     param_origins: BTreeSet<usize>,
+    /// `@authority(server)` component keys present on entities flowing into this value
+    /// (for catching `despawn(e)` on server-authoritative entities without tainting `direct`).
+    server_entity_comps: BTreeSet<String>,
+    /// Symbolic 0-based helper `fn` parameter indices flowing into an `Entity` value for `despawn`.
+    entity_param_origins: BTreeSet<usize>,
 }
 
 impl Provenance {
@@ -143,8 +149,11 @@ impl Provenance {
     fn param(idx: usize) -> Self {
         let mut param_origins = BTreeSet::new();
         param_origins.insert(idx);
+        let mut entity_param_origins = BTreeSet::new();
+        entity_param_origins.insert(idx);
         Self {
             param_origins,
+            entity_param_origins,
             ..Self::default()
         }
     }
@@ -158,6 +167,8 @@ impl Provenance {
             && self.opt_inner.is_none()
             && self.elem_join.is_none()
             && self.param_origins.is_empty()
+            && self.server_entity_comps.is_empty()
+            && self.entity_param_origins.is_empty()
     }
 
     fn is_pure_leaf(&self) -> bool {
@@ -268,6 +279,12 @@ impl Provenance {
             (None, None) => None,
         };
 
+        let mut server_entity_comps = self.server_entity_comps.clone();
+        server_entity_comps.extend(other.server_entity_comps.iter().cloned());
+
+        let mut entity_param_origins = self.entity_param_origins.clone();
+        entity_param_origins.extend(other.entity_param_origins.iter().copied());
+
         Self {
             direct,
             is_query_row: self.is_query_row || other.is_query_row,
@@ -277,18 +294,29 @@ impl Provenance {
             opt_inner,
             elem_join,
             param_origins,
+            server_entity_comps,
+            entity_param_origins,
         }
     }
 
     fn proj_field(&self, field: &str) -> Self {
-        if self.is_query_row && field == "id" {
-            return Self::empty();
+        if self.is_query_row && matches!(field, "id" | "entity") {
+            return Self {
+                server_entity_comps: self.server_entity_comps.clone(),
+                entity_param_origins: self.entity_param_origins.clone(),
+                ..Self::default()
+            };
         }
         if let Some(fp) = self.fields.get(field) {
             let mut out = fp.clone();
             if !self.is_query_row {
                 out.direct.extend(self.direct.iter().cloned());
                 out.param_origins.extend(self.param_origins.iter().copied());
+            } else if matches!(field, "id" | "entity") {
+                out.server_entity_comps
+                    .extend(self.server_entity_comps.iter().cloned());
+                out.entity_param_origins
+                    .extend(self.entity_param_origins.iter().copied());
             }
             return out;
         }
@@ -364,10 +392,20 @@ impl Provenance {
                 .as_ref()
                 .map(|b| Box::new(b.instantiate(arg_provs, depth + 1))),
             param_origins: BTreeSet::new(),
+            server_entity_comps: self.server_entity_comps.clone(),
+            entity_param_origins: BTreeSet::new(),
         };
         for &p in &self.param_origins {
             if let Some(ap) = arg_provs.get(p) {
                 out = out.join(ap);
+            }
+        }
+        for &p in &self.entity_param_origins {
+            if let Some(ap) = arg_provs.get(p) {
+                out.server_entity_comps
+                    .extend(ap.server_entity_comps.iter().cloned());
+                out.entity_param_origins
+                    .extend(ap.entity_param_origins.iter().copied());
             }
         }
         out
@@ -449,7 +487,15 @@ fn is_decayable_copy_ty(ty: &Ty, enums: &IndexMap<String, EnumDef>) -> bool {
 fn decay_storage_copy(prov: Provenance, ty: &Ty, enums: &IndexMap<String, EnumDef>) -> Provenance {
     let can_decay = prov.is_pure_leaf() || prov.is_ecs_borrow;
     if can_decay && is_decayable_copy_ty(ty, enums) {
-        Provenance::empty()
+        if matches!(ty, Ty::Ref(s) | Ty::Named(s) if s == "Entity") {
+            Provenance {
+                server_entity_comps: prov.server_entity_comps,
+                entity_param_origins: prov.entity_param_origins,
+                ..Provenance::default()
+            }
+        } else {
+            Provenance::empty()
+        }
     } else {
         prov
     }
@@ -583,7 +629,19 @@ impl AuthScope {
 struct FnSummary {
     direct_server_writes: BTreeSet<String>,
     mutated_params: BTreeSet<usize>,
+    despawned_entity_params: BTreeSet<usize>,
+    triggered_events: BTreeSet<String>,
+    started_workflows: BTreeSet<String>,
+    uses_server_res: bool,
     return_prov: Provenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct WorkflowSummary {
+    server_writes: BTreeSet<String>,
+    triggered_events: BTreeSet<String>,
+    started_workflows: BTreeSet<String>,
+    uses_server_res: bool,
 }
 
 struct AuthEnv<'a> {
@@ -594,6 +652,8 @@ struct AuthEnv<'a> {
     item_fields: &'a IndexMap<String, Vec<(String, Ty)>>,
     fn_summaries: &'a HashMap<String, FnSummary>,
     fn_params: &'a HashMap<String, Vec<(HirParamKind, Ty)>>,
+    workflow_names: &'a HashSet<String>,
+    object_server_comps: &'a HashMap<String, BTreeSet<String>>,
 }
 
 impl<'a> AuthEnv<'a> {
@@ -759,8 +819,33 @@ impl<'a> AuthEnv<'a> {
         p
     }
 
-    fn query_row_prov_for_pat(&self, terms: &[HirQueryTerm], pat_name: Option<&str>) -> Provenance {
-        if terms.len() == 1 && pat_name == Some(terms[0].alias.as_str()) {
+    fn query_server_entity_comps(&self, q: &HirQuery) -> BTreeSet<String> {
+        let mut server_comps = BTreeSet::new();
+        for t in &q.terms {
+            if self.is_server(&t.storage_key) || self.is_server(&t.canonical_component) {
+                let short = t
+                    .storage_key
+                    .split("::")
+                    .next()
+                    .unwrap_or(&t.storage_key)
+                    .to_owned();
+                server_comps.insert(short);
+            }
+        }
+        for f in q.with_filters.iter().chain(q.has_filters.iter()) {
+            let comp = extract_filter_target_component(f).unwrap_or(f.as_str());
+            if self.is_server(comp) {
+                let short = comp.rsplit("::").next().unwrap_or(comp).to_owned();
+                server_comps.insert(short);
+            }
+        }
+        server_comps
+    }
+
+    fn query_row_prov_for_query(&self, q: &HirQuery, pat_name: Option<&str>) -> Provenance {
+        let server_entity_comps = self.query_server_entity_comps(q);
+        let terms = &q.terms;
+        let mut out = if terms.len() == 1 && pat_name == Some(terms[0].alias.as_str()) {
             let tp = self.query_term_prov(&terms[0]);
             let mut fields = BTreeMap::new();
             fields.insert(terms[0].alias.clone(), tp.clone());
@@ -769,26 +854,48 @@ impl<'a> AuthEnv<'a> {
                 is_query_row: terms[0].field_name.is_none(),
                 is_ecs_borrow: terms[0].field_name.is_some(),
                 fields,
+                server_entity_comps: server_entity_comps.clone(),
                 ..Provenance::default()
             }
         } else {
             let mut fields = BTreeMap::new();
             for t in terms {
-                fields.insert(t.alias.clone(), self.query_term_prov(t));
+                let mut tp = self.query_term_prov(t);
+                if t.storage_key == "Entity" {
+                    tp.server_entity_comps
+                        .extend(server_entity_comps.iter().cloned());
+                }
+                fields.insert(t.alias.clone(), tp);
             }
             Provenance {
                 is_query_row: true,
                 fields,
+                server_entity_comps: server_entity_comps.clone(),
                 ..Provenance::default()
             }
+        };
+        if !server_entity_comps.is_empty() {
+            for ent_key in ["id", "entity"] {
+                out.fields
+                    .entry(ent_key.to_owned())
+                    .and_modify(|p| {
+                        p.server_entity_comps
+                            .extend(server_entity_comps.iter().cloned())
+                    })
+                    .or_insert_with(|| Provenance {
+                        server_entity_comps: server_entity_comps.clone(),
+                        ..Provenance::default()
+                    });
+            }
         }
+        out
     }
 
     fn query_prov(&self, q: &HirQuery) -> Provenance {
         if q.is_count {
             return Provenance::empty();
         }
-        let row = self.query_row_prov_for_pat(&q.terms, None);
+        let row = self.query_row_prov_for_query(q, None);
         if q.is_point_lookup && !q.is_unwrap {
             Provenance {
                 opt_inner: Some(Box::new(row)),
@@ -821,6 +928,10 @@ struct ExecCtx<'a> {
     emit_violations: bool,
     server_writes_seen: BTreeSet<String>,
     mutated_params_seen: BTreeSet<usize>,
+    despawned_entity_params_seen: BTreeSet<usize>,
+    triggered_events_seen: BTreeSet<String>,
+    started_workflows_seen: BTreeSet<String>,
+    uses_server_res: bool,
     return_prov: Provenance,
     diagnostics: Vec<(String, String)>,
     flow_exited: bool,
@@ -835,6 +946,10 @@ impl<'a> ExecCtx<'a> {
             emit_violations,
             server_writes_seen: BTreeSet::new(),
             mutated_params_seen: BTreeSet::new(),
+            despawned_entity_params_seen: BTreeSet::new(),
+            triggered_events_seen: BTreeSet::new(),
+            started_workflows_seen: BTreeSet::new(),
+            uses_server_res: false,
             return_prov: Provenance::empty(),
             diagnostics: Vec::new(),
             flow_exited: false,
@@ -935,6 +1050,13 @@ impl<'a> ExecCtx<'a> {
                 self.server_writes_seen.extend(dead_ctx.server_writes_seen);
                 self.mutated_params_seen
                     .extend(dead_ctx.mutated_params_seen);
+                self.despawned_entity_params_seen
+                    .extend(dead_ctx.despawned_entity_params_seen);
+                self.triggered_events_seen
+                    .extend(dead_ctx.triggered_events_seen);
+                self.started_workflows_seen
+                    .extend(dead_ctx.started_workflows_seen);
+                self.uses_server_res |= dead_ctx.uses_server_res;
                 self.diagnostics.extend(dead_ctx.diagnostics);
             } else {
                 self.eval_stmt(stmt, scope);
@@ -1002,10 +1124,22 @@ impl<'a> ExecCtx<'a> {
                     scope,
                 );
             }
+            HirStmt::Despawn(e) => {
+                let ep = self.eval_expr(e, scope);
+                for comp in &ep.server_entity_comps {
+                    self.record_server_violation(
+                        comp,
+                        format!(
+                            "non-server callable despawns entity with `@authority(server)` component `{comp}`"
+                        ),
+                    );
+                }
+                self.despawned_entity_params_seen
+                    .extend(ep.entity_param_origins.iter().copied());
+            }
             HirStmt::Expr(e)
             | HirStmt::Wait(e)
             | HirStmt::WaitUntil(e)
-            | HirStmt::Despawn(e)
             | HirStmt::Emit(e)
             | HirStmt::RequireTrue(e) => {
                 self.eval_expr(e, scope);
@@ -1082,6 +1216,18 @@ impl<'a> ExecCtx<'a> {
                     self.eval_expr(t, scope);
                 }
                 self.eval_expr(event, scope);
+                let ev_name = match event.as_ref() {
+                    HirExpr::StructLit { name, .. } => {
+                        Some(name.rsplit("::").next().unwrap_or(name).to_owned())
+                    }
+                    _ => match event.ty() {
+                        Ty::Named(n) => Some(n.rsplit("::").next().unwrap_or(&n).to_owned()),
+                        _ => None,
+                    },
+                };
+                if let Some(ev) = ev_name {
+                    self.triggered_events_seen.insert(ev);
+                }
             }
             HirStmt::InsertRelation {
                 relation,
@@ -1123,6 +1269,10 @@ impl<'a> ExecCtx<'a> {
     }
 
     fn check_comp_init(&mut self, ci: &HirCompInit, verb: &str, scope: &mut AuthScope) {
+        let short_comp = ci.component.rsplit("::").next().unwrap_or(&ci.component);
+        if self.env.workflow_names.contains(short_comp) {
+            self.started_workflows_seen.insert(short_comp.to_owned());
+        }
         if self.env.is_server(&ci.component) {
             self.record_server_violation(
                 &ci.component,
@@ -1372,6 +1522,10 @@ impl<'a> ExecCtx<'a> {
     fn check_inserted_value_authority(&mut self, value: &HirExpr, scope: &mut AuthScope) {
         match value {
             HirExpr::StructLit { name, fields, .. } => {
+                let short_name = name.rsplit("::").next().unwrap_or(name);
+                if self.env.workflow_names.contains(short_name) {
+                    self.started_workflows_seen.insert(short_name.to_owned());
+                }
                 if self.env.is_server(name) {
                     self.record_server_violation(
                         name,
@@ -1445,9 +1599,16 @@ impl<'a> ExecCtx<'a> {
             | HirExpr::StringLit(_)
             | HirExpr::CharLit(_) => Provenance::empty(),
 
-            HirExpr::Path { name, .. } => {
-                scope.get(name).cloned().unwrap_or_else(Provenance::empty)
-            }
+            HirExpr::Path { name, .. } => scope.get(name).cloned().unwrap_or_else(|| {
+                if let Some(comps) = self.env.object_server_comps.get(name) {
+                    Provenance {
+                        server_entity_comps: comps.clone(),
+                        ..Provenance::default()
+                    }
+                } else {
+                    Provenance::empty()
+                }
+            }),
 
             HirExpr::Field { base, field, .. } => self.eval_expr(base, scope).proj_field(field),
 
@@ -1727,8 +1888,7 @@ impl<'a> ExecCtx<'a> {
                     HirForIter::Query(q) => {
                         self.eval_query_clauses(q, scope);
                         (
-                            self.env
-                                .query_row_prov_for_pat(&q.terms, pat_name.as_deref()),
+                            self.env.query_row_prov_for_query(q, pat_name.as_deref()),
                             Ty::Ref("Entity".to_owned()),
                             true,
                         )
@@ -1755,10 +1915,19 @@ impl<'a> ExecCtx<'a> {
                         self.eval_expr(radius, scope);
                         (Provenance::empty(), Ty::Ref("Entity".to_owned()), false)
                     }
-                    HirForIter::SpatialSegmentAt { tick, p0, p1, .. } => {
+                    HirForIter::SpatialSegmentAt {
+                        tick,
+                        p0,
+                        p1,
+                        radius,
+                        ..
+                    } => {
                         self.eval_expr(tick, scope);
                         self.eval_expr(p0, scope);
                         self.eval_expr(p1, scope);
+                        if let Some(r) = radius {
+                            self.eval_expr(r, scope);
+                        }
                         (Provenance::empty(), Ty::Ref("Entity".to_owned()), false)
                     }
                 };
@@ -1779,6 +1948,24 @@ impl<'a> ExecCtx<'a> {
                     let mut silent = ExecCtx::new(self.env, false);
                     if is_query {
                         silent.bind_query_pattern(&f.binding, iter_prov.clone(), &mut body_scope);
+                        if let HirForIter::Query(q) = &f.iter {
+                            for t in &q.terms {
+                                if t.storage_key == "Entity"
+                                    && pat_name.as_deref() != Some(t.alias.as_str())
+                                    && !iter_prov.server_entity_comps.is_empty()
+                                {
+                                    body_scope.insert(
+                                        t.alias.clone(),
+                                        Provenance {
+                                            server_entity_comps: iter_prov
+                                                .server_entity_comps
+                                                .clone(),
+                                            ..Provenance::default()
+                                        },
+                                    );
+                                }
+                            }
+                        }
                     } else {
                         silent.bind_pattern(
                             &f.binding,
@@ -1807,7 +1994,23 @@ impl<'a> ExecCtx<'a> {
                 self.flow_exited = false;
                 loop_scope.push();
                 if is_query {
-                    self.bind_query_pattern(&f.binding, iter_prov, &mut loop_scope);
+                    self.bind_query_pattern(&f.binding, iter_prov.clone(), &mut loop_scope);
+                    if let HirForIter::Query(q) = &f.iter {
+                        for t in &q.terms {
+                            if t.storage_key == "Entity"
+                                && pat_name.as_deref() != Some(t.alias.as_str())
+                                && !iter_prov.server_entity_comps.is_empty()
+                            {
+                                loop_scope.insert(
+                                    t.alias.clone(),
+                                    Provenance {
+                                        server_entity_comps: iter_prov.server_entity_comps.clone(),
+                                        ..Provenance::default()
+                                    },
+                                );
+                            }
+                        }
+                    }
                 } else {
                     self.bind_pattern(&f.binding, iter_prov, &mut loop_scope, &pat_ty);
                 }
@@ -1896,7 +2099,17 @@ impl<'a> ExecCtx<'a> {
                         self.check_comp_init(ci, "spawn", scope);
                     }
                 }
-                Provenance::empty()
+                let mut spawned_srv = BTreeSet::new();
+                for ci in &sp.components {
+                    if self.env.is_server(&ci.component) {
+                        let short = ci.component.rsplit("::").next().unwrap_or(&ci.component);
+                        spawned_srv.insert(short.to_owned());
+                    }
+                }
+                Provenance {
+                    server_entity_comps: spawned_srv,
+                    ..Provenance::default()
+                }
             }
 
             HirExpr::DespawnAll { filters } => {
@@ -1954,6 +2167,15 @@ impl<'a> ExecCtx<'a> {
         // Handle Option combinators transparently (and flag in-place mutators like `as_mut`/`take`).
         if let Some(ref recv) = recv_prov {
             match c.callee.as_str() {
+                "id" if !recv.server_entity_comps.is_empty()
+                    || !recv.entity_param_origins.is_empty() =>
+                {
+                    return Provenance {
+                        server_entity_comps: recv.server_entity_comps.clone(),
+                        entity_param_origins: recv.entity_param_origins.clone(),
+                        ..Provenance::default()
+                    };
+                }
                 "unwrap" | "expect" | "as_ref" => {
                     return recv.unwrap_opt();
                 }
@@ -2033,12 +2255,64 @@ impl<'a> ExecCtx<'a> {
                     }
                     return Provenance::empty();
                 }
-                "res" | "server_res" | "client_res" => {
+                "res" | "client_res" => {
                     if let Some(rname) = c.generic_args.first() {
                         return self.env.schema_type_provenance(
                             &Ty::Named(rname.clone()),
                             &mut HashSet::new(),
                         );
+                    }
+                    return Provenance::empty();
+                }
+                "server_res" => {
+                    self.uses_server_res = true;
+                    if let Some(rname) = c.generic_args.first() {
+                        if self.env.is_server(rname) {
+                            self.record_server_violation(
+                                rname,
+                                format!(
+                                    "non-server callable calls `server_res<{rname}>()` on `@authority(server)` resource"
+                                ),
+                            );
+                        }
+                        return self.env.schema_type_provenance(
+                            &Ty::Named(rname.clone()),
+                            &mut HashSet::new(),
+                        );
+                    }
+                    return Provenance::empty();
+                }
+                "play" => {
+                    for a in &c.args {
+                        let wf = match a {
+                            HirExpr::Path { name, .. } | HirExpr::StructLit { name, .. } => {
+                                Some(name.rsplit("::").next().unwrap_or(name).to_owned())
+                            }
+                            _ => match a.ty() {
+                                Ty::Named(n) => {
+                                    Some(n.rsplit("::").next().unwrap_or(&n).to_owned())
+                                }
+                                _ => None,
+                            },
+                        };
+                        if let Some(w) = wf {
+                            self.started_workflows_seen.insert(w);
+                        }
+                    }
+                    return Provenance::empty();
+                }
+                "despawn" => {
+                    if let Some(ep) = arg_provs.first() {
+                        for comp in &ep.server_entity_comps {
+                            self.record_server_violation(
+                                comp,
+                                format!(
+                                    "non-server callable despawns entity with `@authority(server)` component `{comp}`"
+                                ),
+                            );
+                        }
+                        self.despawned_entity_params_seen
+                            .extend(ep.entity_param_origins.iter().copied());
                     }
                     return Provenance::empty();
                 }
@@ -2107,6 +2381,11 @@ impl<'a> ExecCtx<'a> {
 
         // Transitive helper `fn` invocation check and provenance substitution.
         if c.receiver.is_none() {
+            if let Some(prefix) = c.callee.strip_suffix("::start") {
+                let short_wf = prefix.rsplit("::").next().unwrap_or(prefix).to_owned();
+                self.started_workflows_seen.insert(short_wf);
+                return Provenance::empty();
+            }
             let short_callee = c.callee.rsplit("::").next().unwrap_or(&c.callee);
             if let Some(summary) = self
                 .env
@@ -2122,6 +2401,28 @@ impl<'a> ExecCtx<'a> {
                             c.callee
                         ),
                     );
+                }
+                self.triggered_events_seen
+                    .extend(summary.triggered_events.iter().cloned());
+                self.started_workflows_seen
+                    .extend(summary.started_workflows.iter().cloned());
+                if summary.uses_server_res {
+                    self.uses_server_res = true;
+                }
+                for &p_idx in &summary.despawned_entity_params {
+                    if let Some(ap) = arg_provs.get(p_idx) {
+                        for comp in &ap.server_entity_comps {
+                            self.record_server_violation(
+                                comp,
+                                format!(
+                                    "non-server callable passes server entity `{comp}` to helper `fn {}` which despawns it",
+                                    c.callee
+                                ),
+                            );
+                        }
+                        self.despawned_entity_params_seen
+                            .extend(ap.entity_param_origins.iter().copied());
+                    }
                 }
                 let callee_params = self
                     .env
@@ -2250,9 +2551,10 @@ impl<'a> ExecCtx<'a> {
     }
 }
 
-/// Computes fixed-point summaries across all helper `fn` declarations and enforces `E0501`
-/// authority isolation across all `@authority(client)` / `@predicted` / `@authority(shared)`
-/// callables in the module.
+/// Computes fixed-point summaries across all helper `fn`, `obs`, `task`, `fsm`, and `timeline`
+/// declarations and enforces `E0501` authority isolation across all `@authority(client)` /
+/// `@predicted` / `@authority(shared)` callables in the module.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_module_authority(
     file: &str,
     src: &str,
@@ -2263,10 +2565,42 @@ pub(crate) fn validate_module_authority(
     item_fields: &IndexMap<String, Vec<(String, Ty)>>,
     fns: &[HirFn],
     callables: &[crate::hir::HirCallable],
+    tasks: &[HirTask],
+    fsms: &[HirFsm],
+    timelines: &[HirTimeline],
+    objects: &[HirObject],
+    server_res_items: &HashSet<String>,
     diags: &mut Vec<Diagnostic>,
 ) {
+    let mut workflow_names = HashSet::new();
+    for t in tasks {
+        workflow_names.insert(t.name.rsplit("::").next().unwrap_or(&t.name).to_owned());
+    }
+    for f in fsms {
+        workflow_names.insert(f.name.rsplit("::").next().unwrap_or(&f.name).to_owned());
+    }
+    for tl in timelines {
+        workflow_names.insert(tl.name.rsplit("::").next().unwrap_or(&tl.name).to_owned());
+    }
+
+    let mut object_server_comps: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for obj in objects {
+        let mut srv = BTreeSet::new();
+        for ci in &obj.inits {
+            if is_server_authoritative_key(&ci.component, authorities) {
+                let short = ci.component.rsplit("::").next().unwrap_or(&ci.component);
+                srv.insert(short.to_owned());
+            }
+        }
+        if !srv.is_empty() {
+            let short = obj.name.rsplit("::").next().unwrap_or(&obj.name);
+            object_server_comps.insert(obj.name.clone(), srv.clone());
+            object_server_comps.insert(short.to_owned(), srv);
+        }
+    }
+
     // 1. Fixed-point computation of helper `fn` summaries (direct server writes, mutated params,
-    //    and return provenance including symbolic parameter flow).
+    //    despawned entity params, triggered events, started workflows, server_res, and returns).
     let mut fn_summaries: HashMap<String, FnSummary> = HashMap::new();
     let mut fn_params: HashMap<String, Vec<(HirParamKind, Ty)>> = HashMap::new();
     for hf in fns {
@@ -2287,11 +2621,17 @@ pub(crate) fn validate_module_authority(
             item_fields,
             fn_summaries: &fn_summaries,
             fn_params: &fn_params,
+            workflow_names: &workflow_names,
+            object_server_comps: &object_server_comps,
         };
         let mut updated = fn_summaries.clone();
         for hf in fns {
             let mut scope = AuthScope::new();
             let mut ctx = ExecCtx::new(&next_env, false);
+            let f_short = hf.name.rsplit("::").next().unwrap_or(&hf.name);
+            if server_res_items.contains(&hf.name) || server_res_items.contains(f_short) {
+                ctx.uses_server_res = true;
+            }
             for (idx, p) in hf.params.iter().enumerate() {
                 if let Some(ref def_expr) = p.default {
                     ctx.eval_expr(def_expr, &mut scope);
@@ -2306,6 +2646,10 @@ pub(crate) fn validate_module_authority(
             let summary = FnSummary {
                 direct_server_writes: ctx.server_writes_seen,
                 mutated_params: ctx.mutated_params_seen,
+                despawned_entity_params: ctx.despawned_entity_params_seen,
+                triggered_events: ctx.triggered_events_seen,
+                started_workflows: ctx.started_workflows_seen,
+                uses_server_res: ctx.uses_server_res,
                 return_prov: decay_storage_copy(ctx.return_prov, &hf.ret_ty, enums),
             };
             if updated.get(&hf.name) != Some(&summary) {
@@ -2319,7 +2663,6 @@ pub(crate) fn validate_module_authority(
         }
     }
 
-    // 2. Enforce E0501 on every non-server callable (`@authority(client)` / `@predicted`).
     let auth_env = AuthEnv {
         module_path,
         authorities,
@@ -2328,11 +2671,244 @@ pub(crate) fn validate_module_authority(
         item_fields,
         fn_summaries: &fn_summaries,
         fn_params: &fn_params,
+        workflow_names: &workflow_names,
+        object_server_comps: &object_server_comps,
     };
+
+    // 2. Collect per-observer and per-workflow (`task`/`fsm`/`timeline`) server-write summaries.
+    let mut obs_summaries: Vec<(String, String, WorkflowSummary)> = Vec::new();
+    for c in callables.iter().filter(|c| c.is_observer) {
+        let mut ws = WorkflowSummary::default();
+        let c_short = c.name.rsplit("::").next().unwrap_or(&c.name);
+        if server_res_items.contains(&c.name) || server_res_items.contains(c_short) {
+            ws.uses_server_res = true;
+        }
+        for q in &c.access.queries {
+            for t in &q.terms {
+                if t.mode.is_mutable() && is_server_authoritative_key(&t.storage_key, authorities) {
+                    let short = t.storage_key.split("::").next().unwrap_or(&t.storage_key);
+                    ws.server_writes.insert(short.to_owned());
+                }
+            }
+        }
+        let mut scope = AuthScope::new();
+        for p in &c.params {
+            let schema_p = auth_env.schema_type_provenance(&p.ty, &mut HashSet::new());
+            match p.kind {
+                HirParamKind::ResWrite => {
+                    if let Ty::Named(ref r) | Ty::Ref(ref r) = p.ty
+                        && is_server_authoritative_key(r, authorities)
+                    {
+                        ws.server_writes.insert(r.clone());
+                    }
+                    if !schema_p.is_empty() {
+                        scope.insert(p.name.clone(), schema_p);
+                    }
+                }
+                HirParamKind::RefMut => {
+                    ws.server_writes.extend(schema_p.deep_comps());
+                    if !schema_p.is_empty() {
+                        scope.insert(p.name.clone(), schema_p);
+                    }
+                }
+                _ => {
+                    if !schema_p.is_empty() {
+                        scope.insert(p.name.clone(), schema_p);
+                    }
+                }
+            }
+        }
+        let mut ctx = ExecCtx::new(&auth_env, false);
+        ctx.eval_stmts(&c.body, &mut scope);
+        ws.server_writes.extend(ctx.server_writes_seen);
+        ws.triggered_events.extend(ctx.triggered_events_seen);
+        ws.started_workflows.extend(ctx.started_workflows_seen);
+        ws.uses_server_res |= ctx.uses_server_res;
+        if let Some(ref ev) = c.trigger_event {
+            let ev_short = ev.rsplit("::").next().unwrap_or(ev).to_owned();
+            obs_summaries.push((c.name.clone(), ev_short, ws));
+        }
+    }
+
+    let mut wf_summaries: HashMap<String, WorkflowSummary> = HashMap::new();
+    for task in tasks {
+        let mut ws = WorkflowSummary::default();
+        let t_short = task
+            .name
+            .rsplit("::")
+            .next()
+            .unwrap_or(&task.name)
+            .to_owned();
+        if server_res_items.contains(&task.name) || server_res_items.contains(&t_short) {
+            ws.uses_server_res = true;
+        }
+        let mut scope = AuthScope::new();
+        for t in &task.typed_on_terms {
+            if t.mode.is_mutable() && is_server_authoritative_key(&t.storage_key, authorities) {
+                let short = t.storage_key.split("::").next().unwrap_or(&t.storage_key);
+                ws.server_writes.insert(short.to_owned());
+            }
+            let tp = auth_env.query_term_prov(t);
+            if !tp.is_empty() {
+                scope.insert(t.alias.clone(), tp);
+            }
+        }
+        let mut ctx = ExecCtx::new(&auth_env, false);
+        for p in &task.typed_params {
+            if let Some(ref def) = p.default {
+                ctx.eval_expr(def, &mut scope);
+            }
+            let sp = auth_env.schema_type_provenance(&p.ty, &mut HashSet::new());
+            if !sp.is_empty() {
+                scope.insert(p.name.clone(), sp);
+            }
+        }
+        for p in &task.typed_using_params {
+            if p.kind == HirParamKind::ResWrite
+                && let Ty::Named(ref r) | Ty::Ref(ref r) = p.ty
+                && is_server_authoritative_key(r, authorities)
+            {
+                ws.server_writes.insert(r.clone());
+            }
+            let sp = auth_env.schema_type_provenance(&p.ty, &mut HashSet::new());
+            if !sp.is_empty() {
+                scope.insert(p.name.clone(), sp);
+            }
+        }
+        ctx.eval_stmts(&task.body, &mut scope);
+        ws.server_writes.extend(ctx.server_writes_seen);
+        ws.triggered_events.extend(ctx.triggered_events_seen);
+        ws.started_workflows.extend(ctx.started_workflows_seen);
+        ws.uses_server_res |= ctx.uses_server_res;
+        wf_summaries.insert(t_short, ws);
+    }
+
+    for fsm in fsms {
+        let mut ws = WorkflowSummary::default();
+        let f_short = fsm.name.rsplit("::").next().unwrap_or(&fsm.name).to_owned();
+        if server_res_items.contains(&fsm.name) || server_res_items.contains(&f_short) {
+            ws.uses_server_res = true;
+        }
+        let mut base_scope = AuthScope::new();
+        for p in &fsm.params {
+            if p.kind == HirParamKind::ResWrite
+                && let Ty::Named(ref r) | Ty::Ref(ref r) = p.ty
+                && is_server_authoritative_key(r, authorities)
+            {
+                ws.server_writes.insert(r.clone());
+            }
+            let sp = auth_env.schema_type_provenance(&p.ty, &mut HashSet::new());
+            if !sp.is_empty() {
+                base_scope.insert(p.name.clone(), sp);
+            }
+        }
+        let mut ctx = ExecCtx::new(&auth_env, false);
+        for st in &fsm.state_hooks {
+            let mut st_scope = base_scope.clone();
+            for (_, _, def) in &st.fields {
+                if let Some(d) = def {
+                    ctx.eval_expr(d, &mut st_scope);
+                }
+            }
+            ctx.eval_stmts(&st.on_enter, &mut st_scope);
+            ctx.eval_stmts(&st.on_tick, &mut st_scope);
+            ctx.eval_stmts(&st.on_exit, &mut st_scope);
+        }
+        for tr in &fsm.typed_transitions {
+            let mut tr_scope = base_scope.clone();
+            ctx.eval_expr(&tr.guard, &mut tr_scope);
+            for (_, v) in &tr.target_args {
+                ctx.eval_expr(v, &mut tr_scope);
+            }
+        }
+        ws.server_writes.extend(ctx.server_writes_seen);
+        ws.triggered_events.extend(ctx.triggered_events_seen);
+        ws.started_workflows.extend(ctx.started_workflows_seen);
+        ws.uses_server_res |= ctx.uses_server_res;
+        wf_summaries.insert(f_short, ws);
+    }
+
+    for tl in timelines {
+        let mut ws = WorkflowSummary::default();
+        let tl_short = tl.name.rsplit("::").next().unwrap_or(&tl.name).to_owned();
+        if server_res_items.contains(&tl.name) || server_res_items.contains(&tl_short) {
+            ws.uses_server_res = true;
+        }
+        let mut ctx = ExecCtx::new(&auth_env, false);
+        for (_, stmts) in &tl.typed_triggers {
+            let mut scope = AuthScope::new();
+            ctx.eval_stmts(stmts, &mut scope);
+        }
+        ws.server_writes.extend(ctx.server_writes_seen);
+        ws.triggered_events.extend(ctx.triggered_events_seen);
+        ws.started_workflows.extend(ctx.started_workflows_seen);
+        ws.uses_server_res |= ctx.uses_server_res;
+        wf_summaries.insert(tl_short, ws);
+    }
+
+    // Bounded fixed-point closure across observers and workflows (`trigger -> obs`, `play/start -> task/fsm/timeline`).
+    for _ in 0..16 {
+        let mut changed = false;
+        let obs_snap = obs_summaries.clone();
+        let wf_snap = wf_summaries.clone();
+        let propagate = |ws: &mut WorkflowSummary| -> bool {
+            let mut c = false;
+            let evs: Vec<String> = ws.triggered_events.iter().cloned().collect();
+            for ev in evs {
+                for (_, obs_ev, obs_ws) in &obs_snap {
+                    if *obs_ev == ev {
+                        for w in &obs_ws.server_writes {
+                            c |= ws.server_writes.insert(w.clone());
+                        }
+                        for e in &obs_ws.triggered_events {
+                            c |= ws.triggered_events.insert(e.clone());
+                        }
+                        for sf in &obs_ws.started_workflows {
+                            c |= ws.started_workflows.insert(sf.clone());
+                        }
+                        if obs_ws.uses_server_res && !ws.uses_server_res {
+                            ws.uses_server_res = true;
+                            c = true;
+                        }
+                    }
+                }
+            }
+            let wfs: Vec<String> = ws.started_workflows.iter().cloned().collect();
+            for wname in wfs {
+                if let Some(target_ws) = wf_snap.get(&wname) {
+                    for w in &target_ws.server_writes {
+                        c |= ws.server_writes.insert(w.clone());
+                    }
+                    for e in &target_ws.triggered_events {
+                        c |= ws.triggered_events.insert(e.clone());
+                    }
+                    for sf in &target_ws.started_workflows {
+                        c |= ws.started_workflows.insert(sf.clone());
+                    }
+                    if target_ws.uses_server_res && !ws.uses_server_res {
+                        ws.uses_server_res = true;
+                        c = true;
+                    }
+                }
+            }
+            c
+        };
+        for (_, _, ws) in &mut obs_summaries {
+            changed |= propagate(ws);
+        }
+        for ws in wf_summaries.values_mut() {
+            changed |= propagate(ws);
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // 3. Enforce E0501 on every non-server callable (`@authority(client)` / `@predicted` / `@authority(shared)`).
     for callable in callables {
         let is_client_restricted = matches!(
             callable.authority,
-            AuthorityKind::Client | AuthorityKind::Predicted
+            AuthorityKind::Client | AuthorityKind::Predicted | AuthorityKind::Shared
         ) || callable.is_predicted;
         if !is_client_restricted {
             continue;
@@ -2423,6 +2999,28 @@ pub(crate) fn validate_module_authority(
                         scope.insert(param.name.clone(), schema_p);
                     }
                 }
+                HirParamKind::Trigger => {
+                    let mut tp = if !schema_p.is_empty() {
+                        schema_p
+                    } else {
+                        Provenance::empty()
+                    };
+                    if let Some(ref tc) = callable.trigger_target_comp
+                        && is_server_authoritative_key(tc, authorities)
+                    {
+                        let short = tc.rsplit("::").next().unwrap_or(tc).to_owned();
+                        tp.fields.insert(
+                            "target".to_owned(),
+                            Provenance {
+                                server_entity_comps: BTreeSet::from([short]),
+                                ..Provenance::default()
+                            },
+                        );
+                    }
+                    if !tp.is_empty() {
+                        scope.insert(param.name.clone(), tp);
+                    }
+                }
                 _ => {
                     if !schema_p.is_empty() {
                         scope.insert(param.name.clone(), schema_p);
@@ -2433,6 +3031,10 @@ pub(crate) fn validate_module_authority(
 
         // 2c. Abstract-interpret callable body using unified provenance lattice.
         let mut ctx = ExecCtx::new(&auth_env, true);
+        let c_short = callable.name.rsplit("::").next().unwrap_or(&callable.name);
+        if server_res_items.contains(&callable.name) || server_res_items.contains(c_short) {
+            ctx.uses_server_res = true;
+        }
         ctx.eval_stmts(&callable.body, &mut scope);
         for (_comp, msg) in ctx.diagnostics {
             diags.push(Diagnostic::error(
@@ -2441,6 +3043,60 @@ pub(crate) fn validate_module_authority(
                 msg,
                 None,
             ));
+        }
+        if ctx.uses_server_res {
+            diags.push(Diagnostic::error(
+                codes::E0501_AUTHORITY_VIOLATION,
+                callable_span.clone(),
+                format!(
+                    "non-server callable `{}` uses `server_res<...>()` to access server-side resource",
+                    callable.name
+                ),
+                None,
+            ));
+        }
+        for ev in &ctx.triggered_events_seen {
+            for (obs_name, obs_ev, obs_ws) in &obs_summaries {
+                if obs_ev == ev && (!obs_ws.server_writes.is_empty() || obs_ws.uses_server_res) {
+                    let writes: Vec<&str> =
+                        obs_ws.server_writes.iter().map(String::as_str).collect();
+                    let detail = if writes.is_empty() {
+                        "server_res".to_owned()
+                    } else {
+                        writes.join(", ")
+                    };
+                    diags.push(Diagnostic::error(
+                        codes::E0501_AUTHORITY_VIOLATION,
+                        callable_span.clone(),
+                        format!(
+                            "non-server callable `{}` triggers `{ev}` handled by observer `{obs_name}` which mutates `@authority(server)` state ({detail})",
+                            callable.name
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
+        for wf in &ctx.started_workflows_seen {
+            if let Some(wf_ws) = wf_summaries.get(wf)
+                && (!wf_ws.server_writes.is_empty() || wf_ws.uses_server_res)
+            {
+                let writes: Vec<&str> = wf_ws.server_writes.iter().map(String::as_str).collect();
+                let detail = if writes.is_empty() {
+                    "server_res".to_owned()
+                } else {
+                    writes.join(", ")
+                };
+                diags.push(Diagnostic::error(
+                    codes::E0501_AUTHORITY_VIOLATION,
+                    callable_span.clone(),
+                    format!(
+                        "non-server callable `{}` starts/plays `{wf}` which mutates `@authority(server)` state ({detail})",
+                        callable.name
+                    ),
+                    None,
+                ));
+            }
         }
     }
 }

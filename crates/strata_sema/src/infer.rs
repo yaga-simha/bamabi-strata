@@ -383,6 +383,49 @@ pub(crate) fn build_array_lit(elems: Vec<HirExpr>, expected: Option<&Ty>) -> Hir
     }
 }
 
+/// Validates an expression's array/SmallVec literal length or capacity against an expected type,
+/// returning a human-readable diagnostic message on mismatch.
+pub(crate) fn check_array_or_smallvec_mismatch(expr: &HirExpr, expected: &Ty) -> Option<String> {
+    match expected {
+        Ty::Array { len: exp_len, .. } => match expr {
+            HirExpr::ArrayLit { elems, .. } if elems.len() != *exp_len => Some(format!(
+                "array literal length mismatch: expected `[_; {exp_len}]` ({exp_len} elements), found {} elements",
+                elems.len()
+            )),
+            HirExpr::ArrayLit { .. }
+            | HirExpr::Block { .. }
+            | HirExpr::If { .. }
+            | HirExpr::Match { .. } => None,
+            _ => match expr.ty() {
+                Ty::Array { len: act_len, .. } if act_len != *exp_len => Some(format!(
+                    "array length mismatch: expected `[_; {exp_len}]`, found `[_; {act_len}]`"
+                )),
+                _ => None,
+            },
+        },
+        Ty::SmallVec { cap: exp_cap, .. } => match expr {
+            HirExpr::ArrayLit { elems, .. } if elems.len() > *exp_cap => Some(format!(
+                "SmallVec literal exceeds capacity: capacity is {exp_cap}, found {} elements",
+                elems.len()
+            )),
+            HirExpr::ArrayLit { .. }
+            | HirExpr::Block { .. }
+            | HirExpr::If { .. }
+            | HirExpr::Match { .. } => None,
+            _ => match expr.ty() {
+                Ty::Array { len: act_len, .. } if act_len > *exp_cap => Some(format!(
+                    "array length ({act_len}) exceeds SmallVec capacity ({exp_cap})"
+                )),
+                Ty::SmallVec { cap: act_cap, .. } if act_cap > *exp_cap => Some(format!(
+                    "SmallVec capacity mismatch: expected capacity `<= {exp_cap}`, found `SmallVec<_, {act_cap}>`"
+                )),
+                _ => None,
+            },
+        },
+        _ => None,
+    }
+}
+
 /// Resolves the element type of an indexing expression `base[index]`.
 pub(crate) fn resolve_index_ty(base: &HirExpr, env: &LowerEnv<'_>) -> Ty {
     if let HirExpr::Path { name, .. } = base

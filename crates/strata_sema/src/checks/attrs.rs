@@ -8,6 +8,7 @@ use crate::hir::{
 use crate::hir_lower::is_expr_node;
 use crate::types::{Ty, UnitDim, parse_type_node};
 use indexmap::IndexMap;
+use std::collections::{HashMap, HashSet};
 use strata_syntax::ast::{self, AstNode, ComponentDecl, SourceFile};
 use strata_syntax::{SyntaxKind, SyntaxNode};
 
@@ -1614,6 +1615,83 @@ pub(super) fn register_component_authority(
     }
 }
 
+/// Direct field type-short-names and per-field `@quantize` attributes collected from a `struct`.
+#[derive(Debug, Clone, Default)]
+pub(super) struct StructQuantizeDef {
+    pub(super) fields: Vec<(String, Option<String>)>,
+    pub(super) quantizes: HashMap<String, HirQuantizeSpec>,
+}
+
+fn extract_field_type_short(fd: &ast::FieldDecl) -> Option<String> {
+    let tn = fd.type_node()?;
+    if tn.kind() == SyntaxKind::TypeRef {
+        return ast::child::<ast::Path>(&tn)
+            .map(|p| ast::path_text(&p))
+            .and_then(|s| s.rsplit("::").next().map(str::to_owned));
+    }
+    None
+}
+
+/// Collects every `struct`'s field type map and `@quantize(...)` attributes for nested wire
+/// metadata flattening into [`NetComponentMeta`] and [`crate::hir::HirRpc`].
+pub(super) fn collect_struct_quantize_map(sf: &SourceFile) -> HashMap<String, StructQuantizeDef> {
+    let mut map = HashMap::new();
+    for item in sf.items() {
+        if let ast::Item::Struct(st) = item {
+            let Some(sname) = st.name().map(|t| t.text().to_owned()) else {
+                continue;
+            };
+            let mut def = StructQuantizeDef::default();
+            for fd in st.fields() {
+                let fname = fd
+                    .name()
+                    .map_or_else(|| "_".to_owned(), |t| t.text().to_owned());
+                let fty = extract_field_type_short(&fd);
+                for attr in fd.attributes() {
+                    if ast::attr_name(&attr).as_deref() == Some("quantize")
+                        && let Some(spec) = parse_quantize_attr("", "", &sname, &fname, &attr, None)
+                    {
+                        def.quantizes.insert(fname.clone(), spec);
+                    }
+                }
+                def.fields.push((fname, fty));
+            }
+            map.insert(sname, def);
+        }
+    }
+    map
+}
+
+/// Recursively flattens `@quantize(...)` specs from nested `struct` fields using dotted paths
+/// (e.g. `"sub.x"`).
+pub(super) fn append_nested_struct_quantizes(
+    field_name: &str,
+    type_short: Option<&str>,
+    struct_map: &HashMap<String, StructQuantizeDef>,
+    visited: &mut HashSet<String>,
+    out: &mut Vec<HirQuantizeSpec>,
+) {
+    let Some(tname) = type_short else {
+        return;
+    };
+    let Some(def) = struct_map.get(tname) else {
+        return;
+    };
+    if !visited.insert(tname.to_owned()) {
+        return;
+    }
+    for (sub_name, sub_ty) in &def.fields {
+        let dotted = format!("{field_name}.{sub_name}");
+        if let Some(spec) = def.quantizes.get(sub_name) {
+            let mut nested_spec = spec.clone();
+            nested_spec.field_name = dotted.clone();
+            out.push(nested_spec);
+        }
+        append_nested_struct_quantizes(&dotted, sub_ty.as_deref(), struct_map, visited, out);
+    }
+    visited.remove(tname);
+}
+
 pub(super) fn collect_net_component_meta(
     module_path: &str,
     short: &str,
@@ -1621,6 +1699,7 @@ pub(super) fn collect_net_component_meta(
     is_resource: bool,
     authority: AuthorityKind,
     is_predicted: bool,
+    struct_map: &HashMap<String, StructQuantizeDef>,
 ) -> Option<NetComponentMeta> {
     let net_config = ast::attrs(node)
         .into_iter()
@@ -1647,6 +1726,15 @@ pub(super) fn collect_net_component_meta(
                 quantized_fields.push(spec);
             }
         }
+        let fty_short = extract_field_type_short(&fd);
+        let mut visited = HashSet::new();
+        append_nested_struct_quantizes(
+            &fname,
+            fty_short.as_deref(),
+            struct_map,
+            &mut visited,
+            &mut quantized_fields,
+        );
     }
 
     if !is_replicated

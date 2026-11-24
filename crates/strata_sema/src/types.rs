@@ -812,9 +812,173 @@ fn parse_typeref_node(node: &SyntaxNode, user_types: &HashSet<String>) -> Ty {
     }
 }
 
+fn parse_int_lit_i128(text: &str) -> Option<i128> {
+    const SUFFIXES: [&str; 12] = [
+        "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8",
+    ];
+    let mut base = text;
+    for sfx in SUFFIXES {
+        if let Some(stripped) = base.strip_suffix(sfx) {
+            base = stripped;
+            break;
+        }
+    }
+    let (radix, body) = if let Some(b) = base.strip_prefix("0x").or_else(|| base.strip_prefix("0X"))
+    {
+        (16, b)
+    } else if let Some(b) = base.strip_prefix("0b").or_else(|| base.strip_prefix("0B")) {
+        (2, b)
+    } else if let Some(b) = base.strip_prefix("0o").or_else(|| base.strip_prefix("0O")) {
+        (8, b)
+    } else {
+        (10, base)
+    };
+    let clean: String = body.chars().filter(|&c| c != '_').collect();
+    if clean.is_empty() || clean.starts_with('+') || clean.starts_with('-') {
+        return None;
+    }
+    i128::from_str_radix(&clean, radix).ok()
+}
+
 fn parse_int_lit_token(t: &SyntaxToken) -> Option<usize> {
-    let raw = t.text().split('_').next().unwrap_or("");
-    raw.parse::<usize>().ok()
+    let val = parse_int_lit_i128(t.text())?;
+    usize::try_from(val).ok()
+}
+
+fn eval_const_int_node(node: &SyntaxNode) -> Option<i128> {
+    match node.kind() {
+        SyntaxKind::LiteralExpr => {
+            let tok = node
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .find(|t| !t.kind().is_trivia())?;
+            if tok.kind() == SyntaxKind::IntLit {
+                parse_int_lit_i128(tok.text())
+            } else {
+                None
+            }
+        }
+        SyntaxKind::ParenExpr => {
+            let mut inner: Option<SyntaxNode> = None;
+            for el in node.children_with_tokens() {
+                if let Some(t) = el.as_token() {
+                    if t.kind().is_trivia()
+                        || matches!(t.kind(), SyntaxKind::LParen | SyntaxKind::RParen)
+                    {
+                        continue;
+                    }
+                    return None;
+                } else if let Some(n) = el.as_node() {
+                    if inner.is_some() {
+                        return None;
+                    }
+                    inner = Some(n.clone());
+                }
+            }
+            eval_const_int_node(&inner?)
+        }
+        SyntaxKind::PrefixExpr => {
+            let mut op: Option<SyntaxKind> = None;
+            let mut operand: Option<SyntaxNode> = None;
+            for el in node.children_with_tokens() {
+                if let Some(t) = el.as_token() {
+                    if t.kind().is_trivia() {
+                        continue;
+                    }
+                    if op.is_none() && operand.is_none() {
+                        op = Some(t.kind());
+                    } else {
+                        return None;
+                    }
+                } else if let Some(n) = el.as_node() {
+                    if op.is_some() && operand.is_none() {
+                        operand = Some(n.clone());
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            let val = eval_const_int_node(&operand?)?;
+            match op? {
+                SyntaxKind::Plus => Some(val),
+                SyntaxKind::Minus => val.checked_neg(),
+                _ => None,
+            }
+        }
+        SyntaxKind::BinaryExpr => {
+            let mut lhs: Option<SyntaxNode> = None;
+            let mut op: Option<SyntaxKind> = None;
+            let mut rhs: Option<SyntaxNode> = None;
+            for el in node.children_with_tokens() {
+                if let Some(t) = el.as_token() {
+                    if t.kind().is_trivia() {
+                        continue;
+                    }
+                    if lhs.is_some() && op.is_none() && rhs.is_none() {
+                        op = Some(t.kind());
+                    } else {
+                        return None;
+                    }
+                } else if let Some(n) = el.as_node() {
+                    if lhs.is_none() {
+                        lhs = Some(n.clone());
+                    } else if op.is_some() && rhs.is_none() {
+                        rhs = Some(n.clone());
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            let l = eval_const_int_node(&lhs?)?;
+            let r = eval_const_int_node(&rhs?)?;
+            match op? {
+                SyntaxKind::Plus => l.checked_add(r),
+                SyntaxKind::Minus => l.checked_sub(r),
+                SyntaxKind::Star => l.checked_mul(r),
+                SyntaxKind::Slash => (r != 0).then(|| l.checked_div(r)).flatten(),
+                SyntaxKind::Percent => (r != 0).then(|| l.checked_rem(r)).flatten(),
+                SyntaxKind::Shl => u32::try_from(r)
+                    .ok()
+                    .filter(|&s| s < 128)
+                    .and_then(|s| l.checked_shl(s)),
+                SyntaxKind::Shr => u32::try_from(r)
+                    .ok()
+                    .filter(|&s| s < 128)
+                    .and_then(|s| l.checked_shr(s)),
+                SyntaxKind::Amp => Some(l & r),
+                SyntaxKind::Pipe => Some(l | r),
+                SyntaxKind::Caret => Some(l ^ r),
+                _ => None,
+            }
+        }
+        SyntaxKind::TypeRef => {
+            let mut tok_val: Option<i128> = None;
+            let mut node_val: Option<i128> = None;
+            let mut count = 0usize;
+            for el in node.children_with_tokens() {
+                if let Some(t) = el.as_token() {
+                    if t.kind().is_trivia() {
+                        continue;
+                    }
+                    count += 1;
+                    if t.kind() == SyntaxKind::IntLit {
+                        tok_val = parse_int_lit_i128(t.text());
+                    } else {
+                        return None;
+                    }
+                } else if let Some(n) = el.as_node() {
+                    count += 1;
+                    node_val = eval_const_int_node(n);
+                }
+            }
+            if count == 1 {
+                tok_val.or(node_val)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 fn extract_array_len(node: &SyntaxNode) -> Option<usize> {
@@ -827,15 +991,15 @@ fn extract_array_len(node: &SyntaxNode) -> Option<usize> {
             continue;
         }
         if let Some(t) = el.as_token() {
-            if t.kind() == SyntaxKind::IntLit
-                && let Some(val) = parse_int_lit_token(t)
-            {
-                return Some(val);
+            if t.kind().is_trivia() {
+                continue;
             }
-        } else if let Some(n) = el.as_node()
-            && let Some(val) = extract_first_int_in_node(n)
-        {
-            return Some(val);
+            if t.kind() == SyntaxKind::IntLit {
+                return parse_int_lit_token(t);
+            }
+            return None;
+        } else if let Some(n) = el.as_node() {
+            return eval_const_int_node(n).and_then(|v| usize::try_from(v).ok());
         }
     }
     None
@@ -843,34 +1007,41 @@ fn extract_array_len(node: &SyntaxNode) -> Option<usize> {
 
 fn extract_generic_arg_int(gen_args: &SyntaxNode, arg_index: usize) -> Option<usize> {
     let mut current_arg = 0usize;
+    let mut val: Option<usize> = None;
+    let mut count = 0usize;
     for el in gen_args.children_with_tokens() {
         if let Some(t) = el.as_token() {
+            if t.kind().is_trivia() || matches!(t.kind(), SyntaxKind::Lt | SyntaxKind::Gt) {
+                continue;
+            }
             if t.kind() == SyntaxKind::Comma {
+                if current_arg == arg_index {
+                    return if count == 1 { val } else { None };
+                }
                 current_arg += 1;
                 if current_arg > arg_index {
                     break;
                 }
-            } else if current_arg == arg_index
-                && t.kind() == SyntaxKind::IntLit
-                && let Some(val) = parse_int_lit_token(t)
-            {
-                return Some(val);
+            } else if current_arg == arg_index {
+                count += 1;
+                if t.kind() == SyntaxKind::IntLit {
+                    val = parse_int_lit_token(t);
+                } else {
+                    return None;
+                }
             }
         } else if let Some(n) = el.as_node()
             && current_arg == arg_index
-            && let Some(val) = extract_first_int_in_node(n)
         {
-            return Some(val);
+            count += 1;
+            val = eval_const_int_node(n).and_then(|v| usize::try_from(v).ok());
         }
     }
-    None
-}
-
-fn extract_first_int_in_node(node: &SyntaxNode) -> Option<usize> {
-    node.descendants_with_tokens()
-        .filter_map(|e| e.into_token())
-        .find(|t| t.kind() == SyntaxKind::IntLit)
-        .and_then(|t| parse_int_lit_token(&t))
+    if current_arg == arg_index && count == 1 {
+        val
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -921,5 +1092,18 @@ mod tests {
             })
         );
         assert_eq!(Ty::unit_from_literal("42"), None);
+    }
+
+    /// Verifies integer literal radix/separator parsing and constant integer arithmetic.
+    #[test]
+    fn int_literal_and_const_expr_parsing() {
+        assert_eq!(parse_int_lit_i128("1_024"), Some(1024));
+        assert_eq!(parse_int_lit_i128("1_28"), Some(128));
+        assert_eq!(parse_int_lit_i128("0x10"), Some(16));
+        assert_eq!(parse_int_lit_i128("0xFF_FFu32"), Some(65535));
+        assert_eq!(parse_int_lit_i128("0b100"), Some(4));
+        assert_eq!(parse_int_lit_i128("0o10"), Some(8));
+        assert_eq!(parse_int_lit_i128("0x"), None);
+        assert_eq!(parse_int_lit_i128("0b102"), None);
     }
 }

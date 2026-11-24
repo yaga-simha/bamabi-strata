@@ -12,8 +12,9 @@ use crate::hir::{
 };
 use crate::hir_lower::{
     LowerEnv, ScopeBinding, ScopeStack, is_expr_node, is_type_node, lower_block,
-    lower_block_as_stmts, lower_comp_init_list, lower_expr, lower_field_init_list,
-    lower_fsm_details, lower_param_list, lower_proj_term, lower_stmt_node, lower_sys_param_list,
+    lower_block_as_stmts, lower_comp_init_list, lower_expr, lower_expr_with_expected,
+    lower_field_init_list, lower_fsm_details, lower_param_list, lower_proj_term, lower_stmt_node,
+    lower_sys_param_list,
 };
 use crate::layout::{EnumDef, LayoutEnv, SchemaItemKind, SolvedLayout, solve_pod_layout};
 use crate::types::{QueryRowTerm, Ty, UnitDim, parse_type_node, parse_type_node_with_user_types};
@@ -38,8 +39,10 @@ pub(super) fn analyze_const(
     let name = ast::first_ident(node)?.text().to_owned();
     let ty = node
         .children()
-        .find(|c| matches!(c.kind(), SyntaxKind::TypeRef | SyntaxKind::ArrayType))
-        .map_or(Ty::Unknown, |n| parse_type_node(&n));
+        .find(|c| is_type_node(c.kind()))
+        .map_or(Ty::Unknown, |n| {
+            parse_type_node_with_user_types(&n, lower_env.user_types)
+        });
     let full = node.text().to_string();
     let value_expr = full
         .split_once('=')
@@ -53,7 +56,13 @@ pub(super) fn analyze_const(
         match el {
             NodeOrToken::Token(tok) if tok.kind() == SyntaxKind::Eq => saw_eq = true,
             NodeOrToken::Node(n) if saw_eq && is_expr_node(n.kind()) => {
-                expr = Some(lower_expr(&n, lower_env, &mut scope, &[]));
+                expr = Some(lower_expr_with_expected(
+                    &n,
+                    lower_env,
+                    &mut scope,
+                    &[],
+                    (ty != Ty::Unknown).then_some(&ty),
+                ));
                 break;
             }
             _ => {}
@@ -1522,12 +1531,27 @@ pub(super) fn parse_schedule_group(node: &SyntaxNode) -> HirScheduleGroup {
     } else {
         ast::first_ident(node).map_or_else(String::new, |t| t.text().to_owned())
     };
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for m in ast::children::<ast::ScheduleMod>(node) {
+        let targets: Vec<String> = ast::children::<ast::Path>(m.syntax())
+            .map(|p| ast::path_text(&p))
+            .filter(|t| !t.is_empty())
+            .collect();
+        match m.kind() {
+            Some(ast::ScheduleModKind::Before) => before.extend(targets),
+            Some(ast::ScheduleModKind::After) => after.extend(targets),
+            _ => {}
+        }
+    }
     let children = ast::children::<ast::ScheduleNode>(node)
         .map(|c| parse_schedule_group(c.syntax()))
         .collect();
     HirScheduleGroup {
         kind,
         name,
+        before,
+        after,
         children,
     }
 }
@@ -1574,7 +1598,12 @@ pub(super) fn analyze_sim_test(
     }
 }
 
-pub(super) fn analyze_rpc(module_path: &str, rpc: &ast::RpcDecl, env: &mut LayoutEnv) -> HirRpc {
+pub(super) fn analyze_rpc(
+    module_path: &str,
+    rpc: &ast::RpcDecl,
+    env: &mut LayoutEnv,
+    struct_map: &HashMap<String, StructQuantizeDef>,
+) -> HirRpc {
     let name = rpc
         .name()
         .map_or_else(|| "Rpc".to_owned(), |t| t.text().to_owned());
@@ -1597,6 +1626,17 @@ pub(super) fn analyze_rpc(module_path: &str, rpc: &ast::RpcDecl, env: &mut Layou
             {
                 quantized_fields.push(spec);
             }
+        }
+        if let Ty::Named(ref sname) = fty {
+            let short_t = sname.rsplit("::").next().unwrap_or(sname);
+            let mut visited = HashSet::new();
+            append_nested_struct_quantizes(
+                &fname,
+                Some(short_t),
+                struct_map,
+                &mut visited,
+                &mut quantized_fields,
+            );
         }
         fields.push((fname, fty));
     }
@@ -3385,10 +3425,19 @@ fn validate_no_query_handle_reassign(
                         walk_expr(radius, item_name, span, scopes, diags);
                         bind_handle_pattern(&f.binding, None, scopes);
                     }
-                    HirForIter::SpatialSegmentAt { tick, p0, p1, .. } => {
+                    HirForIter::SpatialSegmentAt {
+                        tick,
+                        p0,
+                        p1,
+                        radius,
+                        ..
+                    } => {
                         walk_expr(tick, item_name, span, scopes, diags);
                         walk_expr(p0, item_name, span, scopes, diags);
                         walk_expr(p1, item_name, span, scopes, diags);
+                        if let Some(r) = radius {
+                            walk_expr(r, item_name, span, scopes, diags);
+                        }
                         bind_handle_pattern(&f.binding, None, scopes);
                     }
                     HirForIter::Range { start, end, .. } => {

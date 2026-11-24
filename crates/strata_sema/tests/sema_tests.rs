@@ -1203,7 +1203,7 @@ component Unmarked { v: f32 = 0.0 }
 sys server_writer(cfg: &mut res ServerCfg) {
     cfg.speed = 10.0;
     for a in query(p: &mut AuthPos) {
-        p.p.x += cfg.speed;
+        a.p.x += cfg.speed;
     }
 }
 
@@ -9235,4 +9235,608 @@ component Iter10Pod {
 
     // 16 + 32 + 24 + 64 + 32 + 24 + 40 + 32 = 264 (all 4-aligned, zero padding)
     assert_eq!(layout.size, 264);
+}
+
+#[test]
+fn bug_tl_10_int_radix_separators_const_exprs_and_array_smallvec_mismatches() {
+    use strata_sema::types::Ty;
+    let ok_src = r#"
+module test::tl10_ok @version(1.0.0);
+
+component Holders {
+    big: [u32; 1_024],
+    bs: BitSet<1_28>,
+    sv: SmallVec<u32, 1_6>,
+    istr: InlineStr<1_6>,
+    hex_arr: [u8; 0x10],
+    bin_arr: [u8; 0b100],
+    oct_arr: [u8; 0o10],
+    arith_arr: [f32; 2 + 2],
+    nested_arith: [f32; 2 * (3 + 1)],
+}
+
+struct Bag {
+    arr: [f32; 2],
+}
+
+fn take_arr(a: [f32; 2]) -> [f32; 2] {
+    return a;
+}
+
+sys ok_lits() {
+    let a: [f32; 2 + 2] = [1.0, 2.0, 3.0, 4.0];
+    let mut m: [[f32; 2]; 2] = [[1.0, 2.0], [3.0, 4.0]];
+    m = [[5.0, 6.0], [7.0, 8.0]];
+    let sv: SmallVec<u32, 4> = [1, 2];
+    let bag = Bag { arr: [1.0, 2.0] };
+    let r = take_arr(bag.arr);
+    let _ = (a, m, sv, r);
+}
+"#;
+    let ok_mod = analyze_source("tl10_ok.strata", ok_src);
+    assert!(ok_mod.ok(), "tl10_ok failed: {:#?}", ok_mod.diagnostics);
+    let layout = &ok_mod.layouts["test::tl10_ok::Holders"];
+    let fty = |name: &str| {
+        layout
+            .fields
+            .iter()
+            .find(|f| f.name == name)
+            .expect(name)
+            .ty
+            .clone()
+    };
+    assert_eq!(
+        fty("big"),
+        Ty::Array {
+            elem: Box::new(Ty::U32),
+            len: 1024
+        }
+    );
+    assert_eq!(fty("bs"), Ty::BitSet(128));
+    assert_eq!(
+        fty("sv"),
+        Ty::SmallVec {
+            elem: Box::new(Ty::U32),
+            cap: 16
+        }
+    );
+    assert_eq!(fty("istr"), Ty::InlineStr(16));
+    assert_eq!(
+        fty("hex_arr"),
+        Ty::Array {
+            elem: Box::new(Ty::U8),
+            len: 16
+        }
+    );
+    assert_eq!(
+        fty("bin_arr"),
+        Ty::Array {
+            elem: Box::new(Ty::U8),
+            len: 4
+        }
+    );
+    assert_eq!(
+        fty("oct_arr"),
+        Ty::Array {
+            elem: Box::new(Ty::U8),
+            len: 8
+        }
+    );
+    assert_eq!(
+        fty("arith_arr"),
+        Ty::Array {
+            elem: Box::new(Ty::F32),
+            len: 4
+        }
+    );
+    assert_eq!(
+        fty("nested_arith"),
+        Ty::Array {
+            elem: Box::new(Ty::F32),
+            len: 8
+        }
+    );
+
+    let bad_cases = [
+        ("overlong", "sys s() { let a: [f32; 2] = [1.0, 2.0, 3.0]; }"),
+        ("underlong", "sys s() { let a: [f32; 4] = [1.0, 2.0]; }"),
+        (
+            "nested_inner",
+            "sys s() { let m: [[f32; 2]; 2] = [[1.0, 2.0, 3.0], [4.0, 5.0]]; }",
+        ),
+        (
+            "smallvec_overflow",
+            "sys s() { let v: SmallVec<u32, 2> = [1, 2, 3, 4]; }",
+        ),
+        (
+            "struct_field_init",
+            "struct Bag { arr: [f32; 2] } sys s() { let _b = Bag { arr: [1.0, 2.0, 3.0] }; }",
+        ),
+        (
+            "spawn_comp_init",
+            "component BoxC { arr: [f32; 2] } sys s() { spawn { BoxC { arr: [1.0] } }; }",
+        ),
+        (
+            "fn_arg",
+            "fn f(a: [f32; 2]) {} sys s() { f([1.0, 2.0, 3.0]); }",
+        ),
+        ("fn_ret", "fn f() -> [f32; 2] { return [1.0, 2.0, 3.0]; }"),
+    ];
+    for (name, body) in bad_cases {
+        let src = format!("module test::{name} @version(1.0.0);\n{body}\n");
+        let res = analyze_source(format!("{name}.strata"), &src);
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.severity == strata_sema::diagnostics::Severity::Error
+                    && d.code == codes::E0111_TYPE_MISMATCH),
+            "{name}: expected E0111_TYPE_MISMATCH, got: {:#?}",
+            res.diagnostics
+        );
+    }
+}
+
+#[test]
+fn bug_sw_01a_07c_and_eq_07_08_hir_and_query_diagnostics() {
+    use strata_sema::hir::{HirExpr, HirForIter, HirStmt};
+
+    let src = r#"
+module test::sw_eq @version(1.0.0);
+
+component Pos { p: vec3 = vec3(0.0, 0.0, 0.0) }
+component Item { id: i32 = 1, val: i32 = 2 }
+spatial_history Hist3D(frames: 8) over Pos by Pos.p;
+
+sys sweep_and_added(h: &Hist3D) {
+    for _hit in h.query_segment_at(0, vec3(0.0, 0.0, 0.0), vec3(10.0, 0.0, 0.0), 3.0_m) {
+    }
+    for _hit3 in h.query_segment_at(0, vec3(0.0, 0.0, 0.0), vec3(10.0, 0.0, 0.0)) {
+    }
+    for _r in query(i: &Item).added<Item>() {
+    }
+}
+
+sys valid_item_access() {
+    for r in query(p: &mut Item) {
+        r.p.val += 5;
+        p.val += 1;
+    }
+}
+
+sys m1() {}
+sys m2() {}
+sys s1() {}
+sys s2() {}
+
+schedule FixedUpdate {
+    seq Outer {
+        m2 after(m1)
+        m1
+        set Phys before(Audio) after(Input) {
+            s1 before(s2)
+            s2
+        }
+    }
+}
+"#;
+    let m = analyze_source("sw_eq.strata", src);
+    assert!(m.ok(), "sw_eq failed: {:#?}", m.diagnostics);
+
+    let sys = m
+        .callables
+        .iter()
+        .find(|c| c.name == "sweep_and_added")
+        .expect("sweep_and_added");
+    assert_eq!(sys.body.len(), 3);
+    match &sys.body[0] {
+        HirStmt::Expr(HirExpr::For(f)) => match &f.iter {
+            HirForIter::SpatialSegmentAt { radius, .. } => {
+                assert!(radius.is_some(), "expected 4th arg radius preserved");
+            }
+            other => panic!("expected SpatialSegmentAt, got {other:?}"),
+        },
+        other => panic!("expected For, got {other:?}"),
+    }
+    match &sys.body[1] {
+        HirStmt::Expr(HirExpr::For(f)) => match &f.iter {
+            HirForIter::SpatialSegmentAt { radius, .. } => {
+                assert!(radius.is_none(), "expected 3-arg radius to be None");
+            }
+            other => panic!("expected SpatialSegmentAt, got {other:?}"),
+        },
+        other => panic!("expected For, got {other:?}"),
+    }
+    match &sys.body[2] {
+        HirStmt::Expr(HirExpr::For(f)) => match &f.iter {
+            HirForIter::Query(q) => {
+                assert_eq!(q.added_filters, vec!["Item".to_owned()]);
+            }
+            other => panic!("expected Query, got {other:?}"),
+        },
+        other => panic!("expected For, got {other:?}"),
+    }
+
+    let sched = &m.schedules[0];
+    let outer = &sched.nodes[0];
+    assert_eq!(outer.children[0].name, "m2");
+    assert_eq!(outer.children[0].after, vec!["m1".to_owned()]);
+    assert_eq!(outer.children[2].name, "Phys");
+    assert_eq!(outer.children[2].before, vec!["Audio".to_owned()]);
+    assert_eq!(outer.children[2].after, vec!["Input".to_owned()]);
+    assert_eq!(outer.children[2].children[0].before, vec!["s2".to_owned()]);
+
+    // EQ-08 negative controls
+    for (name, body) in [
+        (
+            "misbound_p_p_val",
+            "for r in query(p: &mut Item) { p.p.val += 5; }",
+        ),
+        (
+            "unknown_row_term",
+            "for r in query(p: &mut Item) { r.q.val += 5; }",
+        ),
+        (
+            "unknown_comp_field",
+            "for r in query(p: &mut Item) { r.p.missing += 5; }",
+        ),
+        (
+            "unknown_row_field",
+            "for r in query(p: &mut Item) { r.missing += 5; }",
+        ),
+    ] {
+        let bad = format!(
+            "module test::{name} @version(1.0.0);\ncomponent Item {{ id: i32 = 1, val: i32 = 2 }}\nsys bad() {{ {body} }}\n"
+        );
+        let res = analyze_source(format!("{name}.strata"), &bad);
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code == codes::E0301_UNRESOLVED_SYMBOL),
+            "{name}: expected E0301_UNRESOLVED_SYMBOL, got: {:#?}",
+            res.diagnostics
+        );
+    }
+}
+
+#[test]
+fn pm_06_and_pm_15_par_read_only_and_helper_res_writes() {
+    // PM-15 rejected cases
+    for (name, body) in [
+        (
+            "ro_mut",
+            "@par(read_only, chunk = 4) sys bad() { for row in query(w: &mut Worker) { row.w.x += 1.0; } }",
+        ),
+        (
+            "ro_sel_mut",
+            "@par(read_only, chunk = 4) sys bad() { for row in query(w: &mut? Worker) { row.w.x += 1.0; } }",
+        ),
+        (
+            "ro_reduce_mut",
+            "@par(read_only, chunk = 4) sys bad() { let _s = for row in query(w: &mut Worker) reduce(acc: sum(0.0, row.w.x)); }",
+        ),
+    ] {
+        let src = format!(
+            "module test::{name} @version(1.0.0);\ncomponent Worker {{ x: f32 = 0.0 }}\n{body}\n"
+        );
+        let res = analyze_source(format!("{name}.strata"), &src);
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code == codes::E0202_ASSERT_PAR_FAILED),
+            "{name}: expected E0202_ASSERT_PAR_FAILED, got: {:#?}",
+            res.diagnostics
+        );
+    }
+
+    // PM-15 allowed control (par_ro_outbox pattern + sel_reduce without read_only) + PM-06 propagation
+    let ok_src = r#"
+module test::pm_ok @version(1.0.0);
+
+component Worker { x: f32 = 0.0 }
+component OutBox { total: f32 = 0.0 }
+resource Counter { val: u32 = 0 }
+
+fn leaf_bump() {
+    res_mut<Counter>().val += 1;
+}
+
+fn mid_bump() {
+    leaf_bump();
+}
+
+@par(read_only, chunk = 512)
+sys par_ro_outbox() {
+    let s = for e in query(w: &Worker) reduce(acc: sum(0.0, e.w.x));
+    for o in query(ob: &mut OutBox) {
+        o.ob.total = s;
+    }
+}
+
+@par(chunk = 256)
+sys par_sel_reduce() {
+    let _s = for e in query(w: &mut? Worker) reduce(acc: sum(0.0, e.w.x));
+}
+
+@par(chunk = 4)
+sys sneaky_par() {
+    for row in query(w: &mut Worker) {
+        mid_bump();
+        row.w.x += 1.0;
+    }
+}
+
+sys read_counter(c: &res Counter) {
+    let _v = c.val;
+}
+
+assert_par(sneaky_par, read_counter);
+"#;
+    let res = analyze_source("pm_ok.strata", ok_src);
+    let sneaky = res
+        .callables
+        .iter()
+        .find(|c| c.name == "sneaky_par")
+        .expect("sneaky_par");
+    assert!(
+        sneaky.access.res_writes.contains("Counter"),
+        "expected transitive res_writes to contain Counter, got: {:?}",
+        sneaky.access.res_writes
+    );
+    // sneaky_par + par_ro_outbox + par_sel_reduce produce zero E0202 by themselves; ONLY assert_par(sneaky_par, read_counter) triggers E0202!
+    let e0202: Vec<_> = res
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == codes::E0202_ASSERT_PAR_FAILED)
+        .collect();
+    assert_eq!(
+        e0202.len(),
+        1,
+        "expected exactly 1 assert_par E0202, got: {e0202:#?}"
+    );
+    assert!(
+        e0202[0]
+            .message
+            .contains("assert_par(sneaky_par, read_counter)")
+    );
+}
+
+#[test]
+fn nt_02_authority_shared_despawn_observer_and_workflow_isolation() {
+    let base_schema = r#"
+@authority(server)
+component ServerHp { hp: f32 = 100.0 }
+@authority(server)
+resource ServerBank { gold: u32 = 10 }
+@authority(shared)
+resource SharedGold { gold: u32 = 10 }
+@authority(client)
+component ClientTag { flag: bool = true }
+event CheatEvt { val: u32 = 1 }
+"#;
+
+    let bypasses = [
+        (
+            "shared_sys_writes_server_comp",
+            "@authority(shared) sys cheat() { for r in query(h: &mut ServerHp) { r.h.hp = 0.0; } }",
+        ),
+        (
+            "shared_sys_writes_server_res",
+            "@authority(shared) sys cheat(b: &mut res ServerBank) { b.gold = 999; }",
+        ),
+        (
+            "client_sys_server_res_shared_gold",
+            "@authority(client) sys cheat() { server_res<SharedGold>().gold = 9999; }",
+        ),
+        (
+            "client_sys_despawns_server_entity",
+            "@authority(client) sys cheat() { for r in query(h: &ServerHp) { despawn(r.id); } }",
+        ),
+        (
+            "client_sys_despawns_server_entity_via_fn",
+            "fn kill(e: Entity) { despawn(e); }\n@authority(client) sys cheat() { for r in query(h: &ServerHp) { kill(r.id); } }",
+        ),
+        (
+            "client_sys_triggers_server_mutating_obs",
+            "obs on_cheat(t: &Trigger<CheatEvt>, b: &mut res ServerBank) { b.gold = t.payload.val; }\n@authority(client) sys cheat() { trigger(CheatEvt { val: 777 }); }",
+        ),
+        (
+            "client_sys_starts_server_mutating_task",
+            "task CheatTask() using (b: &mut res ServerBank) { b.gold = 555; }\n@authority(client) sys cheat() { for r in query(c: &ClientTag) { insert(r.id, CheatTask::start()); } }",
+        ),
+        (
+            "client_sys_starts_server_mutating_fsm",
+            "fsm CheatFsm(b: &mut res ServerBank) { initial A; state A { on_tick { b.gold = 666; } } }\n@authority(client) sys cheat() { for r in query(c: &ClientTag) { insert(r.id, CheatFsm::start()); } }",
+        ),
+        (
+            "client_sys_starts_server_mutating_timeline",
+            "timeline CheatTl(rate: 60_hz, duration: 10_f) { at 1_f => res_mut<ServerBank>().gold = 888; }\n@authority(client) sys cheat() { play(CheatTl); }",
+        ),
+    ];
+
+    for (name, body) in bypasses {
+        let src = format!("module test::{name} @version(1.0.0);\n{base_schema}\n{body}\n");
+        let salsa_mod = {
+            let db = SemaDb::new();
+            let sf = db.new_source(format!("{name}.strata"), src.clone());
+            db.analyze_file(sf)
+        };
+        for (mode, res) in [
+            (
+                "full",
+                std::sync::Arc::new(analyze_source(format!("{name}.strata"), &src)),
+            ),
+            ("salsa", salsa_mod),
+        ] {
+            assert!(
+                res.diagnostics
+                    .iter()
+                    .any(|d| d.code == codes::E0501_AUTHORITY_VIOLATION),
+                "{name} ({mode}): expected E0501_AUTHORITY_VIOLATION, got: {:#?}",
+                res.diagnostics
+            );
+        }
+    }
+
+    // Valid controls: server sys triggering server obs, client sys despawning client entity,
+    // client sys starting client task, client sys mutating shared resource via res_mut.
+    let ok_src = format!(
+        "module test::nt02_ok @version(1.0.0);\n{base_schema}\n
+obs on_srv(t: &Trigger<CheatEvt>, b: &mut res ServerBank) {{ b.gold = t.payload.val; }}
+task ClientTask() {{ yield_tick; }}
+@authority(server)
+sys srv_ok() {{ trigger(CheatEvt {{ val: 42 }}); }}
+@authority(client)
+sys cl_ok() {{
+    res_mut<SharedGold>().gold = 50;
+    for r in query(c: &ClientTag) {{
+        insert(r.id, ClientTask::start());
+        despawn(r.id);
+    }}
+}}
+"
+    );
+    let ok_mod = analyze_source("nt02_ok.strata", &ok_src);
+    assert!(ok_mod.ok(), "nt02_ok failed: {:#?}", ok_mod.diagnostics);
+}
+
+#[test]
+fn nt_10_nested_quantize_effects_and_singleton_resource_aliasing() {
+    // 1. Nested struct `@quantize` preserved in NetComponentMeta & HirRpc with dotted paths
+    let quant_src = r#"
+module test::nested_quant @version(1.0.0);
+
+struct Inner {
+    @quantize(min = -10.0, max = 10.0, bits = 12)
+    z: f32,
+}
+
+struct SubStats {
+    @quantize(min = 0.0, max = 100.0, bits = 8)
+    hp: f32,
+    inner: Inner,
+}
+
+@authority(server)
+@net(reliable, channel = 0)
+component Player {
+    stats: SubStats,
+}
+
+@net_rpc(direction = client_to_server, reliability = reliable, channel = 1)
+rpc MoveRpc {
+    sub: SubStats,
+}
+"#;
+    let qmod = analyze_source("nested_quant.strata", quant_src);
+    assert!(qmod.ok(), "nested_quant failed: {:#?}", qmod.diagnostics);
+    let pmeta = qmod
+        .net_components
+        .iter()
+        .find(|n| n.canonical_name.ends_with("::Player"))
+        .expect("Player net meta");
+    let pnames: Vec<&str> = pmeta
+        .quantized_fields
+        .iter()
+        .map(|q| q.field_name.as_str())
+        .collect();
+    assert_eq!(pnames, vec!["stats.hp", "stats.inner.z"]);
+
+    let rpc_names: Vec<&str> = qmod.rpcs[0]
+        .quantized_fields
+        .iter()
+        .map(|q| q.field_name.as_str())
+        .collect();
+    assert_eq!(rpc_names, vec!["sub.hp", "sub.inner.z"]);
+
+    // 2. Effects mismatches (`insert`, `remove`, `res_mut`, `play`, transitive helper `fn`)
+    for (name, body) in [
+        (
+            "eff_insert",
+            "sys s() effects(reads: [Entity, A]) { for r in query(a: &A) { insert(r.id, B { v: 1 }); } }",
+        ),
+        (
+            "eff_remove",
+            "sys s() effects(reads: [Entity, A]) { for r in query(a: &A) { remove<B>(r.id); } }",
+        ),
+        (
+            "eff_res_mut",
+            "sys s() effects(reads: [A]) { res_mut<Bank>().bal += 1; }",
+        ),
+        (
+            "eff_helper_res_mut",
+            "fn bump() { res_mut<Bank>().bal += 1; }\nsys s() effects(reads: [A]) { bump(); }",
+        ),
+        (
+            "eff_play_tl",
+            "timeline Tl(rate: 60_hz, duration: 5_f) { at 1_f => res_mut<Bank>().bal += 1; }\nsys s() effects(reads: [A]) { play(Tl); }",
+        ),
+    ] {
+        let src = format!(
+            "module test::{name} @version(1.0.0);\ncomponent A {{ x: i32 = 0 }}\ncomponent B {{ v: i32 = 0 }}\nresource Bank {{ bal: i32 = 0 }}\n{body}\n"
+        );
+        let res = analyze_source(format!("{name}.strata"), &src);
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code == codes::E0204_EFFECTS_MISMATCH),
+            "{name}: expected E0204_EFFECTS_MISMATCH, got: {:#?}",
+            res.diagnostics
+        );
+    }
+
+    // 3. Singleton resource aliasing (`&mut res Bank` + `&mut res Bank`, `&res Bank` + `res_mut<Bank>()`,
+    //    `&mut res Bank` + `res<Bank>()`, transitive helper `res_mut`, same-call args)
+    for (name, body) in [
+        (
+            "alias_two_mut_params",
+            "sys bad(a: &mut res Bank, b: &mut res Bank) { a.bal = 1; b.bal = 2; }",
+        ),
+        (
+            "alias_param_ro_and_body_mut",
+            "sys bad(a: &res Bank) { let _x = a.bal; res_mut<Bank>().bal += 1; }",
+        ),
+        (
+            "alias_param_mut_and_body_ro",
+            "sys bad(a: &mut res Bank) { a.bal += res<Bank>().bal; }",
+        ),
+        (
+            "alias_param_ro_and_helper_mut",
+            "fn bump() { res_mut<Bank>().bal += 1; }\nsys bad(a: &res Bank) { let _x = a.bal; bump(); }",
+        ),
+        (
+            "alias_same_call_args",
+            "fn take(a: &mut Bank, b: &mut Bank) {}\nsys bad() { take(res_mut<Bank>(), res_mut<Bank>()); }",
+        ),
+    ] {
+        let src = format!(
+            "module test::{name} @version(1.0.0);\nresource Bank {{ bal: i32 = 0 }}\n{body}\n"
+        );
+        let res = analyze_source(format!("{name}.strata"), &src);
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.code == codes::E0201_ALIASING_CONFLICT),
+            "{name}: expected E0201_ALIASING_CONFLICT, got: {:#?}",
+            res.diagnostics
+        );
+    }
+
+    // Allowed non-aliasing control: `&res Bank` + `res<Bank>()` + sequential `res_mut` statements
+    let ok_alias = r#"
+module test::alias_ok @version(1.0.0);
+resource Bank { bal: i32 = 0 }
+sys ok_reads(a: &res Bank) {
+    let _x = a.bal + res<Bank>().bal;
+}
+sys ok_seq_muts() {
+    res_mut<Bank>().bal += 1;
+    res_mut<Bank>().bal += 2;
+}
+"#;
+    let ok_alias_mod = analyze_source("alias_ok.strata", ok_alias);
+    assert!(
+        ok_alias_mod.ok(),
+        "alias_ok failed: {:#?}",
+        ok_alias_mod.diagnostics
+    );
 }
