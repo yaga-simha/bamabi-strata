@@ -146,6 +146,14 @@ impl<'a> NativeCtx<'a> {
             }
         }
         for func in self.mir.functions.iter().chain(self.mir.fns.iter()) {
+            for p in &func.params {
+                if let Some(ref lk) = p.layout_key {
+                    let base = lk.split('.').next().unwrap_or(lk).trim();
+                    if !base.is_empty() {
+                        candidate_names.insert(strip_filter_wrapper(base));
+                    }
+                }
+            }
             for qb in &func.query_bindings {
                 for wf in &qb.with_filters {
                     candidate_names.insert(strip_filter_wrapper(wf));
@@ -188,15 +196,14 @@ impl<'a> NativeCtx<'a> {
 
         for raw in candidate_names {
             let trimmed = raw.trim();
+            let short = trimmed.rsplit("::").next().unwrap_or(trimmed);
             if trimmed.is_empty()
-                || matches!(trimmed, "Entity" | "Bundle" | "ChildOf" | "Component")
+                || matches!(short, "Entity" | "Bundle" | "ChildOf" | "Component")
                 || self.find_layout_entry(trimmed).is_some()
                 || self.tags_by_key.contains_key(trimmed)
+                || self.find_layout_entry(short).is_some()
+                || self.tags_by_key.contains_key(short)
             {
-                continue;
-            }
-            let short = trimmed.rsplit("::").next().unwrap_or(trimmed);
-            if self.find_layout_entry(short).is_some() || self.tags_by_key.contains_key(short) {
                 continue;
             }
             let canonical = if trimmed.contains("::") {
@@ -599,7 +606,257 @@ pub(super) fn emit_runtime_helpers(out: &mut String) {
          #[inline] fn strata_norm_v2(a: [f32; 2]) -> [f32; 2] {{ let l = strata_len(&a); if l > 1e-12 {{ [a[0]/l, a[1]/l] }} else {{ [0.0; 2] }} }}\n\
          #[inline] fn strata_norm_v3(a: [f32; 3]) -> [f32; 3] {{ let l = strata_len(&a); if l > 1e-12 {{ [a[0]/l, a[1]/l, a[2]/l] }} else {{ [0.0; 3] }} }}\n\
          #[inline] fn strata_norm_v4(a: [f32; 4]) -> [f32; 4] {{ let l = strata_len(&a); if l > 1e-12 {{ [a[0]/l, a[1]/l, a[2]/l, a[3]/l] }} else {{ [0.0; 4] }} }}\n\
-         #[inline] fn strata_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {{ [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]] }}\n"
+         #[inline] fn strata_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {{ [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]] }}\n\
+         #[inline] fn strata_quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {{\n\
+         \x20   [a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1],\n\
+         \x20    a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0],\n\
+         \x20    a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3],\n\
+         \x20    a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2]]\n\
+         }}\n\
+         #[inline] fn strata_quat_mul_vec3(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {{\n\
+         \x20   let qxyz = [q[0], q[1], q[2]];\n\
+         \x20   let c = strata_cross(qxyz, v);\n\
+         \x20   let wv = [q[3]*v[0], q[3]*v[1], q[3]*v[2]];\n\
+         \x20   let r = strata_cross(qxyz, strata_v3_add(c, wv));\n\
+         \x20   [v[0] + 2.0*r[0], v[1] + 2.0*r[1], v[2] + 2.0*r[2]]\n\
+         }}\n\
+         #[allow(dead_code)] #[inline] const fn strata_inline_str_resize<const S: usize, const D: usize>(src: &[u32; S], dst_cap: usize) -> [u32; D] {{\n\
+         \x20   let mut out = [0u32; D];\n\
+         \x20   if D <= 1 || S <= 1 {{ return out; }}\n\
+         \x20   let max_src = (S - 1) * 4;\n\
+         \x20   let max_dst = if dst_cap < (D - 1) * 4 {{ dst_cap }} else {{ (D - 1) * 4 }};\n\
+         \x20   let src_len = src[0] as usize;\n\
+         \x20   let mut end = if src_len < max_src {{ src_len }} else {{ max_src }};\n\
+         \x20   if end > max_dst {{ end = max_dst; }}\n\
+         \x20   while end > 0 && end < src_len {{\n\
+         \x20       let b = src[1 + (end / 4)].to_le_bytes()[end % 4];\n\
+         \x20       if (b & 0xC0) != 0x80 {{ break; }}\n\
+         \x20       end -= 1;\n\
+         \x20   }}\n\
+         \x20   out[0] = end as u32;\n\
+         \x20   let words = end.div_ceil(4);\n\
+         \x20   let mut w = 0usize;\n\
+         \x20   while w < words {{\n\
+         \x20       let mut wb = src[1 + w].to_le_bytes();\n\
+         \x20       let base = w * 4;\n\
+         \x20       let mut j = 0usize;\n\
+         \x20       while j < 4 {{\n\
+         \x20           if base + j >= end {{ wb[j] = 0; }}\n\
+         \x20           j += 1;\n\
+         \x20       }}\n\
+         \x20       out[1 + w] = u32::from_le_bytes(wb);\n\
+         \x20       w += 1;\n\
+         \x20   }}\n\
+         \x20   out\n\
+         }}\n\
+         #[allow(dead_code)] const fn strata_bytes_to_u16_words<const B: usize, const W: usize>(b: [u8; B]) -> [u16; W] {{\n\
+         \x20   let mut out = [0u16; W];\n\
+         \x20   let mut i = 0usize;\n\
+         \x20   while i < W {{\n\
+         \x20       let s = i * 2;\n\
+         \x20       let b0 = if s < B {{ b[s] }} else {{ 0 }};\n\
+         \x20       let b1 = if s + 1 < B {{ b[s + 1] }} else {{ 0 }};\n\
+         \x20       out[i] = u16::from_le_bytes([b0, b1]);\n\
+         \x20       i += 1;\n\
+         \x20   }}\n\
+         \x20   out\n\
+         }}\n\
+         #[allow(dead_code)] const fn strata_bytes_to_u32_words<const B: usize, const W: usize>(b: [u8; B]) -> [u32; W] {{\n\
+         \x20   let mut out = [0u32; W];\n\
+         \x20   let mut i = 0usize;\n\
+         \x20   while i < W {{\n\
+         \x20       let s = i * 4;\n\
+         \x20       let b0 = if s < B {{ b[s] }} else {{ 0 }};\n\
+         \x20       let b1 = if s + 1 < B {{ b[s + 1] }} else {{ 0 }};\n\
+         \x20       let b2 = if s + 2 < B {{ b[s + 2] }} else {{ 0 }};\n\
+         \x20       let b3 = if s + 3 < B {{ b[s + 3] }} else {{ 0 }};\n\
+         \x20       out[i] = u32::from_le_bytes([b0, b1, b2, b3]);\n\
+         \x20       i += 1;\n\
+         \x20   }}\n\
+         \x20   out\n\
+         }}\n\
+         #[allow(dead_code)] const fn strata_bytes_to_u64_words<const B: usize, const W: usize>(b: [u8; B]) -> [u64; W] {{\n\
+         \x20   let mut out = [0u64; W];\n\
+         \x20   let mut i = 0usize;\n\
+         \x20   while i < W {{\n\
+         \x20       let s = i * 8;\n\
+         \x20       let b0 = if s < B {{ b[s] }} else {{ 0 }};\n\
+         \x20       let b1 = if s + 1 < B {{ b[s + 1] }} else {{ 0 }};\n\
+         \x20       let b2 = if s + 2 < B {{ b[s + 2] }} else {{ 0 }};\n\
+         \x20       let b3 = if s + 3 < B {{ b[s + 3] }} else {{ 0 }};\n\
+         \x20       let b4 = if s + 4 < B {{ b[s + 4] }} else {{ 0 }};\n\
+         \x20       let b5 = if s + 5 < B {{ b[s + 5] }} else {{ 0 }};\n\
+         \x20       let b6 = if s + 6 < B {{ b[s + 6] }} else {{ 0 }};\n\
+         \x20       let b7 = if s + 7 < B {{ b[s + 7] }} else {{ 0 }};\n\
+         \x20       out[i] = u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);\n\
+         \x20       i += 1;\n\
+         \x20   }}\n\
+         \x20   out\n\
+         }}\n\
+         pub trait StrataPodBytes: Sized {{\n\
+         \x20   fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]);\n\
+         \x20   fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]);\n\
+         \x20   fn strata_pod_from_bytes(src: &[u8]) -> Self;\n\
+         }}\n\
+         #[inline] fn strata_pod_read_arr<const M: usize>(b: [u8; M], off: usize, dst: &mut [u8]) {{\n\
+         \x20   if off < M {{\n\
+         \x20       let n = dst.len().min(M - off);\n\
+         \x20       dst[..n].copy_from_slice(&b[off..off + n]);\n\
+         \x20   }}\n\
+         }}\n\
+         #[inline] fn strata_pod_patch_arr<const M: usize>(b: &mut [u8; M], off: usize, src: &[u8]) {{\n\
+         \x20   if off < M {{\n\
+         \x20       let n = src.len().min(M - off);\n\
+         \x20       b[off..off + n].copy_from_slice(&src[..n]);\n\
+         \x20   }}\n\
+         }}\n\
+         #[inline] fn strata_pod_take_arr<const M: usize>(src: &[u8]) -> [u8; M] {{\n\
+         \x20   let mut b = [0u8; M];\n\
+         \x20   let n = src.len().min(M);\n\
+         \x20   b[..n].copy_from_slice(&src[..n]);\n\
+         \x20   b\n\
+         }}\n\
+         impl StrataPodBytes for u8 {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr([*self], off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ if off == 0 && !src.is_empty() {{ *self = src[0]; }} }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ src.first().copied().unwrap_or(0) }}\n\
+         }}\n\
+         impl StrataPodBytes for i8 {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr([*self as u8], off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ if off == 0 && !src.is_empty() {{ *self = src[0] as i8; }} }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ src.first().copied().unwrap_or(0) as i8 }}\n\
+         }}\n\
+         impl StrataPodBytes for bool {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr([u8::from(*self)], off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ if off == 0 && !src.is_empty() {{ *self = src[0] != 0; }} }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ src.first().copied().unwrap_or(0) != 0 }}\n\
+         }}\n\
+         impl StrataPodBytes for FfiBool {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr([u8::from(self.get())], off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ if off == 0 && !src.is_empty() {{ *self = FfiBool::from_bool(src[0] != 0); }} }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ FfiBool::from_bool(src.first().copied().unwrap_or(0) != 0) }}\n\
+         }}\n\
+         impl StrataPodBytes for u16 {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr(self.to_le_bytes(), off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ let mut b = self.to_le_bytes(); strata_pod_patch_arr(&mut b, off, src); *self = u16::from_le_bytes(b); }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ u16::from_le_bytes(strata_pod_take_arr(src)) }}\n\
+         }}\n\
+         impl StrataPodBytes for i16 {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr(self.to_le_bytes(), off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ let mut b = self.to_le_bytes(); strata_pod_patch_arr(&mut b, off, src); *self = i16::from_le_bytes(b); }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ i16::from_le_bytes(strata_pod_take_arr(src)) }}\n\
+         }}\n\
+         impl StrataPodBytes for u32 {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr(self.to_le_bytes(), off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ let mut b = self.to_le_bytes(); strata_pod_patch_arr(&mut b, off, src); *self = u32::from_le_bytes(b); }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ u32::from_le_bytes(strata_pod_take_arr(src)) }}\n\
+         }}\n\
+         impl StrataPodBytes for i32 {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr(self.to_le_bytes(), off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ let mut b = self.to_le_bytes(); strata_pod_patch_arr(&mut b, off, src); *self = i32::from_le_bytes(b); }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ i32::from_le_bytes(strata_pod_take_arr(src)) }}\n\
+         }}\n\
+         impl StrataPodBytes for f32 {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr(self.to_le_bytes(), off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ let mut b = self.to_le_bytes(); strata_pod_patch_arr(&mut b, off, src); *self = f32::from_le_bytes(b); }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ f32::from_le_bytes(strata_pod_take_arr(src)) }}\n\
+         }}\n\
+         impl StrataPodBytes for Fixed32 {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr(self.0.to_le_bytes(), off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ let mut b = self.0.to_le_bytes(); strata_pod_patch_arr(&mut b, off, src); self.0 = i32::from_le_bytes(b); }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ Fixed32(i32::from_le_bytes(strata_pod_take_arr(src))) }}\n\
+         }}\n\
+         impl StrataPodBytes for u64 {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr(self.to_le_bytes(), off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ let mut b = self.to_le_bytes(); strata_pod_patch_arr(&mut b, off, src); *self = u64::from_le_bytes(b); }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ u64::from_le_bytes(strata_pod_take_arr(src)) }}\n\
+         }}\n\
+         impl StrataPodBytes for i64 {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr(self.to_le_bytes(), off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ let mut b = self.to_le_bytes(); strata_pod_patch_arr(&mut b, off, src); *self = i64::from_le_bytes(b); }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ i64::from_le_bytes(strata_pod_take_arr(src)) }}\n\
+         }}\n\
+         impl StrataPodBytes for f64 {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr(self.to_le_bytes(), off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ let mut b = self.to_le_bytes(); strata_pod_patch_arr(&mut b, off, src); *self = f64::from_le_bytes(b); }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ f64::from_le_bytes(strata_pod_take_arr(src)) }}\n\
+         }}\n\
+         impl StrataPodBytes for Fixed64 {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr(self.0.to_le_bytes(), off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ let mut b = self.0.to_le_bytes(); strata_pod_patch_arr(&mut b, off, src); self.0 = i64::from_le_bytes(b); }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ Fixed64(i64::from_le_bytes(strata_pod_take_arr(src))) }}\n\
+         }}\n\
+         impl StrataPodBytes for FfiEntity {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr(self.to_bits().to_le_bytes(), off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ let mut b = self.to_bits().to_le_bytes(); strata_pod_patch_arr(&mut b, off, src); *self = FfiEntity::from_bits(u64::from_le_bytes(b)); }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ FfiEntity::from_bits(u64::from_le_bytes(strata_pod_take_arr(src))) }}\n\
+         }}\n\
+         #[inline] fn strata_asset_to_bytes(a: FfiAssetHandle) -> [u8; 32] {{\n\
+         \x20   let mut b = [0u8; 32];\n\
+         \x20   b[0] = a.kind;\n\
+         \x20   b[1] = a.reserved0[0]; b[2] = a.reserved0[1]; b[3] = a.reserved0[2];\n\
+         \x20   b[4..8].copy_from_slice(&a.asset_type.to_raw().to_le_bytes());\n\
+         \x20   b[8..12].copy_from_slice(&a.index.to_le_bytes());\n\
+         \x20   b[12..16].copy_from_slice(&a.generation.to_le_bytes());\n\
+         \x20   b[16..32].copy_from_slice(a.uuid.as_bytes());\n\
+         \x20   b\n\
+         }}\n\
+         #[inline] fn strata_asset_from_bytes(b: [u8; 32]) -> FfiAssetHandle {{\n\
+         \x20   FfiAssetHandle {{\n\
+         \x20       kind: b[0],\n\
+         \x20       reserved0: [b[1], b[2], b[3]],\n\
+         \x20       asset_type: BamComponent::from_raw(u32::from_le_bytes([b[4], b[5], b[6], b[7]])),\n\
+         \x20       index: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),\n\
+         \x20       generation: u32::from_le_bytes([b[12], b[13], b[14], b[15]]),\n\
+         \x20       uuid: ComponentUuid::from_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31]]),\n\
+         \x20   }}\n\
+         }}\n\
+         impl StrataPodBytes for FfiAssetHandle {{\n\
+         \x20   #[inline] fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{ strata_pod_read_arr(strata_asset_to_bytes(*self), off, dst); }}\n\
+         \x20   #[inline] fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{ let mut b = strata_asset_to_bytes(*self); strata_pod_patch_arr(&mut b, off, src); *self = strata_asset_from_bytes(b); }}\n\
+         \x20   #[inline] fn strata_pod_from_bytes(src: &[u8]) -> Self {{ if src.is_empty() {{ Self::NONE }} else {{ let mut b = strata_asset_to_bytes(Self::NONE); strata_pod_patch_arr(&mut b, 0, src); strata_asset_from_bytes(b) }} }}\n\
+         }}\n\
+         impl<T: StrataPodBytes, const N: usize> StrataPodBytes for [T; N] {{\n\
+         \x20   fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{\n\
+         \x20       let elem_sz = core::mem::size_of::<T>();\n\
+         \x20       if elem_sz == 0 || dst.is_empty() {{ return; }}\n\
+         \x20       let mut stack_buf = [0u8; 256];\n\
+         \x20       let mut heap_buf = Vec::new();\n\
+         \x20       let tmp: &mut [u8] = if elem_sz <= 256 {{ &mut stack_buf[..elem_sz] }} else {{ heap_buf.resize(elem_sz, 0); heap_buf.as_mut_slice() }};\n\
+         \x20       let req_end = off.saturating_add(dst.len());\n\
+         \x20       for (idx, el) in self.iter().enumerate() {{\n\
+         \x20           let es = idx * elem_sz;\n\
+         \x20           let ee = es + elem_sz;\n\
+         \x20           if ee <= off {{ continue; }}\n\
+         \x20           if es >= req_end {{ break; }}\n\
+         \x20           el.strata_pod_read_sub(0, tmp);\n\
+         \x20           let ov_s = es.max(off);\n\
+         \x20           let ov_e = ee.min(req_end);\n\
+         \x20           dst[ov_s - off..ov_e - off].copy_from_slice(&tmp[ov_s - es..ov_e - es]);\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         \x20   fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{\n\
+         \x20       let elem_sz = core::mem::size_of::<T>();\n\
+         \x20       if elem_sz == 0 || src.is_empty() {{ return; }}\n\
+         \x20       let req_end = off.saturating_add(src.len());\n\
+         \x20       for (idx, el) in self.iter_mut().enumerate() {{\n\
+         \x20           let es = idx * elem_sz;\n\
+         \x20           let ee = es + elem_sz;\n\
+         \x20           if ee <= off {{ continue; }}\n\
+         \x20           if es >= req_end {{ break; }}\n\
+         \x20           let ov_s = es.max(off);\n\
+         \x20           let ov_e = ee.min(req_end);\n\
+         \x20           el.strata_pod_write_bytes(ov_s - es, &src[ov_s - off..ov_e - off]);\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         \x20   fn strata_pod_from_bytes(src: &[u8]) -> Self {{\n\
+         \x20       let elem_sz = core::mem::size_of::<T>();\n\
+         \x20       core::array::from_fn(|i| {{\n\
+         \x20           let off = i * elem_sz;\n\
+         \x20           if elem_sz > 0 && off < src.len() {{ T::strata_pod_from_bytes(&src[off..]) }} else {{ T::strata_pod_from_bytes(&[]) }}\n\
+         \x20       }})\n\
+         \x20   }}\n\
+         }}\n"
     )
     .ok();
 }
@@ -743,6 +1000,18 @@ pub(super) fn native_default_expr_for_ty(
                 let pack_fn = blob_pack_method_for_blob_ty(&blob_ty);
                 return format!("{}::strata_default().{pack_fn}()", entry.struct_name);
             }
+        }
+        Ty::Mat3 => return "[0.0_f32; 9]".to_owned(),
+        Ty::Mat4 => return "[0.0_f32; 16]".to_owned(),
+        Ty::SmallVec { elem, cap } => {
+            let (es, ea) = sema_ty_size_align(elem, ctx);
+            let stride = if es == 0 {
+                0
+            } else {
+                es.div_ceil(ea.max(1)) * ea.max(1)
+            };
+            let total = 8 + stride * (*cap);
+            return aligned_blob_default_expr(total, ea.max(4));
         }
         Ty::Array { elem, len } => {
             let elem_size = byte_size / (*len).max(1);
@@ -978,8 +1247,214 @@ pub(super) fn format_const_for_field(
             }
             format!("[{}]", elems.join(", "))
         }
+        (Ty::SmallVec { elem, cap }, MirConstVal::Array(items)) => {
+            let (elem_size, elem_align) = sema_ty_size_align(elem, ctx);
+            let dummy = SolvedField {
+                name: field.name.clone(),
+                ty: (**elem).clone(),
+                offset: 0,
+                size: elem_size,
+                align: elem_align,
+                is_padding: false,
+                bam_field_kind: 0,
+                type_tag: String::new(),
+            };
+            let elems: Vec<String> = items
+                .iter()
+                .take(*cap)
+                .map(|it| format_const_for_field(it, &dummy, ctx))
+                .collect();
+            const_pack_smallvec_expr(elem, *cap, &elems, true, ctx)
+        }
         _ => native_default_expr_for_field(field, ctx),
     }
+}
+
+fn emit_const_pack_ty_bytes(
+    buf_var: &str,
+    off_expr: &str,
+    val_expr: &str,
+    ty: &Ty,
+    byte_size: usize,
+    align: usize,
+    elem_is_ffi_bool: bool,
+    depth: usize,
+    ctx: &NativeCtx<'_>,
+) -> String {
+    match ty {
+        Ty::U8 => format!("strata_write_le_bytes(&mut {buf_var}, {off_expr}, [{val_expr}]);"),
+        Ty::I8 => {
+            format!("strata_write_le_bytes(&mut {buf_var}, {off_expr}, [({val_expr}) as u8]);")
+        }
+        Ty::Bool => {
+            if elem_is_ffi_bool {
+                format!(
+                    "strata_write_le_bytes(&mut {buf_var}, {off_expr}, [u8::from(({val_expr}).get())]);"
+                )
+            } else {
+                format!(
+                    "strata_write_le_bytes(&mut {buf_var}, {off_expr}, [u8::from({val_expr})]);"
+                )
+            }
+        }
+        Ty::U16 | Ty::I16 | Ty::U32 | Ty::I32 | Ty::U64 | Ty::I64 | Ty::Sym | Ty::Rgba8 => {
+            format!(
+                "strata_write_le_bytes(&mut {buf_var}, {off_expr}, ({val_expr}).to_le_bytes());"
+            )
+        }
+        Ty::F32 | Ty::UnitScalar { .. } | Ty::GraceWindow | Ty::F64 | Ty::Ref(_) => {
+            format!(
+                "strata_write_le_bytes(&mut {buf_var}, {off_expr}, ({val_expr}).to_bits().to_le_bytes());"
+            )
+        }
+        Ty::Fix32 | Ty::Fix64 => {
+            format!(
+                "strata_write_le_bytes(&mut {buf_var}, {off_expr}, ({val_expr}).0.to_le_bytes());"
+            )
+        }
+        Ty::Named(n) => {
+            let short = n.rsplit("::").next().unwrap_or(n);
+            if let Some(en) = ctx
+                .enums_by_key
+                .get(n.as_str())
+                .or_else(|| ctx.enums_by_key.get(short))
+            {
+                let repr = en.rust_repr();
+                format!(
+                    "strata_write_le_bytes(&mut {buf_var}, {off_expr}, (({val_expr}) as {repr}).to_le_bytes());"
+                )
+            } else if let Some(entry) = ctx.find_layout_entry(n)
+                && entry.layout.size > 0
+                && !entry.layout.fields.is_empty()
+            {
+                format!(
+                    "strata_write_le_bytes(&mut {buf_var}, {off_expr}, ({val_expr}).strata_to_u8_bytes());"
+                )
+            } else {
+                String::new()
+            }
+        }
+        Ty::Vec2
+        | Ty::Vec3
+        | Ty::Vec3a
+        | Ty::Vec4
+        | Ty::Quat
+        | Ty::Rgba
+        | Ty::Mat3
+        | Ty::Mat4
+        | Ty::IVec2
+        | Ty::IVec3
+        | Ty::UVec2
+        | Ty::BitSet(_)
+        | Ty::InlineStr(_) => {
+            let len = match ty {
+                Ty::Vec2 | Ty::IVec2 | Ty::UVec2 => 2,
+                Ty::Vec3 | Ty::IVec3 => 3,
+                Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => 4,
+                Ty::Mat3 => 9,
+                Ty::Mat4 => 16,
+                Ty::BitSet(b) => (*b).div_ceil(32).max(1),
+                Ty::InlineStr(c) => 1 + c.div_ceil(4),
+                _ => unreachable!(),
+            };
+            let is_f32 = matches!(
+                ty,
+                Ty::Vec2
+                    | Ty::Vec3
+                    | Ty::Vec3a
+                    | Ty::Vec4
+                    | Ty::Quat
+                    | Ty::Rgba
+                    | Ty::Mat3
+                    | Ty::Mat4
+            );
+            let conv = if is_f32 {
+                "to_bits().to_le_bytes()"
+            } else {
+                "to_le_bytes()"
+            };
+            format!(
+                "let __pa_{depth} = {val_expr}; let mut __pk_{depth} = 0usize; while __pk_{depth} < {len} {{ strata_write_le_bytes(&mut {buf_var}, ({off_expr}) + __pk_{depth} * 4, __pa_{depth}[__pk_{depth}].{conv}); __pk_{depth} += 1; }}"
+            )
+        }
+        Ty::Array { elem, len } => {
+            let (ces, cea) = sema_ty_size_align(elem, ctx);
+            let ces_eff = if ces == 0 {
+                byte_size / (*len).max(1)
+            } else {
+                ces
+            };
+            let cea_eff = cea.max(align).max(1);
+            let stride = ces_eff.div_ceil(cea_eff) * cea_eff;
+            let elem_var = format!("__pe_{depth}");
+            let inner = emit_const_pack_ty_bytes(
+                buf_var,
+                &format!("({off_expr}) + __pk_{depth} * {stride}"),
+                &elem_var,
+                elem,
+                ces_eff,
+                cea_eff,
+                elem_is_ffi_bool,
+                depth + 1,
+                ctx,
+            );
+            format!(
+                "let __pa_{depth} = {val_expr}; let mut __pk_{depth} = 0usize; while __pk_{depth} < {len} {{ let {elem_var} = __pa_{depth}[__pk_{depth}]; {inner} __pk_{depth} += 1; }}"
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+pub(super) fn const_pack_smallvec_expr(
+    elem: &Ty,
+    cap: usize,
+    elem_exprs: &[String],
+    elem_is_ffi_bool: bool,
+    ctx: &NativeCtx<'_>,
+) -> String {
+    let (es, ea) = sema_ty_size_align(elem, ctx);
+    let ea_nz = ea.max(1);
+    let stride = if es == 0 {
+        0
+    } else {
+        es.div_ceil(ea_nz) * ea_nz
+    };
+    let sv_align = ea.max(4);
+    let total_bytes = 8 + stride * cap;
+    let count = elem_exprs.len().min(cap);
+    if count == 0 {
+        return aligned_blob_default_expr(total_bytes, sv_align);
+    }
+    let mut body = format!(
+        "let mut __sv_b = [0u8; {total_bytes}]; strata_write_le_bytes(&mut __sv_b, 0, ({count}u32).to_le_bytes());"
+    );
+    for (idx, ex) in elem_exprs.iter().take(count).enumerate() {
+        let pack = emit_const_pack_ty_bytes(
+            "__sv_b",
+            &format!("{}", 8 + idx * stride),
+            ex,
+            elem,
+            es,
+            ea_nz,
+            elem_is_ffi_bool,
+            idx,
+            ctx,
+        );
+        body.push(' ');
+        body.push_str(&pack);
+    }
+    let blob_ty = aligned_blob_type(total_bytes, sv_align);
+    let finish = if blob_ty.starts_with("[u64;") {
+        "strata_bytes_to_u64_words(__sv_b)"
+    } else if blob_ty.starts_with("[u32;") {
+        "strata_bytes_to_u32_words(__sv_b)"
+    } else if blob_ty.starts_with("[u16;") {
+        "strata_bytes_to_u16_words(__sv_b)"
+    } else {
+        "__sv_b"
+    };
+    format!("{{ {body} {finish} }}")
 }
 
 fn effective_expected_ty<'a>(expected_ty: Option<&'a Ty>, fallback: &'a Ty) -> &'a Ty {
@@ -1016,6 +1491,22 @@ fn const_safe_coerce_expr(expr: &str, from: &ValTy, to: &ValTy) -> String {
         return expr.to_owned();
     }
     match (from, to) {
+        (ValTy::F32 | ValTy::F64, ValTy::Bool) => format!("((({expr}) as f64) != 0.0_f64)"),
+        (
+            ValTy::U8
+            | ValTy::I8
+            | ValTy::U16
+            | ValTy::I16
+            | ValTy::U32
+            | ValTy::I32
+            | ValTy::U64
+            | ValTy::I64,
+            ValTy::Bool,
+        ) => format!("(({expr}) != 0)"),
+        (ValTy::InlineStr(_), ValTy::InlineStr(to_cap)) => {
+            let to_words = 1 + to_cap.div_ceil(4);
+            format!("strata_inline_str_resize::<_, {to_words}>(&({expr}), {to_cap})")
+        }
         (ValTy::F32 | ValTy::F64, ValTy::Fix32) => format!(
             "Fixed32({{ let __x = ({expr}) as f64; if !__x.is_finite() {{ 0i32 }} else {{ let __s = __x * 65536.0_f64; let __r = if __s >= 0.0_f64 {{ __s + 0.5_f64 }} else {{ __s - 0.5_f64 }}; let __qi = __r as i64; if __qi < i32::MIN as i64 {{ i32::MIN }} else if __qi > i32::MAX as i64 {{ i32::MAX }} else {{ __qi as i32 }} }} }})"
         ),
@@ -1066,6 +1557,21 @@ pub(super) fn eval_hir_expr_static(
                     "Fixed64".to_owned(),
                     format!("Fixed64({})", format_fix64_i64_lit(scale_int_fix64(*value))),
                 )),
+                Ty::BitSet(bits) => {
+                    let words = (*bits).div_ceil(32).max(1);
+                    let mask = *value as u64;
+                    let parts: Vec<String> = (0..words)
+                        .map(|w| {
+                            let wd = if w < 2 {
+                                ((mask >> (w * 32)) & 0xFFFF_FFFF) as u32
+                            } else {
+                                0
+                            };
+                            format!("0x{wd:08X}u32")
+                        })
+                        .collect();
+                    Some((format!("[u32; {words}]"), format!("[{}]", parts.join(", "))))
+                }
                 Ty::Named(n) => {
                     let short = n.rsplit("::").next().unwrap_or(n);
                     if let Some(en) = ctx
@@ -1180,6 +1686,16 @@ pub(super) fn eval_hir_expr_static(
                 "uvec2::ONE" => Some(("[u32; 2]".to_owned(), "[1u32, 1u32]".to_owned())),
                 "uvec2::X" => Some(("[u32; 2]".to_owned(), "[1u32, 0u32]".to_owned())),
                 "uvec2::Y" => Some(("[u32; 2]".to_owned(), "[0u32, 1u32]".to_owned())),
+                "mat3::ZERO" | "Mat3::ZERO" => Some(("[f32; 9]".to_owned(), "[0.0_f32; 9]".to_owned())),
+                "mat3::IDENTITY" | "Mat3::IDENTITY" => Some((
+                    "[f32; 9]".to_owned(),
+                    "[1.0_f32, 0.0_f32, 0.0_f32, 0.0_f32, 1.0_f32, 0.0_f32, 0.0_f32, 0.0_f32, 1.0_f32]".to_owned(),
+                )),
+                "mat4::ZERO" | "Mat4::ZERO" => Some(("[f32; 16]".to_owned(), "[0.0_f32; 16]".to_owned())),
+                "mat4::IDENTITY" | "Mat4::IDENTITY" => Some((
+                    "[f32; 16]".to_owned(),
+                    "[1.0_f32, 0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32, 1.0_f32, 0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32, 1.0_f32, 0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32, 1.0_f32]".to_owned(),
+                )),
                 _ => {
                     if let Some(c) = ctx.mir.consts.iter().find(|c| {
                         c.name == *name || c.name.rsplit("::").next() == Some(name.as_str())
@@ -1376,6 +1892,11 @@ pub(super) fn eval_hir_expr_static(
             {
                 return eval_hir_expr_static(expr, Some(eff), ctx);
             }
+            if matches!(target_ty, Ty::InlineStr(_))
+                && matches!(expr.as_ref(), HirExpr::StringLit(_))
+            {
+                return eval_hir_expr_static(expr, Some(target_ty), ctx);
+            }
             if target_ty == eff
                 && matches!(eff, Ty::Fix32 | Ty::Fix64)
                 && let Some(cs) = eval_hir_const_scalar(expr, ctx)
@@ -1426,28 +1947,44 @@ pub(super) fn eval_hir_expr_static(
         }
         HirExpr::ArrayLit { elems, ty } => {
             let eff = effective_expected_ty(expected_ty, ty);
+            let sv_spec = match eff {
+                Ty::SmallVec { elem, cap } => Some((elem.as_ref(), *cap)),
+                _ => match ty {
+                    Ty::SmallVec { elem, cap } => Some((elem.as_ref(), *cap)),
+                    _ => None,
+                },
+            };
+            if let Some((sv_elem, sv_cap)) = sv_spec {
+                let child_expected = Some(sv_elem).filter(|t| !matches!(t, Ty::Unknown));
+                let mut sv_parts = Vec::with_capacity(elems.len().min(sv_cap));
+                for el in elems.iter().take(sv_cap) {
+                    let (_, el_val) = eval_hir_expr_static(el, child_expected, ctx)?;
+                    sv_parts.push(el_val);
+                }
+                let pack_expr = const_pack_smallvec_expr(sv_elem, sv_cap, &sv_parts, false, ctx);
+                let out_ty = rust_ty_from_hir_ty(eff, ctx);
+                return Some((out_ty, pack_expr));
+            }
             let mut elem_ty_opt = match eff {
-                Ty::Array { elem, .. } | Ty::SmallVec { elem, .. } => Some(elem.as_ref()),
+                Ty::Array { elem, .. } => Some(elem.as_ref()),
                 Ty::Vec2 | Ty::Vec3 | Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => Some(&Ty::F32),
                 Ty::IVec2 | Ty::IVec3 => Some(&Ty::I32),
                 Ty::UVec2 => Some(&Ty::U32),
                 _ => None,
             };
             if elem_ty_opt.is_none_or(|t| matches!(t, Ty::Unknown))
-                && let Ty::Array { elem, .. } | Ty::SmallVec { elem, .. } = ty
+                && let Ty::Array { elem, .. } = ty
                 && !matches!(elem.as_ref(), Ty::Unknown)
             {
                 elem_ty_opt = Some(elem.as_ref());
             }
             let target_len = match eff {
                 Ty::Array { len, .. } => *len,
-                Ty::SmallVec { cap, .. } => *cap,
                 Ty::Vec2 | Ty::IVec2 | Ty::UVec2 => 2,
                 Ty::Vec3 | Ty::IVec3 => 3,
                 Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => 4,
                 _ => match ty {
                     Ty::Array { len, .. } => *len,
-                    Ty::SmallVec { cap, .. } => *cap,
                     _ => elems.len(),
                 },
             };
@@ -1605,6 +2142,54 @@ pub(super) fn eval_hir_expr_static(
                 let y = eval_hir_u32(call.args.get(1), ctx);
                 Some(("[u32; 2]".to_owned(), format!("[{x}u32, {y}u32]")))
             }
+            "mat3" | "Mat3" => {
+                if call.args.is_empty() {
+                    Some(("[f32; 9]".to_owned(), "[0.0_f32; 9]".to_owned()))
+                } else if call.args.len() == 3 {
+                    let c0 = eval_hir_expr_static(&call.args[0], Some(&Ty::Vec3), ctx)
+                        .map_or_else(|| "[0.0_f32; 3]".to_owned(), |(_, v)| v);
+                    let c1 = eval_hir_expr_static(&call.args[1], Some(&Ty::Vec3), ctx)
+                        .map_or_else(|| "[0.0_f32; 3]".to_owned(), |(_, v)| v);
+                    let c2 = eval_hir_expr_static(&call.args[2], Some(&Ty::Vec3), ctx)
+                        .map_or_else(|| "[0.0_f32; 3]".to_owned(), |(_, v)| v);
+                    Some((
+                        "[f32; 9]".to_owned(),
+                        format!(
+                            "{{ let __c0 = {c0}; let __c1 = {c1}; let __c2 = {c2}; [__c0[0], __c0[1], __c0[2], __c1[0], __c1[1], __c1[2], __c2[0], __c2[1], __c2[2]] }}"
+                        ),
+                    ))
+                } else {
+                    let elems: Vec<String> = (0..9)
+                        .map(|i| eval_hir_f32(call.args.get(i), ctx))
+                        .collect();
+                    Some(("[f32; 9]".to_owned(), format!("[{}]", elems.join(", "))))
+                }
+            }
+            "mat4" | "Mat4" => {
+                if call.args.is_empty() {
+                    Some(("[f32; 16]".to_owned(), "[0.0_f32; 16]".to_owned()))
+                } else if call.args.len() == 4 {
+                    let c0 = eval_hir_expr_static(&call.args[0], Some(&Ty::Vec4), ctx)
+                        .map_or_else(|| "[0.0_f32; 4]".to_owned(), |(_, v)| v);
+                    let c1 = eval_hir_expr_static(&call.args[1], Some(&Ty::Vec4), ctx)
+                        .map_or_else(|| "[0.0_f32; 4]".to_owned(), |(_, v)| v);
+                    let c2 = eval_hir_expr_static(&call.args[2], Some(&Ty::Vec4), ctx)
+                        .map_or_else(|| "[0.0_f32; 4]".to_owned(), |(_, v)| v);
+                    let c3 = eval_hir_expr_static(&call.args[3], Some(&Ty::Vec4), ctx)
+                        .map_or_else(|| "[0.0_f32; 4]".to_owned(), |(_, v)| v);
+                    Some((
+                        "[f32; 16]".to_owned(),
+                        format!(
+                            "{{ let __c0 = {c0}; let __c1 = {c1}; let __c2 = {c2}; let __c3 = {c3}; [__c0[0], __c0[1], __c0[2], __c0[3], __c1[0], __c1[1], __c1[2], __c1[3], __c2[0], __c2[1], __c2[2], __c2[3], __c3[0], __c3[1], __c3[2], __c3[3]] }}"
+                        ),
+                    ))
+                } else {
+                    let elems: Vec<String> = (0..16)
+                        .map(|i| eval_hir_f32(call.args.get(i), ctx))
+                        .collect();
+                    Some(("[f32; 16]".to_owned(), format!("[{}]", elems.join(", "))))
+                }
+            }
             "meters" | "sec" | "ms" | "rad" | "deg" | "mps" | "mps2" | "hz" | "frames" => {
                 eval_hir_expr_static(call.args.first()?, expected_ty, ctx)
             }
@@ -1730,6 +2315,10 @@ fn eval_hir_const_scalar(expr: &HirExpr, ctx: &NativeCtx<'_>) -> Option<ConstSca
                 };
             }
             match target_ty {
+                Ty::Bool => Some(ConstScalar::Int(i64::from(match v {
+                    ConstScalar::Int(i) => i != 0,
+                    ConstScalar::Float(f) => f != 0.0,
+                }))),
                 Ty::U8 => Some(ConstScalar::Int(match v {
                     ConstScalar::Int(i) => i64::from(i as u8),
                     ConstScalar::Float(f) => i64::from(f as u8),
@@ -2004,6 +2593,15 @@ pub(super) fn emit_native_layouts(out: &mut String, ctx: &NativeCtx<'_>) {
             writeln!(out, "impl Default for {struct_name} {{").ok();
             writeln!(out, "    fn default() -> Self {{ Self::strata_default() }}").ok();
             writeln!(out, "}}").ok();
+            writeln!(
+                out,
+                "impl StrataPodBytes for {struct_name} {{\n\
+                 \x20   #[inline] fn strata_pod_read_sub(&self, _off: usize, _dst: &mut [u8]) {{}}\n\
+                 \x20   #[inline] fn strata_pod_write_bytes(&mut self, _off: usize, _src: &[u8]) {{}}\n\
+                 \x20   #[inline] fn strata_pod_from_bytes(_src: &[u8]) -> Self {{ Self }}\n\
+                 }}"
+            )
+            .ok();
         } else {
             writeln!(out, "pub struct {struct_name} {{").ok();
             for field in &layout.fields {
@@ -2175,6 +2773,40 @@ pub(super) fn emit_native_layouts(out: &mut String, ctx: &NativeCtx<'_>) {
                 }
             }
             writeln!(out, "}}").ok();
+            writeln!(
+                out,
+                "impl StrataPodBytes for {struct_name} {{\n\
+                 \x20   #[inline]\n\
+                 \x20   fn strata_pod_read_sub(&self, off: usize, dst: &mut [u8]) {{\n\
+                 \x20       let b = self.strata_to_u8_bytes();\n\
+                 \x20       if off < b.len() {{\n\
+                 \x20           let n = dst.len().min(b.len() - off);\n\
+                 \x20           dst[..n].copy_from_slice(&b[off..off + n]);\n\
+                 \x20       }}\n\
+                 \x20   }}\n\
+                 \x20   #[inline]\n\
+                 \x20   fn strata_pod_write_bytes(&mut self, off: usize, src: &[u8]) {{\n\
+                 \x20       let mut b = self.strata_to_u8_bytes();\n\
+                 \x20       if off < b.len() {{\n\
+                 \x20           let n = src.len().min(b.len() - off);\n\
+                 \x20           b[off..off + n].copy_from_slice(&src[..n]);\n\
+                 \x20           self.strata_from_u8_bytes(&b);\n\
+                 \x20       }}\n\
+                 \x20   }}\n\
+                 \x20   #[inline]\n\
+                 \x20   fn strata_pod_from_bytes(src: &[u8]) -> Self {{\n\
+                 \x20       if src.len() >= {sz} {{\n\
+                 \x20           Self::strata_from_u8_bytes_val(src)\n\
+                 \x20       }} else {{\n\
+                 \x20           let mut b = Self::strata_default().strata_to_u8_bytes();\n\
+                 \x20           let n = src.len().min(b.len());\n\
+                 \x20           b[..n].copy_from_slice(&src[..n]);\n\
+                 \x20           Self::strata_from_u8_bytes_val(&b)\n\
+                 \x20       }}\n\
+                 \x20   }}\n\
+                 }}"
+            )
+            .ok();
         }
 
         emit_mod_component_impl(
@@ -2335,6 +2967,7 @@ pub(super) fn emit_spatial_and_relation_resources(out: &mut String, ctx: &Native
              \x20   pub history: Vec<{sname}Frame>,\n\
              \x20   pub write_cursors: Vec<u32>,\n\
              \x20   pub head_tick: u32,\n\
+             \x20   pub populated_frames: usize,\n\
              \x20   pub frames: usize,\n\
              \x20   pub capacity: usize,\n\
              \x20   pub cols: usize,\n\
@@ -2360,6 +2993,7 @@ pub(super) fn emit_spatial_and_relation_resources(out: &mut String, ctx: &Native
              \x20           history,\n\
              \x20           write_cursors: vec![0u32; {cell_count}],\n\
              \x20           head_tick: 0,\n\
+             \x20           populated_frames: 0,\n\
              \x20           frames: {frames},\n\
              \x20           capacity: {capacity},\n\
              \x20           cols: {cols},\n\
@@ -2374,6 +3008,13 @@ pub(super) fn emit_spatial_and_relation_resources(out: &mut String, ctx: &Native
              }}\n\
              impl {sname} {{\n\
              \x20   #[inline]\n\
+             \x20   pub fn lift_vec2(&self, v: [f32; 2]) -> [f32; 3] {{\n\
+             \x20       let mut out = [0.0_f32; 3];\n\
+             \x20       out[self.plane_axes[0]] = v[0];\n\
+             \x20       out[self.plane_axes[1]] = v[1];\n\
+             \x20       out\n\
+             \x20   }}\n\
+             \x20   #[inline]\n\
              \x20   fn cell_coords(&self, x: f32, y: f32) -> (usize, usize) {{\n\
              \x20       let cx = (((x - self.bounds_min[0]) * self.inv_cell_size).floor() as i32).clamp(0, self.cols as i32 - 1) as usize;\n\
              \x20       let cy = (((y - self.bounds_min[1]) * self.inv_cell_size).floor() as i32).clamp(0, self.rows as i32 - 1) as usize;\n\
@@ -2386,6 +3027,7 @@ pub(super) fn emit_spatial_and_relation_resources(out: &mut String, ctx: &Native
              \x20   }}\n\
              \x20   pub fn csr_begin(&mut self) {{\n\
              \x20       self.head_tick = self.head_tick.wrapping_add(1);\n\
+             \x20       self.populated_frames = (self.populated_frames + 1).min(self.frames);\n\
              \x20       let slot = (self.head_tick as usize) % self.frames;\n\
              \x20       let f = &mut self.history[slot];\n\
              \x20       f.count = 0;\n\
@@ -2442,8 +3084,10 @@ pub(super) fn emit_spatial_and_relation_resources(out: &mut String, ctx: &Native
              \x20       let f = &self.history[slot];\n\
              \x20       let r = radius.max(0.0);\n\
              \x20       let r_sq = r * r;\n\
-             \x20       let cx = center[self.plane_axes[0]];\n\
-             \x20       let cy = center[self.plane_axes[1]];\n\
+             \x20       let ax0 = self.plane_axes[0];\n\
+             \x20       let ax1 = self.plane_axes[1];\n\
+             \x20       let cx = center[ax0];\n\
+             \x20       let cy = center[ax1];\n\
              \x20       let (min_cx, min_cy) = self.cell_coords(cx - r, cy - r);\n\
              \x20       let (max_cx, max_cy) = self.cell_coords(cx + r, cy + r);\n\
              \x20       let total = (f.count as usize).min(f.entities.len());\n\
@@ -2456,10 +3100,9 @@ pub(super) fn emit_spatial_and_relation_resources(out: &mut String, ctx: &Native
              \x20               if start <= end && end <= total {{\n\
              \x20                   for k in start..end {{\n\
              \x20                       let pos = f.positions[k];\n\
-             \x20                       let dx = pos[0] - center[0];\n\
-             \x20                       let dy = pos[1] - center[1];\n\
-             \x20                       let dz = pos[2] - center[2];\n\
-             \x20                       if dx * dx + dy * dy + dz * dz <= r_sq {{\n\
+             \x20                       let dx = pos[ax0] - center[ax0];\n\
+             \x20                       let dy = pos[ax1] - center[ax1];\n\
+             \x20                       if dx * dx + dy * dy <= r_sq {{\n\
              \x20                           out.push(FfiEntity::from_bits(f.entities[k].to_bits()));\n\
              \x20                           if out.len() >= 64 {{ return out; }}\n\
              \x20                       }}\n\
@@ -2470,19 +3113,25 @@ pub(super) fn emit_spatial_and_relation_resources(out: &mut String, ctx: &Native
              \x20       out\n\
              \x20   }}\n\
              \x20   pub fn query_segment_at(&self, tick_offset: u32, start: [f32; 3], end: [f32; 3], radius: f32) -> Vec<FfiEntity> {{\n\
-             \x20       let off = (tick_offset as usize) % self.frames;\n\
+             \x20       let off = tick_offset as usize;\n\
+             \x20       if self.frames == 0 || off >= self.frames || off >= self.populated_frames {{\n\
+             \x20           return Vec::new();\n\
+             \x20       }}\n\
              \x20       let slot = ((self.head_tick as usize) + self.frames - off) % self.frames;\n\
              \x20       let f = &self.history[slot];\n\
              \x20       let r = radius.max(0.0);\n\
              \x20       let r_sq = r * r;\n\
-             \x20       let sx = start[self.plane_axes[0]];\n\
-             \x20       let sy = start[self.plane_axes[1]];\n\
-             \x20       let ex = end[self.plane_axes[0]];\n\
-             \x20       let ey = end[self.plane_axes[1]];\n\
+             \x20       let ax0 = self.plane_axes[0];\n\
+             \x20       let ax1 = self.plane_axes[1];\n\
+             \x20       let sx = start[ax0];\n\
+             \x20       let sy = start[ax1];\n\
+             \x20       let ex = end[ax0];\n\
+             \x20       let ey = end[ax1];\n\
              \x20       let (min_cx, min_cy) = self.cell_coords(sx.min(ex) - r, sy.min(ey) - r);\n\
              \x20       let (max_cx, max_cy) = self.cell_coords(sx.max(ex) + r, sy.max(ey) + r);\n\
-             \x20       let ab = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];\n\
-             \x20       let ab_sq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];\n\
+             \x20       let abx = ex - sx;\n\
+             \x20       let aby = ey - sy;\n\
+             \x20       let ab_sq = abx * abx + aby * aby;\n\
              \x20       let total = (f.count as usize).min(f.entities.len());\n\
              \x20       let mut out = Vec::new();\n\
              \x20       for row in min_cy..=max_cy {{\n\
@@ -2493,12 +3142,12 @@ pub(super) fn emit_spatial_and_relation_resources(out: &mut String, ctx: &Native
              \x20               if s_idx <= e_idx && e_idx <= total {{\n\
              \x20                   for k in s_idx..e_idx {{\n\
              \x20                       let pos = f.positions[k];\n\
-             \x20                       let ap = [pos[0] - start[0], pos[1] - start[1], pos[2] - start[2]];\n\
-             \x20                       let t = if ab_sq > 1e-12 {{ ((ap[0]*ab[0] + ap[1]*ab[1] + ap[2]*ab[2]) / ab_sq).clamp(0.0, 1.0) }} else {{ 0.0 }};\n\
-             \x20                       let dx = start[0] + ab[0] * t - pos[0];\n\
-             \x20                       let dy = start[1] + ab[1] * t - pos[1];\n\
-             \x20                       let dz = start[2] + ab[2] * t - pos[2];\n\
-             \x20                       if dx * dx + dy * dy + dz * dz <= r_sq {{\n\
+             \x20                       let apx = pos[ax0] - sx;\n\
+             \x20                       let apy = pos[ax1] - sy;\n\
+             \x20                       let t = if ab_sq > 1e-12 {{ ((apx * abx + apy * aby) / ab_sq).clamp(0.0, 1.0) }} else {{ 0.0 }};\n\
+             \x20                       let dx = sx + abx * t - pos[ax0];\n\
+             \x20                       let dy = sy + aby * t - pos[ax1];\n\
+             \x20                       if dx * dx + dy * dy <= r_sq {{\n\
              \x20                           out.push(FfiEntity::from_bits(f.entities[k].to_bits()));\n\
              \x20                           if out.len() >= 64 {{ return out; }}\n\
              \x20                       }}\n\
@@ -2560,15 +3209,34 @@ pub(super) fn emit_tables_and_curves(out: &mut String, ctx: &NativeCtx<'_>) {
         let row_struct = format!("StrataTable_{tident}Row");
         writeln!(
             out,
-            "#[derive(Clone, Copy, Debug, PartialEq, Default)]\npub struct {row_struct} {{"
+            "#[derive(Clone, Copy, Debug, PartialEq)]\npub struct {row_struct} {{"
         )
         .ok();
+        let mut def_inits = Vec::new();
         for (fname, fty) in &tb.fields {
             let rfname = sanitize_rust_ident(fname);
             let rty = rust_ty_from_hir_ty(fty, ctx);
             writeln!(out, "    pub {rfname}: {rty},").ok();
+            def_inits.push(format!(
+                "{rfname}: {}",
+                rust_default_expr_from_hir_ty(fty, ctx)
+            ));
         }
         writeln!(out, "}}").ok();
+        writeln!(
+            out,
+            "impl {row_struct} {{\n\
+             \x20   #[allow(dead_code)]\n\
+             \x20   pub const fn strata_default() -> Self {{\n\
+             \x20       Self {{ {} }}\n\
+             \x20   }}\n\
+             }}\n\
+             impl Default for {row_struct} {{\n\
+             \x20   fn default() -> Self {{ Self::strata_default() }}\n\
+             }}",
+            def_inits.join(", ")
+        )
+        .ok();
 
         let key_enum = ctx.enums_by_key.get(&tb.key_enum).copied();
         let mut row_entries: Vec<(i64, String)> = Vec::new();
@@ -2598,18 +3266,34 @@ pub(super) fn emit_tables_and_curves(out: &mut String, ctx: &NativeCtx<'_>) {
             ));
         }
         row_entries.sort_by_key(|(d, _)| *d);
+        row_entries.dedup_by_key(|(d, _)| *d);
 
-        let max_disc = row_entries.iter().map(|(d, _)| *d).max().unwrap_or(-1);
-        let mut ordered = vec![format!("{row_struct}::default()"); (max_disc + 1).max(0) as usize];
-        for (d, lit) in row_entries {
-            if d >= 0 && (d as usize) < ordered.len() {
-                ordered[d as usize] = lit;
-            }
-        }
+        let entry_lits: Vec<String> = row_entries
+            .iter()
+            .map(|(d, lit)| format!("({d}i64, {lit})"))
+            .collect();
         writeln!(
             out,
-            "static STRATA_TABLE_{tident}: &[{row_struct}] = &[\n    {}\n];\n",
-            ordered.join(",\n    ")
+            "static STRATA_TABLE_{tident}: &[(i64, {row_struct})] = &[\n    {}\n];\n\
+             #[allow(dead_code)]\n\
+             #[inline]\n\
+             const fn strata_table_get_{tident}(key: i64) -> {row_struct} {{\n\
+             \x20   let mut lo = 0usize;\n\
+             \x20   let mut hi = STRATA_TABLE_{tident}.len();\n\
+             \x20   while lo < hi {{\n\
+             \x20       let mid = lo + (hi - lo) / 2;\n\
+             \x20       let k = STRATA_TABLE_{tident}[mid].0;\n\
+             \x20       if k == key {{\n\
+             \x20           return STRATA_TABLE_{tident}[mid].1;\n\
+             \x20       }} else if k < key {{\n\
+             \x20           lo = mid + 1;\n\
+             \x20       }} else {{\n\
+             \x20           hi = mid;\n\
+             \x20       }}\n\
+             \x20   }}\n\
+             \x20   {row_struct}::strata_default()\n\
+             }}\n",
+            entry_lits.join(",\n    ")
         )
         .ok();
     }
@@ -2656,6 +3340,17 @@ pub(super) fn rust_ty_from_hir_ty(ty: &Ty, ctx: &NativeCtx<'_>) -> String {
         Ty::Mat3 => "[f32; 9]".to_owned(),
         Ty::Mat4 => "[f32; 16]".to_owned(),
         Ty::Array { elem, len } => format!("[{}; {len}]", rust_ty_from_hir_ty(elem, ctx)),
+        Ty::SmallVec { elem, cap } => {
+            let (es, ea) = sema_ty_size_align(elem, ctx);
+            let stride = if es == 0 {
+                0
+            } else {
+                es.div_ceil(ea.max(1)) * ea.max(1)
+            };
+            aligned_blob_type(8 + stride * (*cap), ea.max(4))
+        }
+        Ty::InputBuffer { cap, .. } => format!("[u32; {}]", (*cap) * 2),
+        Ty::Unit => "()".to_owned(),
         Ty::BitSet(bits) => format!("[u32; {}]", (*bits).div_ceil(32).max(1)),
         Ty::InlineStr(cap) => format!("[u32; {}]", 1 + cap.div_ceil(4)),
         Ty::Ref(_) => "FfiEntity".to_owned(),
@@ -2685,7 +3380,6 @@ pub(super) fn rust_default_expr_from_hir_ty(ty: &Ty, ctx: &NativeCtx<'_>) -> Str
         Ty::I8 => "0i8".to_owned(),
         Ty::U16 => "0u16".to_owned(),
         Ty::I16 => "0i16".to_owned(),
-        Ty::U32 | Ty::Sym | Ty::Rgba8 => "0u32".to_owned(),
         Ty::I32 => "0i32".to_owned(),
         Ty::U64 => "0u64".to_owned(),
         Ty::I64 => "0i64".to_owned(),
@@ -2704,6 +3398,17 @@ pub(super) fn rust_default_expr_from_hir_ty(ty: &Ty, ctx: &NativeCtx<'_>) -> Str
         Ty::Array { elem, len } => {
             format!("[{}; {len}]", rust_default_expr_from_hir_ty(elem, ctx))
         }
+        Ty::SmallVec { elem, cap } => {
+            let (es, ea) = sema_ty_size_align(elem, ctx);
+            let stride = if es == 0 {
+                0
+            } else {
+                es.div_ceil(ea.max(1)) * ea.max(1)
+            };
+            aligned_blob_default_expr(8 + stride * (*cap), ea.max(4))
+        }
+        Ty::InputBuffer { cap, .. } => format!("[0u32; {}]", (*cap) * 2),
+        Ty::Unit => "()".to_owned(),
         Ty::Ref(_) => "FfiEntity::NULL".to_owned(),
         Ty::Asset(_) => "FfiAssetHandle::NONE".to_owned(),
         Ty::BitSet(bits) => format!("[0u32; {}]", (*bits).div_ceil(32).max(1)),
@@ -2716,10 +3421,10 @@ pub(super) fn rust_default_expr_from_hir_ty(ty: &Ty, ctx: &NativeCtx<'_>) -> Str
             } else if let Some(entry) = ctx.find_layout_entry(n) {
                 format!("{}::strata_default()", entry.struct_name)
             } else {
-                "Default::default()".to_owned()
+                "0u32".to_owned()
             }
         }
-        _ => "Default::default()".to_owned(),
+        _ => "0u32".to_owned(),
     }
 }
 
@@ -2754,28 +3459,435 @@ pub(super) fn emit_net_protocol_and_codecs(
     .ok();
 
     for rpc in &mir.rpcs {
-        emit_native_rpc_struct_and_codec(out, mir, rpc)?;
+        emit_native_rpc_struct_and_codec(out, ctx, rpc)?;
     }
     for nc in &mir.net_components {
         if nc.is_replicated || !nc.quantize_specs.is_empty() {
-            let Some(entry) = ctx.find_layout_entry(&nc.canonical_name) else {
+            let Some(strata_entries) = collect_net_comp_strata(nc, ctx) else {
                 return Err(CodegenError::Unsupported {
                     context: format!("bevy_native::net_component({})", nc.canonical_name),
                     detail: "missing solved layout for network component".to_owned(),
                 });
             };
-            emit_native_net_component_codec(out, mir, nc, &entry.struct_name, entry.layout)?;
+            emit_native_net_component_codec(out, ctx, nc, &strata_entries)?;
         }
     }
     Ok(())
 }
 
+enum NetFieldTarget {
+    Direct {
+        fname: String,
+        rty: String,
+    },
+    NestedBlob {
+        top_fname: String,
+        rel_off: usize,
+        leaf_sz: usize,
+        leaf_rty: String,
+    },
+}
+
+fn collect_net_comp_strata<'a>(
+    nc: &MirNetComponent,
+    ctx: &'a NativeCtx<'a>,
+) -> Option<Vec<(String, LayoutEntry<'a>)>> {
+    let mut out: Vec<(String, LayoutEntry<'a>)> = Vec::new();
+    let mut seen: HashSet<&'a str> = HashSet::new();
+    for wf in &nc.wire_fields {
+        let key = wf.stratum_layout.as_deref().unwrap_or(&nc.canonical_name);
+        if let Some(entry) = ctx.find_layout_entry(key)
+            && seen.insert(entry.layout.canonical_name.as_str())
+        {
+            out.push((key.to_owned(), entry.clone()));
+        }
+    }
+    if out.is_empty()
+        && let Some(entry) = ctx.find_layout_entry(&nc.canonical_name)
+    {
+        out.push((entry.layout.canonical_name.clone(), entry.clone()));
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn net_replicated_chunk_count(ctx: &NativeCtx<'_>) -> usize {
+    let valid_rep = ctx
+        .mir
+        .net_components
+        .iter()
+        .filter(|nc| nc.is_replicated && collect_net_comp_strata(nc, ctx).is_some())
+        .count();
+    if valid_rep == 0 {
+        0
+    } else {
+        valid_rep.div_ceil(14)
+    }
+}
+
+fn walk_nested_solved_field<'a>(
+    ctx: &'a NativeCtx<'a>,
+    mut ty: &'a Ty,
+    parts: &[&str],
+    initial_off: usize,
+    context_label: &str,
+    full_path: &str,
+) -> Result<(usize, usize, String), CodegenError> {
+    let mut rel_off = initial_off;
+    for (idx, seg) in parts.iter().enumerate() {
+        let Ty::Named(ref inner) = *ty else {
+            return Err(CodegenError::Unsupported {
+                context: context_label.to_owned(),
+                detail: format!("nested wire field `{full_path}` traverses non-struct field"),
+            });
+        };
+        let Some(entry) = ctx.find_layout_entry(inner) else {
+            return Err(CodegenError::Unsupported {
+                context: context_label.to_owned(),
+                detail: format!("nested wire field `{full_path}` missing layout `{inner}`"),
+            });
+        };
+        let Some(sf) = entry.layout.fields.iter().find(|f| f.name == *seg) else {
+            return Err(CodegenError::Unsupported {
+                context: context_label.to_owned(),
+                detail: format!(
+                    "nested wire field `{full_path}` missing segment `{seg}` on `{}`",
+                    entry.layout.canonical_name
+                ),
+            });
+        };
+        rel_off += sf.offset;
+        if idx + 1 == parts.len() {
+            let rty = rust_abi_type_for_field(sf, ctx.mir);
+            return Ok((rel_off, sf.size, rty));
+        }
+        ty = &sf.ty;
+    }
+    Err(CodegenError::Unsupported {
+        context: context_label.to_owned(),
+        detail: format!("empty nested wire path `{full_path}`"),
+    })
+}
+
+fn resolve_comp_wire_field_target(
+    ctx: &NativeCtx<'_>,
+    layout: &SolvedLayout,
+    path: &str,
+    comp_canon: &str,
+) -> Result<NetFieldTarget, CodegenError> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let Some(sf0) = layout.fields.iter().find(|f| f.name == parts[0]) else {
+        return Err(CodegenError::Unsupported {
+            context: format!("bevy_native::net_component({comp_canon})"),
+            detail: format!(
+                "wire field `{path}` missing from solved layout `{}`",
+                layout.canonical_name
+            ),
+        });
+    };
+    let top_fname = sanitize_rust_ident(parts[0]);
+    if parts.len() == 1 {
+        return Ok(NetFieldTarget::Direct {
+            fname: top_fname,
+            rty: rust_abi_type_for_field(sf0, ctx.mir),
+        });
+    }
+    let ctx_lbl = format!("bevy_native::net_component({comp_canon})");
+    let (rel_off, leaf_sz, leaf_rty) =
+        walk_nested_solved_field(ctx, &sf0.ty, &parts[1..], 0, &ctx_lbl, path)?;
+    Ok(NetFieldTarget::NestedBlob {
+        top_fname,
+        rel_off,
+        leaf_sz,
+        leaf_rty,
+    })
+}
+
+fn resolve_rpc_wire_field_target(
+    ctx: &NativeCtx<'_>,
+    rpc: &MirRpc,
+    path: &str,
+) -> Result<NetFieldTarget, CodegenError> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let Some((_, mty, _, sz)) = rpc.fields.iter().find(|(n, _, _, _)| n == parts[0]) else {
+        return Err(CodegenError::Unsupported {
+            context: format!("bevy_native::rpc({})", rpc.canonical_name),
+            detail: format!("wire field `{path}` missing from RPC payload"),
+        });
+    };
+    let top_fname = sanitize_rust_ident(parts[0]);
+    if parts.len() == 1 {
+        return Ok(NetFieldTarget::Direct {
+            fname: top_fname,
+            rty: rust_abi_type_for_mir_ty(mty, *sz, ctx.mir),
+        });
+    }
+    let MirType::Named(ref inner) = *mty else {
+        return Err(CodegenError::Unsupported {
+            context: format!("bevy_native::rpc({})", rpc.canonical_name),
+            detail: format!("nested wire field `{path}` traverses non-struct field"),
+        });
+    };
+    let Some(entry) = ctx.find_layout_entry(inner) else {
+        return Err(CodegenError::Unsupported {
+            context: format!("bevy_native::rpc({})", rpc.canonical_name),
+            detail: format!("nested wire field `{path}` missing layout `{inner}`"),
+        });
+    };
+    let rest = &parts[1..];
+    let Some(sf1) = entry.layout.fields.iter().find(|f| f.name == rest[0]) else {
+        return Err(CodegenError::Unsupported {
+            context: format!("bevy_native::rpc({})", rpc.canonical_name),
+            detail: format!("nested wire field `{path}` missing segment `{}`", rest[0]),
+        });
+    };
+    let ctx_lbl = format!("bevy_native::rpc({})", rpc.canonical_name);
+    let (rel_off, leaf_sz, leaf_rty) = if rest.len() == 1 {
+        (sf1.offset, sf1.size, rust_abi_type_for_field(sf1, ctx.mir))
+    } else {
+        walk_nested_solved_field(ctx, &sf1.ty, &rest[1..], sf1.offset, &ctx_lbl, path)?
+    };
+    Ok(NetFieldTarget::NestedBlob {
+        top_fname,
+        rel_off,
+        leaf_sz,
+        leaf_rty,
+    })
+}
+
+fn const_zero_for_rust_abi_ty(rt: &str) -> String {
+    match rt {
+        "()" => "()".to_owned(),
+        "bool" => "false".to_owned(),
+        "FfiBool" => "FfiBool::FALSE".to_owned(),
+        "u8" => "0u8".to_owned(),
+        "i8" => "0i8".to_owned(),
+        "u16" => "0u16".to_owned(),
+        "i16" => "0i16".to_owned(),
+        "u32" => "0u32".to_owned(),
+        "i32" => "0i32".to_owned(),
+        "u64" => "0u64".to_owned(),
+        "i64" => "0i64".to_owned(),
+        "f32" => "0.0_f32".to_owned(),
+        "f64" => "0.0_f64".to_owned(),
+        "Fixed32" => "Fixed32(0i32)".to_owned(),
+        "Fixed64" => "Fixed64(0i64)".to_owned(),
+        "FfiEntity" => "FfiEntity::NULL".to_owned(),
+        "FfiAssetHandle" => "FfiAssetHandle::NONE".to_owned(),
+        _ => {
+            let trimmed = rt.trim();
+            if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+                && let Some((elem, len_s)) = inner.rsplit_once(';')
+            {
+                let elem_z = const_zero_for_rust_abi_ty(elem.trim());
+                return format!("[{elem_z}; {}]", len_s.trim());
+            }
+            "Default::default()".to_owned()
+        }
+    }
+}
+
+fn emit_native_wire_encode(
+    out: &mut String,
+    wf: &strata_mir::MirNetFieldSpec,
+    target: &NetFieldTarget,
+    src_var: &str,
+) -> Result<(), CodegenError> {
+    match target {
+        NetFieldTarget::Direct { fname, rty } => {
+            emit_rust_wire_field_encode(out, wf, fname, rty, src_var)
+        }
+        NetFieldTarget::NestedBlob {
+            top_fname,
+            rel_off,
+            leaf_sz,
+            leaf_rty,
+        } => {
+            writeln!(
+                out,
+                "    {{\n\
+                 \x20       let mut __nb = [0u8; {leaf_sz}];\n\
+                 \x20       {src_var}.{top_fname}.strata_pod_read_sub({rel_off}, &mut __nb);\n\
+                 \x20       let __nv = <{leaf_rty} as StrataPodBytes>::strata_pod_from_bytes(&__nb);"
+            )
+            .ok();
+            if let Some(ref q) = wf.quantize {
+                let min_s = format!("{:?}f64", q.min);
+                let max_s = format!("{:?}f64", q.max);
+                let step_s = match q.step {
+                    Some(s) => format!("Some({s:?}f64)"),
+                    None => "None".to_owned(),
+                };
+                let bits = q.bits;
+                let to_f64 = |e: &str| {
+                    if leaf_rty == "Fixed32" {
+                        format!("(({e}.0 as f64) / 65_536.0_f64)")
+                    } else if leaf_rty == "Fixed64" {
+                        format!("(({e}.0 as f64) / 4_294_967_296.0_f64)")
+                    } else if matches!(wf.ty, MirType::Fix32) {
+                        format!("(({e} as f64) / 65_536.0_f64)")
+                    } else if matches!(wf.ty, MirType::Fix64) {
+                        format!("(({e} as f64) / 4_294_967_296.0_f64)")
+                    } else {
+                        format!("{e} as f64")
+                    }
+                };
+                if q.lane_count == 1 {
+                    let vs = to_f64("__nv");
+                    writeln!(
+                        out,
+                        "        strata_net_pack_bits_le(&mut pkt.payload, {}, {bits}, strata_net_quantize_scalar_f64({vs}, {min_s}, {max_s}, {bits}, {step_s}));",
+                        wf.bit_offset
+                    )
+                    .ok();
+                } else {
+                    for li in 0..(q.lane_count as usize) {
+                        let boff = wf.bit_offset + (li as u32) * u32::from(bits);
+                        let vs = to_f64(&format!("__nv[{li}]"));
+                        writeln!(
+                            out,
+                            "        strata_net_pack_bits_le(&mut pkt.payload, {boff}, {bits}, strata_net_quantize_scalar_f64({vs}, {min_s}, {max_s}, {bits}, {step_s}));"
+                        )
+                        .ok();
+                    }
+                }
+            } else if matches!(leaf_rty.as_str(), "bool" | "FfiBool") {
+                writeln!(
+                    out,
+                    "        let _ = &__nv;\n\
+                     \x20       strata_net_pack_bits_le(&mut pkt.payload, {}, 8, u64::from(__nb.first().copied().unwrap_or(0) != 0));",
+                    wf.bit_offset
+                )
+                .ok();
+            } else {
+                writeln!(
+                    out,
+                    "        let _ = &__nv;\n\
+                     \x20       for (__ni, &__nbyte) in __nb.iter().take({}).enumerate() {{\n\
+                     \x20           strata_net_pack_bits_le(&mut pkt.payload, {} + (__ni as u32) * 8, 8, u64::from(__nbyte));\n\
+                     \x20       }}",
+                    wf.byte_size, wf.bit_offset
+                )
+                .ok();
+            }
+            writeln!(out, "    }}").ok();
+            Ok(())
+        }
+    }
+}
+
+fn emit_native_wire_decode(
+    out: &mut String,
+    wf: &strata_mir::MirNetFieldSpec,
+    target: &NetFieldTarget,
+    dst_var: &str,
+) -> Result<(), CodegenError> {
+    match target {
+        NetFieldTarget::Direct { fname, rty } => {
+            emit_rust_wire_field_decode(out, wf, fname, rty, dst_var)
+        }
+        NetFieldTarget::NestedBlob {
+            top_fname,
+            rel_off,
+            leaf_sz,
+            leaf_rty,
+        } => {
+            writeln!(out, "    {{").ok();
+            if let Some(ref q) = wf.quantize {
+                let min_s = format!("{:?}f64", q.min);
+                let max_s = format!("{:?}f64", q.max);
+                let step_s = match q.step {
+                    Some(s) => format!("Some({s:?}f64)"),
+                    None => "None".to_owned(),
+                };
+                let bits = q.bits;
+                let init_z = const_zero_for_rust_abi_ty(leaf_rty);
+                writeln!(out, "        let mut __nv: {leaf_rty} = {init_z};").ok();
+                let cast_val = |deq_expr: &str, lane_ty: &str| -> String {
+                    if lane_ty == "Fixed32" {
+                        return format!("Fixed32((({deq_expr}) * 65_536.0_f64).round() as i32)");
+                    }
+                    if lane_ty == "Fixed64" {
+                        return format!(
+                            "Fixed64((({deq_expr}) * 4_294_967_296.0_f64).round() as i64)"
+                        );
+                    }
+                    if matches!(wf.ty, MirType::Fix32) {
+                        return format!("(({deq_expr}) * 65_536.0_f64).round() as i32");
+                    }
+                    if matches!(wf.ty, MirType::Fix64) {
+                        return format!("(({deq_expr}) * 4_294_967_296.0_f64).round() as i64");
+                    }
+                    match lane_ty {
+                        "f64" => deq_expr.to_owned(),
+                        "i8" => format!("({deq_expr}).round() as i8"),
+                        "i16" => format!("({deq_expr}).round() as i16"),
+                        "i32" | "[i32; 2]" | "[i32; 3]" => format!("({deq_expr}).round() as i32"),
+                        "i64" => format!("({deq_expr}).round() as i64"),
+                        "u8" => format!("({deq_expr}).round().max(0.0) as u8"),
+                        "u16" => format!("({deq_expr}).round().max(0.0) as u16"),
+                        "u32" | "[u32; 2]" => format!("({deq_expr}).round().max(0.0) as u32"),
+                        "u64" => format!("({deq_expr}).round().max(0.0) as u64"),
+                        _ => format!("({deq_expr}) as f32"),
+                    }
+                };
+                if q.lane_count == 1 {
+                    let deq = format!(
+                        "strata_net_dequantize_scalar_f64(strata_net_unpack_bits_le(&pkt.payload, {}, {bits}), {min_s}, {max_s}, {bits}, {step_s})",
+                        wf.bit_offset
+                    );
+                    let assigned = cast_val(&deq, leaf_rty);
+                    writeln!(out, "        __nv = {assigned};").ok();
+                } else {
+                    for li in 0..(q.lane_count as usize) {
+                        let boff = wf.bit_offset + (li as u32) * u32::from(bits);
+                        let deq = format!(
+                            "strata_net_dequantize_scalar_f64(strata_net_unpack_bits_le(&pkt.payload, {boff}, {bits}), {min_s}, {max_s}, {bits}, {step_s})"
+                        );
+                        let assigned = cast_val(&deq, leaf_rty);
+                        writeln!(out, "        __nv[{li}] = {assigned};").ok();
+                    }
+                }
+                writeln!(
+                    out,
+                    "        let mut __nb = [0u8; {leaf_sz}];\n\
+                     \x20       __nv.strata_pod_read_sub(0, &mut __nb);\n\
+                     \x20       {dst_var}.{top_fname}.strata_pod_write_bytes({rel_off}, &__nb);"
+                )
+                .ok();
+            } else {
+                writeln!(
+                    out,
+                    "        let mut __nb = [0u8; {leaf_sz}];\n\
+                     \x20       for (__ni, __slot) in __nb.iter_mut().take({}).enumerate() {{\n\
+                     \x20           *__slot = strata_net_unpack_bits_le(&pkt.payload, {} + (__ni as u32) * 8, 8) as u8;\n\
+                     \x20       }}",
+                    wf.byte_size, wf.bit_offset
+                )
+                .ok();
+                if matches!(leaf_rty.as_str(), "bool" | "FfiBool") {
+                    writeln!(
+                        out,
+                        "        if !__nb.is_empty() {{ __nb[0] = u8::from(__nb[0] != 0); }}"
+                    )
+                    .ok();
+                }
+                writeln!(
+                    out,
+                    "        {dst_var}.{top_fname}.strata_pod_write_bytes({rel_off}, &__nb);"
+                )
+                .ok();
+            }
+            writeln!(out, "    }}").ok();
+            Ok(())
+        }
+    }
+}
+
 pub(super) fn emit_native_net_component_codec(
     out: &mut String,
-    mir: &MirModule,
+    ctx: &NativeCtx<'_>,
     nc: &MirNetComponent,
-    struct_name: &str,
-    layout: &SolvedLayout,
+    strata_entries: &[(String, LayoutEntry<'_>)],
 ) -> Result<(), CodegenError> {
     let ident = sanitize_ident(&nc.name);
     let fp = nc.schema_fingerprint;
@@ -2801,9 +3913,20 @@ pub(super) fn emit_native_net_component_codec(
         flags_parts.join(" | ")
     };
 
+    let multi_stratum = strata_entries.len() > 1;
+    let enc_sig_params = if multi_stratum {
+        strata_entries
+            .iter()
+            .enumerate()
+            .map(|(i, (_, e))| format!("src_{i}: &{}", e.struct_name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        format!("src: &{}", strata_entries[0].1.struct_name)
+    };
     writeln!(
         out,
-        "pub fn strata_net_encode_{ident}(src: &{struct_name}, entity_bits: u64, tick_or_seq: u32, client_id: u8) -> StrataNetPacket {{\n\
+        "pub fn strata_net_encode_{ident}({enc_sig_params}, entity_bits: u64, tick_or_seq: u32, client_id: u8) -> StrataNetPacket {{\n\
          \x20   let mut pkt = StrataNetPacket::default();\n\
          \x20   pkt.module_net_fingerprint = STRATA_NET_MODULE_FINGERPRINT;\n\
          \x20   pkt.item_schema_fingerprint = 0x{fp:016X};\n\
@@ -2822,18 +3945,22 @@ pub(super) fn emit_native_net_component_codec(
     )
     .ok();
     for wf in &nc.wire_fields {
-        let Some(sf) = layout.fields.iter().find(|f| f.name == wf.field_name) else {
-            return Err(CodegenError::Unsupported {
-                context: format!("bevy_native::net_component({})", nc.canonical_name),
-                detail: format!(
-                    "wire field `{}` missing from solved layout `{}`",
-                    wf.field_name, layout.canonical_name
-                ),
-            });
+        let sl_key = wf.stratum_layout.as_deref().unwrap_or(&nc.canonical_name);
+        let si = strata_entries
+            .iter()
+            .position(|(k, e)| {
+                k.as_str() == sl_key || e.layout.canonical_name == sl_key || e.struct_name == sl_key
+            })
+            .unwrap_or(0);
+        let layout = strata_entries[si].1.layout;
+        let resolved =
+            resolve_comp_wire_field_target(ctx, layout, &wf.field_name, &nc.canonical_name)?;
+        let src_var = if multi_stratum {
+            format!("src_{si}")
+        } else {
+            "src".to_owned()
         };
-        let fname = sanitize_rust_ident(&wf.field_name);
-        let rty = rust_abi_type_for_field(sf, mir);
-        emit_rust_wire_field_encode(out, wf, &fname, &rty, "src")?;
+        emit_native_wire_encode(out, wf, &resolved, &src_var)?;
     }
     writeln!(out, "    pkt\n}}\n").ok();
 
@@ -2842,9 +3969,19 @@ pub(super) fn emit_native_net_component_codec(
     } else {
         String::new()
     };
+    let dec_sig_params = if multi_stratum {
+        strata_entries
+            .iter()
+            .enumerate()
+            .map(|(i, (_, e))| format!("out_{i}: &mut {}", e.struct_name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        format!("out_val: &mut {}", strata_entries[0].1.struct_name)
+    };
     writeln!(
         out,
-        "pub fn strata_net_decode_{ident}(pkt: &StrataNetPacket, out_val: &mut {struct_name}) -> bool {{\n\
+        "pub fn strata_net_decode_{ident}(pkt: &StrataNetPacket, {dec_sig_params}) -> bool {{\n\
          \x20   if !strata_net_verify_handshake(pkt, 0x{fp:016X}) || pkt.item_schema_fingerprint != 0x{fp:016X} {{\n\
          \x20       return false;\n\
          \x20   }}\n\
@@ -2854,18 +3991,22 @@ pub(super) fn emit_native_net_component_codec(
     )
     .ok();
     for wf in &nc.wire_fields {
-        let Some(sf) = layout.fields.iter().find(|f| f.name == wf.field_name) else {
-            return Err(CodegenError::Unsupported {
-                context: format!("bevy_native::net_component({})", nc.canonical_name),
-                detail: format!(
-                    "wire field `{}` missing from solved layout `{}`",
-                    wf.field_name, layout.canonical_name
-                ),
-            });
+        let sl_key = wf.stratum_layout.as_deref().unwrap_or(&nc.canonical_name);
+        let si = strata_entries
+            .iter()
+            .position(|(k, e)| {
+                k.as_str() == sl_key || e.layout.canonical_name == sl_key || e.struct_name == sl_key
+            })
+            .unwrap_or(0);
+        let layout = strata_entries[si].1.layout;
+        let resolved =
+            resolve_comp_wire_field_target(ctx, layout, &wf.field_name, &nc.canonical_name)?;
+        let dst_var = if multi_stratum {
+            format!("out_{si}")
+        } else {
+            "out_val".to_owned()
         };
-        let fname = sanitize_rust_ident(&wf.field_name);
-        let rty = rust_abi_type_for_field(sf, mir);
-        emit_rust_wire_field_decode(out, wf, &fname, &rty, "out_val")?;
+        emit_native_wire_decode(out, wf, &resolved, &dst_var)?;
     }
     writeln!(out, "    true\n}}\n").ok();
     Ok(())
@@ -2873,9 +4014,10 @@ pub(super) fn emit_native_net_component_codec(
 
 pub(super) fn emit_native_rpc_struct_and_codec(
     out: &mut String,
-    mir: &MirModule,
+    ctx: &NativeCtx<'_>,
     rpc: &MirRpc,
 ) -> Result<(), CodegenError> {
+    let mir = ctx.mir;
     let ident = sanitize_ident(&rpc.name);
     let rty = format!("StrataRpc_{ident}");
     if rpc.fields.is_empty() {
@@ -2887,15 +4029,26 @@ pub(super) fn emit_native_rpc_struct_and_codec(
     } else {
         writeln!(
             out,
-            "#[repr(C)]\n#[derive(Clone, Copy, Debug, Default, PartialEq)]\npub struct {rty} {{"
+            "#[repr(C)]\n#[derive(Clone, Copy, Debug, PartialEq)]\npub struct {rty} {{"
         )
         .ok();
+        let mut def_inits = Vec::with_capacity(rpc.fields.len());
         for (fname, mty, _, sz) in &rpc.fields {
             let rf = sanitize_rust_ident(fname);
             let rt = rust_abi_type_for_mir_ty(mty, *sz, mir);
             writeln!(out, "    pub {rf}: {rt},").ok();
+            def_inits.push(format!("{rf}: {}", const_zero_for_rust_abi_ty(&rt)));
         }
-        writeln!(out, "}}\n").ok();
+        writeln!(
+            out,
+            "}}\nimpl Default for {rty} {{\n\
+             \x20   fn default() -> Self {{\n\
+             \x20       Self {{ {} }}\n\
+             \x20   }}\n\
+             }}\n",
+            def_inits.join(", ")
+        )
+        .ok();
     }
 
     let fp = rpc.schema_fingerprint;
@@ -2927,16 +4080,8 @@ pub(super) fn emit_native_rpc_struct_and_codec(
     )
     .ok();
     for wf in &rpc.wire_fields {
-        let Some((_, mty, _, sz)) = rpc.fields.iter().find(|(n, _, _, _)| n == &wf.field_name)
-        else {
-            return Err(CodegenError::Unsupported {
-                context: format!("bevy_native::rpc({})", rpc.canonical_name),
-                detail: format!("wire field `{}` missing from RPC payload", wf.field_name),
-            });
-        };
-        let rf = sanitize_rust_ident(&wf.field_name);
-        let rt = rust_abi_type_for_mir_ty(mty, *sz, mir);
-        emit_rust_wire_field_encode(out, wf, &rf, &rt, "rpc")?;
+        let resolved = resolve_rpc_wire_field_target(ctx, rpc, &wf.field_name)?;
+        emit_native_wire_encode(out, wf, &resolved, "rpc")?;
     }
     writeln!(out, "    pkt\n}}\n").ok();
 
@@ -2957,168 +4102,226 @@ pub(super) fn emit_native_rpc_struct_and_codec(
     )
     .ok();
     for wf in &rpc.wire_fields {
-        let Some((_, mty, _, sz)) = rpc.fields.iter().find(|(n, _, _, _)| n == &wf.field_name)
-        else {
-            return Err(CodegenError::Unsupported {
-                context: format!("bevy_native::rpc({})", rpc.canonical_name),
-                detail: format!("wire field `{}` missing from RPC payload", wf.field_name),
-            });
-        };
-        let rf = sanitize_rust_ident(&wf.field_name);
-        let rt = rust_abi_type_for_mir_ty(mty, *sz, mir);
-        emit_rust_wire_field_decode(out, wf, &rf, &rt, "out_rpc")?;
+        let resolved = resolve_rpc_wire_field_target(ctx, rpc, &wf.field_name)?;
+        emit_native_wire_decode(out, wf, &resolved, "out_rpc")?;
     }
     writeln!(out, "    true\n}}\n").ok();
     Ok(())
 }
 
 pub(super) fn emit_net_synthesized_systems(out: &mut String, ctx: &NativeCtx<'_>) {
-    let rep_comps: Vec<&MirNetComponent> = ctx
+    let rep_items: Vec<(&MirNetComponent, Vec<(String, LayoutEntry<'_>)>)> = ctx
         .mir
         .net_components
         .iter()
         .filter(|nc| nc.is_replicated)
+        .filter_map(|nc| collect_net_comp_strata(nc, ctx).map(|strata| (nc, strata)))
         .collect();
-    if rep_comps.is_empty() {
+    if rep_items.is_empty() {
         return;
     }
 
-    // RX system
-    let mut rx_params = vec!["mut mr_net: MessageReader<StrataNetPacket>".to_owned()];
-    let mut tx_params = vec!["mut mw_net: MessageWriter<StrataNetPacket>".to_owned()];
-    for (idx, nc) in rep_comps.iter().enumerate() {
-        let Some(entry) = ctx.find_layout_entry(&nc.canonical_name) else {
-            continue;
-        };
-        let sname = &entry.struct_name;
-        if nc.is_resource {
-            rx_params.push(format!("mut net_res_{idx}: ResMut<{sname}>"));
-            tx_params.push(format!("net_res_{idx}: Res<{sname}>"));
-        } else {
-            rx_params.push(format!(
-                "mut net_q_{idx}: Query<(Entity, &'static mut {sname})>"
-            ));
-            tx_params.push(format!(
-                "net_q_{idx}: Query<(Entity, &'static {sname}), Changed<{sname}>>"
-            ));
-        }
-    }
+    let chunks: Vec<&[(&MirNetComponent, Vec<(String, LayoutEntry<'_>)>)]> =
+        rep_items.chunks(14).collect();
+    let multi_chunk = chunks.len() > 1;
 
-    writeln!(out, "fn strata_sys_net_rx({}) {{", rx_params.join(", ")).ok();
-    writeln!(
-        out,
-        "    let pkts: Vec<StrataNetPacket> = mr_net.read().copied().collect();\n\
-         \x20   if pkts.is_empty() {{ return; }}"
-    )
-    .ok();
-    for (idx, nc) in rep_comps.iter().enumerate() {
-        let Some(entry) = ctx.find_layout_entry(&nc.canonical_name) else {
-            continue;
-        };
-        let ident = sanitize_ident(&nc.name);
-        let target_id = fnv1a_64_str(&nc.canonical_name);
-        if nc.is_resource {
-            writeln!(
-                out,
-                "    if let Some(last_pkt) = pkts.iter().rev().find(|p| p.kind == PACKET_KIND_RESOURCE_DELTA && p.target_id == 0x{target_id:016X}) {{\n\
-                 \x20       let mut decoded = *net_res_{idx};\n\
-                 \x20       if strata_net_decode_{ident}(last_pkt, &mut decoded) && decoded != *net_res_{idx} {{\n\
-                 \x20           *net_res_{idx} = decoded;\n\
-                 \x20       }}\n\
-                 \x20   }}"
-            )
-            .ok();
+    for (ci, chunk) in chunks.iter().enumerate() {
+        let rx_fn = if multi_chunk {
+            format!("strata_sys_net_rx_{ci}")
         } else {
-            let is_sparse =
-                (entry.layout.component_flags & bamabi_sys::BAM_COMPONENT_FLAG_SPARSE_SET) != 0;
-            writeln!(
-                out,
-                "    if pkts.iter().any(|p| p.kind == PACKET_KIND_COMPONENT_DELTA && p.target_id == 0x{target_id:016X}) {{"
-            )
-            .ok();
-            if is_sparse {
+            "strata_sys_net_rx".to_owned()
+        };
+        let tx_fn = if multi_chunk {
+            format!("strata_sys_net_tx_{ci}")
+        } else {
+            "strata_sys_net_tx".to_owned()
+        };
+
+        let mut rx_params = vec!["mut mr_net: MessageReader<StrataNetPacket>".to_owned()];
+        let mut tx_params = vec!["mut mw_net: MessageWriter<StrataNetPacket>".to_owned()];
+        for (idx, (nc, strata_entries)) in chunk.iter().enumerate() {
+            if nc.is_resource {
+                let sname = &strata_entries[0].1.struct_name;
+                rx_params.push(format!("mut net_res_{idx}: ResMut<{sname}>"));
+                tx_params.push(format!("net_res_{idx}: Res<{sname}>"));
+            } else if strata_entries.len() == 1 {
+                let sname = &strata_entries[0].1.struct_name;
+                rx_params.push(format!(
+                    "mut net_q_{idx}: Query<(Entity, &'static mut {sname})>"
+                ));
+                tx_params.push(format!(
+                    "net_q_{idx}: Query<(Entity, &'static {sname}), Changed<{sname}>>"
+                ));
+            } else {
+                let mut rx_q_terms = vec!["Entity".to_owned()];
+                let mut tx_q_terms = vec!["Entity".to_owned()];
+                let mut tx_changed = Vec::new();
+                for (_, entry) in strata_entries {
+                    let sname = &entry.struct_name;
+                    rx_q_terms.push(format!("&'static mut {sname}"));
+                    tx_q_terms.push(format!("&'static {sname}"));
+                    tx_changed.push(format!("Changed<{sname}>"));
+                }
+                rx_params.push(format!(
+                    "mut net_q_{idx}: Query<({})>",
+                    rx_q_terms.join(", ")
+                ));
+                tx_params.push(format!(
+                    "net_q_{idx}: Query<({}), Or<({})>>",
+                    tx_q_terms.join(", "),
+                    tx_changed.join(", ")
+                ));
+            }
+        }
+
+        writeln!(out, "fn {rx_fn}({}) {{", rx_params.join(", ")).ok();
+        writeln!(
+            out,
+            "    let pkts: Vec<StrataNetPacket> = mr_net.read().copied().collect();\n\
+             \x20   if pkts.is_empty() {{ return; }}"
+        )
+        .ok();
+        for (idx, (nc, strata_entries)) in chunk.iter().enumerate() {
+            let ident = sanitize_ident(&nc.name);
+            let target_id = fnv1a_64_str(&nc.canonical_name);
+            if nc.is_resource {
                 writeln!(
                     out,
-                    "        for (ent, mut comp_mut) in net_q_{idx}.iter_mut() {{\n\
+                    "    if let Some(last_pkt) = pkts.iter().rev().find(|p| p.kind == PACKET_KIND_RESOURCE_DELTA && p.target_id == 0x{target_id:016X}) {{\n\
+                     \x20       let mut decoded = *net_res_{idx};\n\
+                     \x20       if strata_net_decode_{ident}(last_pkt, &mut decoded) && decoded != *net_res_{idx} {{\n\
+                     \x20           *net_res_{idx} = decoded;\n\
+                     \x20       }}\n\
+                     \x20   }}"
+                )
+                .ok();
+            } else if strata_entries.len() > 1 {
+                let k = strata_entries.len();
+                let mut_vars: Vec<String> = (0..k).map(|s| format!("mut __c_{s}")).collect();
+                let dec_decls: String = (0..k)
+                    .map(|s| format!("let mut __d_{s} = *__c_{s}; "))
+                    .collect();
+                let dec_args: Vec<String> = (0..k).map(|s| format!("&mut __d_{s}")).collect();
+                let assign_back: String = (0..k)
+                    .map(|s| format!("if __d_{s} != *__c_{s} {{ *__c_{s} = __d_{s}; }} "))
+                    .collect();
+                writeln!(
+                    out,
+                    "    if pkts.iter().any(|p| p.kind == PACKET_KIND_COMPONENT_DELTA && p.target_id == 0x{target_id:016X}) {{\n\
+                     \x20       for (ent, {}) in net_q_{idx}.iter_mut() {{\n\
                      \x20           let ebits = ent.to_bits();\n\
                      \x20           if let Some(pkt) = pkts.iter().rev().find(|p| p.kind == PACKET_KIND_COMPONENT_DELTA && p.target_id == 0x{target_id:016X} && p.entity_bits == ebits) {{\n\
-                     \x20               let mut decoded = *comp_mut;\n\
-                     \x20               if strata_net_decode_{ident}(pkt, &mut decoded) && decoded != *comp_mut {{\n\
-                     \x20                   *comp_mut = decoded;\n\
+                     \x20               {dec_decls}\n\
+                     \x20               if strata_net_decode_{ident}(pkt, {}) {{\n\
+                     \x20                   {assign_back}\n\
                      \x20               }}\n\
                      \x20           }}\n\
-                     \x20       }}"
+                     \x20       }}\n\
+                     \x20   }}",
+                    mut_vars.join(", "),
+                    dec_args.join(", "),
+                )
+                .ok();
+            } else {
+                let is_sparse = (strata_entries[0].1.layout.component_flags
+                    & bamabi_sys::BAM_COMPONENT_FLAG_SPARSE_SET)
+                    != 0;
+                writeln!(
+                    out,
+                    "    if pkts.iter().any(|p| p.kind == PACKET_KIND_COMPONENT_DELTA && p.target_id == 0x{target_id:016X}) {{"
+                )
+                .ok();
+                if is_sparse {
+                    writeln!(
+                        out,
+                        "        for (ent, mut comp_mut) in net_q_{idx}.iter_mut() {{\n\
+                         \x20           let ebits = ent.to_bits();\n\
+                         \x20           if let Some(pkt) = pkts.iter().rev().find(|p| p.kind == PACKET_KIND_COMPONENT_DELTA && p.target_id == 0x{target_id:016X} && p.entity_bits == ebits) {{\n\
+                         \x20               let mut decoded = *comp_mut;\n\
+                         \x20               if strata_net_decode_{ident}(pkt, &mut decoded) && decoded != *comp_mut {{\n\
+                         \x20                   *comp_mut = decoded;\n\
+                         \x20               }}\n\
+                         \x20           }}\n\
+                         \x20       }}"
+                    )
+                    .ok();
+                } else {
+                    writeln!(
+                        out,
+                        "        if let Ok(chunks) = net_q_{idx}.strata_contiguous_iter_mut() {{\n\
+                         \x20           for (entities, raw_col) in chunks {{\n\
+                         \x20               let mut sel = SelectiveMutSlice::from_contiguous_mut(raw_col);\n\
+                         \x20               let len = entities.len().min(sel.len());\n\
+                         \x20               for row in 0..len {{\n\
+                         \x20                   let ebits = entities[row].to_bits();\n\
+                         \x20                   if let Some(pkt) = pkts.iter().rev().find(|p| p.kind == PACKET_KIND_COMPONENT_DELTA && p.target_id == 0x{target_id:016X} && p.entity_bits == ebits) {{\n\
+                         \x20                       sel.update_if(row, |cur| {{\n\
+                         \x20                           let mut decoded = *cur;\n\
+                         \x20                           if strata_net_decode_{ident}(pkt, &mut decoded) && decoded != *cur {{\n\
+                         \x20                               *cur = decoded;\n\
+                         \x20                               true\n\
+                         \x20                           }} else {{\n\
+                         \x20                               false\n\
+                         \x20                           }}\n\
+                         \x20                       }});\n\
+                         \x20                   }}\n\
+                         \x20               }}\n\
+                         \x20           }}\n\
+                         \x20       }}"
+                    )
+                    .ok();
+                }
+                writeln!(out, "    }}").ok();
+            }
+        }
+        writeln!(out, "}}\n").ok();
+
+        writeln!(out, "fn {tx_fn}({}) {{", tx_params.join(", ")).ok();
+        writeln!(
+            out,
+            "    let mut out_pkts: Vec<StrataNetPacket> = Vec::new();"
+        )
+        .ok();
+        for (idx, (nc, strata_entries)) in chunk.iter().enumerate() {
+            let ident = sanitize_ident(&nc.name);
+            if nc.is_resource {
+                writeln!(
+                    out,
+                    "    if net_res_{idx}.is_changed() {{\n\
+                     \x20       out_pkts.push(strata_net_encode_{ident}(&net_res_{idx}, 0, 0, 0));\n\
+                     \x20   }}"
+                )
+                .ok();
+            } else if strata_entries.len() > 1 {
+                let k = strata_entries.len();
+                let vars: Vec<String> = (0..k).map(|s| format!("__c_{s}")).collect();
+                let joined = vars.join(", ");
+                writeln!(
+                    out,
+                    "    for (ent, {joined}) in net_q_{idx}.iter() {{\n\
+                     \x20       out_pkts.push(strata_net_encode_{ident}({joined}, ent.to_bits(), 0, 0));\n\
+                     \x20   }}"
                 )
                 .ok();
             } else {
                 writeln!(
                     out,
-                    "        if let Ok(chunks) = net_q_{idx}.strata_contiguous_iter_mut() {{\n\
-                     \x20           for (entities, raw_col) in chunks {{\n\
-                     \x20               let mut sel = SelectiveMutSlice::from_contiguous_mut(raw_col);\n\
-                     \x20               let len = entities.len().min(sel.len());\n\
-                     \x20               for row in 0..len {{\n\
-                     \x20                   let ebits = entities[row].to_bits();\n\
-                     \x20                   if let Some(pkt) = pkts.iter().rev().find(|p| p.kind == PACKET_KIND_COMPONENT_DELTA && p.target_id == 0x{target_id:016X} && p.entity_bits == ebits) {{\n\
-                     \x20                       sel.update_if(row, |cur| {{\n\
-                     \x20                           let mut decoded = *cur;\n\
-                     \x20                           if strata_net_decode_{ident}(pkt, &mut decoded) && decoded != *cur {{\n\
-                     \x20                               *cur = decoded;\n\
-                     \x20                               true\n\
-                     \x20                           }} else {{\n\
-                     \x20                               false\n\
-                     \x20                           }}\n\
-                     \x20                       }});\n\
-                     \x20                   }}\n\
-                     \x20               }}\n\
-                     \x20           }}\n\
-                     \x20       }}"
+                    "    for (ent, val) in net_q_{idx}.iter() {{\n\
+                     \x20       out_pkts.push(strata_net_encode_{ident}(val, ent.to_bits(), 0, 0));\n\
+                     \x20   }}"
                 )
                 .ok();
             }
-            writeln!(out, "    }}").ok();
         }
+        writeln!(
+            out,
+            "    if !out_pkts.is_empty() {{\n\
+             \x20       mw_net.write_batch(out_pkts);\n\
+             \x20   }}\n\
+             }}\n"
+        )
+        .ok();
     }
-    writeln!(out, "}}\n").ok();
-
-    // TX system
-    writeln!(out, "fn strata_sys_net_tx({}) {{", tx_params.join(", ")).ok();
-    writeln!(
-        out,
-        "    let mut out_pkts: Vec<StrataNetPacket> = Vec::new();"
-    )
-    .ok();
-    for (idx, nc) in rep_comps.iter().enumerate() {
-        if ctx.find_layout_entry(&nc.canonical_name).is_none() {
-            continue;
-        }
-        let ident = sanitize_ident(&nc.name);
-        if nc.is_resource {
-            writeln!(
-                out,
-                "    if net_res_{idx}.is_changed() {{\n\
-                 \x20       out_pkts.push(strata_net_encode_{ident}(&net_res_{idx}, 0, 0, 0));\n\
-                 \x20   }}"
-            )
-            .ok();
-        } else {
-            writeln!(
-                out,
-                "    for (ent, val) in net_q_{idx}.iter() {{\n\
-                 \x20       out_pkts.push(strata_net_encode_{ident}(val, ent.to_bits(), 0, 0));\n\
-                 \x20   }}"
-            )
-            .ok();
-        }
-    }
-    writeln!(
-        out,
-        "    if !out_pkts.is_empty() {{\n\
-         \x20       mw_net.write_batch(out_pkts);\n\
-         \x20   }}\n\
-         }}\n"
-    )
-    .ok();
 }
 
 // =========================================================================
@@ -3335,7 +4538,7 @@ pub(super) fn render_run_if_expr(
             let b = render_run_if_expr(base, ctx, resources)?;
             let rf = sanitize_rust_ident(field);
             if matches!(expr.ty(), Ty::Bool) {
-                Some(format!("{b}.{rf}.as_bool()"))
+                Some(format!("{b}.{rf}.get()"))
             } else {
                 Some(format!("{b}.{rf}"))
             }
@@ -3430,7 +4633,12 @@ pub(super) fn emit_native_plugin(out: &mut String, ctx: &NativeCtx<'_>) {
         }
     }
 
-    let has_rep_net = has_net_protocol(mir) && mir.net_components.iter().any(|nc| nc.is_replicated);
+    let net_chunks = if has_net_protocol(mir) {
+        net_replicated_chunk_count(ctx)
+    } else {
+        0
+    };
+    let has_rep_net = net_chunks > 0;
     if has_rep_net {
         leaf_set_names.push("StrataLeafSet_strata_net_rx".to_owned());
         leaf_set_names.push("StrataLeafSet_strata_net_tx".to_owned());
@@ -3603,12 +4811,15 @@ pub(super) fn emit_native_plugin(out: &mut String, ctx: &NativeCtx<'_>) {
             )
             .ok();
         }
+        let mut sched_name_map = HashMap::new();
+        collect_schedule_name_map(&sched.nodes, &sched_sys_names, &mut sched_name_map);
         emit_schedule_nodes(
             out,
             sched_lbl,
             &sched.nodes,
             Some(&root_set),
             &sched_sys_names,
+            &sched_name_map,
             &mut registered_systems,
         );
     }
@@ -3734,11 +4945,26 @@ pub(super) fn emit_native_plugin(out: &mut String, ctx: &NativeCtx<'_>) {
     }
 
     if has_rep_net {
+        if net_chunks == 1 {
+            writeln!(
+                out,
+                "        app.add_systems(FixedUpdate, strata_sys_net_rx.in_set(StrataLeafSet_strata_net_rx));\n\
+                 \x20       app.add_systems(FixedUpdate, strata_sys_net_tx.in_set(StrataLeafSet_strata_net_tx));"
+            )
+            .ok();
+        } else {
+            for ci in 0..net_chunks {
+                writeln!(
+                    out,
+                    "        app.add_systems(FixedUpdate, strata_sys_net_rx_{ci}.in_set(StrataLeafSet_strata_net_rx));\n\
+                     \x20       app.add_systems(FixedUpdate, strata_sys_net_tx_{ci}.in_set(StrataLeafSet_strata_net_tx));"
+                )
+                .ok();
+            }
+        }
         writeln!(
             out,
-            "        app.add_systems(FixedUpdate, strata_sys_net_rx.in_set(StrataLeafSet_strata_net_rx));\n\
-             \x20       app.add_systems(FixedUpdate, strata_sys_net_tx.in_set(StrataLeafSet_strata_net_tx));\n\
-             \x20       app.configure_sets(FixedUpdate, StrataLeafSet_strata_net_rx.before(StrataLeafSet_strata_net_tx));"
+            "        app.configure_sets(FixedUpdate, StrataLeafSet_strata_net_rx.before(StrataLeafSet_strata_net_tx));"
         )
         .ok();
         if has_timer_tick {
@@ -3790,11 +5016,63 @@ pub(super) fn collect_first_sets(nodes: &[HirScheduleGroup], out: &mut Vec<Strin
     }
 }
 
+pub(super) fn collect_schedule_name_map(
+    nodes: &[HirScheduleGroup],
+    valid_systems: &HashSet<String>,
+    out: &mut HashMap<String, String>,
+) {
+    for node in nodes {
+        if node.kind == "leaf" {
+            if valid_systems.contains(&node.name) {
+                out.insert(node.name.clone(), group_set_name(node));
+            }
+        } else {
+            out.insert(node.name.clone(), group_set_name(node));
+            collect_schedule_name_map(&node.children, valid_systems, out);
+        }
+    }
+}
+
 pub(super) fn group_set_name(node: &HirScheduleGroup) -> String {
     if node.kind == "leaf" {
         format!("StrataLeafSet_{}", sanitize_ident(&node.name))
     } else {
         format!("StrataSet_{}", sanitize_ident(&node.name))
+    }
+}
+
+fn emit_schedule_node_constraints(
+    out: &mut String,
+    sched_lbl: &str,
+    node: &HirScheduleGroup,
+    self_set: &str,
+    valid_systems: &HashSet<String>,
+    name_map: &HashMap<String, String>,
+) {
+    let resolve_target = |t: &str| -> Option<String> {
+        name_map.get(t).cloned().or_else(|| {
+            valid_systems
+                .contains(t)
+                .then(|| format!("StrataLeafSet_{}", sanitize_ident(t)))
+        })
+    };
+    for b in &node.before {
+        if let Some(tset) = resolve_target(b) {
+            writeln!(
+                out,
+                "        app.configure_sets({sched_lbl}, {self_set}.before({tset}));"
+            )
+            .ok();
+        }
+    }
+    for a in &node.after {
+        if let Some(tset) = resolve_target(a) {
+            writeln!(
+                out,
+                "        app.configure_sets({sched_lbl}, {self_set}.after({tset}));"
+            )
+            .ok();
+        }
     }
 }
 
@@ -3804,6 +5082,7 @@ pub(super) fn emit_schedule_nodes(
     nodes: &[HirScheduleGroup],
     parent_set: Option<&str>,
     valid_systems: &HashSet<String>,
+    name_map: &HashMap<String, String>,
     registered_systems: &mut HashSet<String>,
 ) {
     let mut child_sets = Vec::new();
@@ -3835,6 +5114,14 @@ pub(super) fn emit_schedule_nodes(
                 )
                 .ok();
             }
+            emit_schedule_node_constraints(
+                out,
+                sched_lbl,
+                node,
+                &leaf_set,
+                valid_systems,
+                name_map,
+            );
             child_sets.push(leaf_set);
         } else {
             let gset = group_set_name(node);
@@ -3845,12 +5132,14 @@ pub(super) fn emit_schedule_nodes(
                 )
                 .ok();
             }
+            emit_schedule_node_constraints(out, sched_lbl, node, &gset, valid_systems, name_map);
             emit_schedule_nodes(
                 out,
                 sched_lbl,
                 &node.children,
                 Some(&gset),
                 valid_systems,
+                name_map,
                 registered_systems,
             );
             if matches!(node.kind.as_str(), "seq" | "seq_weak") {

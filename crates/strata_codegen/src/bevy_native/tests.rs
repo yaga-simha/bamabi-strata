@@ -1032,3 +1032,548 @@ schedule FixedUpdate { step_iter8 }
         "BevyNative must emit 4-lane vec3a and const-safe Fixed32:\n{code}"
     );
 }
+
+#[test]
+fn bevy_native_wave2b_math_types_consts_and_par_reduce_regressions() {
+    let src = r#"
+module test::wave2b_math @version(1.0.0);
+
+@repr(i32)
+enum Mode {
+    Neg = -5,
+    Zero = 0,
+    Sparse = 100000,
+}
+
+struct Stats {
+    hp: i32 = 10,
+    flag: bool = false,
+}
+
+const C_ABS_FIX32: fix32 = (-2.5_f32) as fix32;
+const C_BOOL_F: bool = (1.5_f32) as bool;
+
+table SparseCfg by Mode {
+    weight: f32,
+    stats: Stats,
+    mask: BitSet<128>,
+    lbl: InlineStr<16>,
+} = {
+    Neg => { weight: 1.5, stats: Stats { hp: 20, flag: true }, mask: bits(1, 70), lbl: "neg" },
+    Zero => { weight: 2.0, stats: Stats { hp: 30, flag: false }, mask: bits(2), lbl: "z" },
+    Sparse => { weight: 3.5, stats: Stats { hp: 99, flag: false }, mask: bits(3, 99), lbl: "sp" },
+};
+
+component Body {
+    rot: quat = quat(0.0, 0.0, 0.0, 1.0),
+    dir: vec3 = vec3(1.0, 0.0, 0.0),
+    pos: vec3 = vec3(0.0, 0.0, 0.0),
+    v2: vec2 = vec2(1.0, 2.0),
+    iv: ivec2 = ivec2(5, -7),
+    uv: uvec2 = uvec2(8, 3),
+    fx32: fix32 = -1.5,
+    fx64: fix64 = 2.0,
+    m3: mat3,
+    mats: [mat3; 2],
+    flag: bool = true,
+    alive: i32 = 3,
+}
+
+resource Totals {
+    cnt: u32 = 0,
+    any_ok: bool = false,
+    all_ok: bool = false,
+    prod_fx32: fix32 = 1.0,
+    prod_fx64: fix64 = 1.0,
+    sum_v2: vec2 = vec2(0.0, 0.0),
+    res_counter: i32 = 0,
+}
+
+fn mutate_res(t: &mut res Totals, delta: i32) {
+    t.res_counter += delta;
+}
+
+fn sneaky_res_bump() {
+    res_mut<Totals>().res_counter += 1;
+}
+
+sys math_and_table() {
+    let row = SparseCfg[Mode::Sparse];
+    let _neg_row = SparseCfg[Mode::Neg];
+    let _hp = row.stats.hp;
+    let _has70 = row.mask.has(70);
+
+    let _af32 = abs(C_ABS_FIX32);
+    let _cb = C_BOOL_F;
+
+    for r in query(b: &mut Body) {
+        r.b.fx32 = abs(r.b.fx32);
+        r.b.fx64 = abs(r.b.fx64);
+        let imin: i32 = -2147483648;
+        r.b.alive = abs(imin);
+
+        let q = r.b.rot * r.b.rot;
+        r.b.rot = q;
+        r.b.dir = r.b.rot * r.b.dir;
+
+        let mut lv = r.b.pos;
+        lv.xz = vec2(4.0, 5.0);
+        r.b.pos = lv.zyx;
+
+        r.b.pos = clamp(r.b.pos, -10.0, 10.0);
+        let mn = min(r.b.pos, vec3(1.0, 2.0, 3.0));
+        let mx = max(r.b.v2, vec2(0.5, 0.5));
+        let _iv2 = r.b.iv * 2 + 3 * r.b.iv;
+        let _ivm = r.b.iv % 3;
+        let _uvm = r.b.uv % uvec2(5, 2);
+        let _lf64 = lerp(0.0_f64, 10.0_f64, 0.25_f64);
+        let _lfx32 = lerp(r.b.fx32, 4.0 as fix32, 0.5 as fix32);
+        let _lfx64 = lerp(r.b.fx64, 6.0 as fix64, 0.5 as fix64);
+        let _lsq = length_sq(mn);
+        let _dsq = distance_sq(mx, vec2(0.0, 0.0));
+        let _sq = sqr(2.5_f32);
+        let _sg = signum(-3.0_f32);
+        let _rm = remap(5.0_f32, 0.0_f32, 10.0_f32, 0.0_f32, 100.0_f32);
+        let _f2b = (r.b.pos.x) as bool;
+        let _d2b = (_lf64) as bool;
+        r.b.m3 = mat3(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0));
+    }
+}
+
+sys reduce_totals(t: &mut res Totals) {
+    let (c, ha, ea, pf32, pf64) = for r in query(b: &Body) reduce (
+        c: count(r.b.alive > 0),
+        ha: any(r.b.flag),
+        ea: all(r.b.flag),
+        pf32: prod(1.0 as fix32, r.b.fx32),
+        pf64: prod(1.0 as fix64, r.b.fx64)
+    );
+    t.cnt = c;
+    t.any_ok = ha;
+    t.all_ok = ea;
+    t.prod_fx32 = pf32;
+    t.prod_fx64 = pf64;
+}
+
+@par(chunk = 32)
+sys par_vec2_sum(t: &mut res Totals) {
+    let s2 = for r in query(b: &Body) reduce (s2: sum(vec2(0.0, 0.0), r.b.v2));
+    t.sum_v2 = s2;
+}
+
+@par(chunk = 32)
+sys par_fallback_res() {
+    for r in query(b: &mut Body) {
+        sneaky_res_bump();
+        r.b.alive += 1;
+    }
+}
+
+schedule FixedUpdate { math_and_table, reduce_totals, par_vec2_sum, par_fallback_res }
+"#;
+    let sema = analyze_source("wave2b_math.strata", src);
+    assert!(sema.ok(), "{:?}", sema.diagnostics);
+    let mir = lower_to_mir(&sema);
+    verify_mir(&mir).expect("wave2b_math MIR must verify");
+    let art = emit(&mir, &BevyNativeOptions::default()).expect("emit bevy_native wave2b_math");
+    let code = &art.files[1].content;
+
+    assert!(
+        code.contains("pub const fn strata_default() -> Self")
+            && code.contains("static STRATA_TABLE_SparseCfg: &[(i64, StrataTable_SparseCfgRow)]")
+            && code.contains("strata_table_get_SparseCfg"),
+        "PM-05/BUG-TL-03: sparse table must emit const strata_default and sorted key lookup:\n{code}"
+    );
+    assert!(
+        !code.contains("Default::default()")
+            || !code
+                .split("STRATA_TABLE_SparseCfg")
+                .nth(1)
+                .unwrap_or("")
+                .split("const fn strata_table_get")
+                .next()
+                .unwrap_or("")
+                .contains("Default::default()"),
+        "PM-05: static table must not contain Default::default() (E0015):\n{code}"
+    );
+    assert!(
+        code.contains("Fixed32(((")
+            && code.contains("wrapping_abs()")
+            && code.contains("Fixed64((("),
+        "PM-03: abs on Fixed32/Fixed64 and i32 must use saturating/wrapping abs and preserve Fixed types:\n{code}"
+    );
+    assert!(
+        code.contains("strata_quat_mul(") && code.contains("strata_quat_mul_vec3("),
+        "PM-04: quat_mul and quat_mul_vec3 must emit quaternion helpers:\n{code}"
+    );
+    assert!(
+        code.contains("wrapping_add((if ") && code.contains(">> 16") && code.contains(">> 32"),
+        "PM-07/PM-08: 1-arg count and wide Fix32/Fix64 prod expected:\n{code}"
+    );
+    assert!(
+        code.contains("!= 0.0"),
+        "PM-09: float as bool cast expected:\n{code}"
+    );
+    assert!(
+        code.contains("let __cx = ")
+            && code.contains("let __lo = [")
+            && code.contains("let __hi = [")
+            && code.contains(".wrapping_mul(__sv)"),
+        "PM-12: clamp(vec3, f, f) and ivec scalar mul expected:\n{code}"
+    );
+    assert!(
+        !code.contains("let mut __loc_76: i32"),
+        "PM-12: ivec scalar arithmetic must refine dst local to [i32; 2], not i32:\n{code}"
+    );
+    assert!(
+        code.contains("strata_fn_sneaky_res_bump((&mut"),
+        "PM-06: @par helper res write fallback must pass mutable resource and compile sequentially:\n{code}"
+    );
+}
+
+#[test]
+fn bevy_native_wave2b_collections_smallvec_strings_and_timers_regressions() {
+    let src = r#"
+module test::wave2b_tl @version(1.0.0);
+
+enum Atk { Slash }
+
+struct TimerWrap {
+    grace: GraceWindow,
+    buf: InputBuffer<Atk, 2>,
+}
+
+struct Cell {
+    v: i32 = 7,
+    bs: BitSet<64> = bits(1),
+}
+
+const C_SHORT: InlineStr<8> = "hi";
+const C_SV: SmallVec<i32, 4> = [10, 20];
+
+component Bag {
+    s16: InlineStr<16> = C_SHORT,
+    grid: [[i32; 2]; 2] = [[1, 2], [3, 4]],
+    cells: [Cell; 2] = [Cell {}, Cell {}],
+    masks: [BitSet<128>; 2] = [bits(2), bits(66)],
+    sv: SmallVec<i32, 4> = C_SV,
+    sv_cells: SmallVec<Cell, 2>,
+    tw: TimerWrap,
+    arr_tw: [TimerWrap; 2],
+    sv_gw: SmallVec<GraceWindow, 2>,
+    out_has: bool = false,
+    out_len: u32 = 0,
+    out_first: i32 = 0,
+}
+
+sys step_collections() {
+    let local_bs: BitSet<128> = bits(0, 70);
+    let mut local_arr_bs: [BitSet<64>; 2] = [bits(0), bits(33)];
+    let _local_has = local_arr_bs[1].has(33);
+    local_arr_bs[0].set(5);
+    local_arr_bs[1].clear(33);
+    let _bs_copy = local_bs;
+
+    for r in query(b: &mut Bag) {
+        let s8: InlineStr<8> = "abcdef";
+        r.b.s16 = s8 as InlineStr<16>;
+        r.b.grid[1][0] = 55;
+        r.b.cells[1].v = 88;
+        r.b.masks[1].set(70);
+        r.b.masks[1].clear(66);
+        r.b.out_has = r.b.masks[1].has(70);
+        let mcopy = r.b.masks[0];
+        let _mc_has = mcopy.has(2);
+        r.b.sv.push(30);
+        r.b.sv[0] = 99;
+        r.b.out_len = r.b.sv.len();
+        r.b.out_first = r.b.sv[0];
+        r.b.tw.grace.arm(0.5);
+    }
+}
+
+schedule FixedUpdate { step_collections }
+"#;
+    let sema = analyze_source("wave2b_tl.strata", src);
+    assert!(sema.ok(), "{:?}", sema.diagnostics);
+    let mir = lower_to_mir(&sema);
+    verify_mir(&mir).expect("wave2b_tl MIR must verify");
+    let art = emit(&mir, &BevyNativeOptions::default()).expect("emit bevy_native wave2b_tl");
+    let code = &art.files[1].content;
+
+    assert!(
+        code.contains("impl StrataPodBytes for"),
+        "BUG-TL-06/BUG-TL-09: StrataPodBytes trait impls required for nested/array/SmallVec writes:\n{code}"
+    );
+    assert!(
+        code.contains("strata_inline_str_resize::<")
+            || code.contains("strata_inline_str_pack::<5>"),
+        "BUG-TL-04: InlineStr constant resize or pack required:\n{code}"
+    );
+    assert!(
+        code.contains("strata_bytes_to_u32_words("),
+        "BUG-TL-09: SmallVec const initialization must pack length header and words cleanly:\n{code}"
+    );
+}
+
+#[test]
+fn bevy_native_wave2b_ecs_flow_spatial_and_schedules_regressions() {
+    let src = r#"
+module test::wave2b_ecs @version(1.0.0);
+
+component Pos3 { xyz: vec3 = vec3(0.0, 0.0, 0.0) }
+component Vel { vx: f32 = 1.0, hp: i32 = 10 }
+component OptMarker { x: i32 = 1 }
+component MutTarget { acc: i32 = 0 }
+component Tracked @summary_tick { v: i32 = 0 }
+event PingEv { entity: Ref<MutTarget>, val: i32 }
+relation ChildOf [exclusive];
+relation Squad;
+stream TickMsg { val: i32 = 0 }
+tag Stunned;
+tag NodeTag;
+
+resource FlagRes { active: bool = true, sum: i32 = 0 }
+
+spatial_grid GridXZ(
+    cell_size: 4.0_m,
+    bounds: vec2(-20.0_m, -20.0_m)..vec2(20.0_m, 20.0_m),
+    plane_axes: [0, 2],
+    capacity: 16,
+) over Pos3 by Pos3.xyz;
+
+spatial_history HistXZ(
+    frames: 4,
+    cell_size: 4.0_m,
+    bounds: vec2(-20.0_m, -20.0_m)..vec2(20.0_m, 20.0_m),
+    plane_axes: [0, 2],
+    capacity: 16,
+) over Pos3 by Pos3.xyz;
+
+fn helper_proj_and_tag(vx: &Vel.vx, _t: &Stunned, _o: &MutTarget) -> f32 {
+    vx * 2.0
+}
+
+fn touch_opt_target(m: &mut MutTarget) {
+    m.acc += 1;
+}
+
+obs on_ping(trg: &Trigger<PingEv, NodeTag>) {
+    let p = trg.payload;
+    let ev = if p.val > 0 { trg.payload } else { p };
+    trigger(trg.target, ev);
+}
+
+sys step_early_and_break(
+    g: &res GridXZ,
+    h: &res HistXZ,
+    fr: &mut res FlagRes,
+) {
+    for r in query(e: Entity, v: &mut? Vel, t: &Stunned, m: &mut MutTarget) {
+        let boosted = helper_proj_and_tag(r.v.vx, r.t, r.m);
+        r.v.vx = boosted;
+        if r.v.hp < 0 {
+            break;
+        }
+        atomic {
+            insert_relation<ChildOf>(r.e, r.e);
+            emit(TickMsg { val: r.m.acc });
+            if r.m.acc > 50 {
+                return;
+            }
+        }
+    }
+
+    for _d in g.query_disc(vec2(1.0, 2.0), 3.0_m) {
+        fr.sum += 1;
+    }
+    for _s in h.query_segment_at(2, vec3(0.0, 0.0, 0.0), vec3(5.0, 0.0, 5.0), 1.5_m) {
+        fr.sum += 2;
+    }
+}
+
+sys nested_and_added_sys(fr: &mut res FlagRes) {
+    for r in query(ox: Option<&OptMarker.x>, m: &mut MutTarget).without<NodeTag>() {
+        if r.ox.is_some() {
+            fr.sum += r.ox.unwrap();
+        }
+        touch_opt_target(r.m);
+        for inner in query(t: &mut Tracked) {
+            inner.t.v += 1;
+        }
+        if r.m.acc > 100 {
+            return;
+        }
+    }
+}
+
+sys added_marker_sys() {
+    for r in query(t: &mut OptMarker).added<OptMarker>() {
+        r.t.x += 1;
+    }
+}
+
+sys trigger_prop_sys() {
+    for r in query(e: Entity, m: &MutTarget).with<NodeTag>() {
+        trigger(r.e, PingEv { entity: r.e, val: r.m.acc }, propagate: true);
+    }
+}
+
+sys up_childof_sys() {
+    for r in query(m: &MutTarget).up<ChildOf>() {
+        let _v = r.m.acc;
+    }
+}
+
+sys opt_dedup_sys(fr: &mut res FlagRes) {
+    for r in query(ox: Option<&Vel.vx>, hp: &Vel.hp) {
+        if r.ox.is_some() {
+            fr.sum += r.hp;
+        }
+    }
+    for r in query(om: Option<&mut? MutTarget>).without<NodeTag>() {
+        if let Some(mut m) = r.om {
+            touch_opt_target(m);
+        }
+    }
+}
+
+sys helper_after_sys(fr: &mut res FlagRes) {
+    fr.sum += 10;
+}
+
+schedule FixedUpdate run_if(res<FlagRes>().active) {
+    set Alpha before(Beta) { step_early_and_break, nested_and_added_sys, added_marker_sys, trigger_prop_sys, up_childof_sys, opt_dedup_sys }
+    set Beta after(Alpha) { helper_after_sys }
+}
+"#;
+    let sema = analyze_source("wave2b_ecs.strata", src);
+    assert!(sema.ok(), "{:?}", sema.diagnostics);
+    let mir = lower_to_mir(&sema);
+    verify_mir(&mir).expect("wave2b_ecs MIR must verify");
+    let art = emit(&mir, &BevyNativeOptions::default()).expect("emit bevy_native wave2b_ecs");
+    let code = &art.files[1].content;
+
+    assert!(
+        code.contains("__returned = true;") && code.contains("if __returned { break; }"),
+        "EQ-03: early return inside chunk loop must exit system:\n{code}"
+    );
+    assert!(
+        !code.contains("StrataTag_Entity_"),
+        "query(e: Entity, ...) must never synthesize a fake StrataTag_Entity component:\n{code}"
+    );
+    assert!(
+        code.contains("let mut __broke_loop = false;"),
+        "EQ-04: __broke_loop must be declared in uses_row_iter loop:\n{code}"
+    );
+    assert!(
+        code.contains("Added<StrataOptMarker_"),
+        "EQ-07: Added<T> query filter expected:\n{code}"
+    );
+    assert!(
+        code.contains("StrataTag_Stunned_"),
+        "EQ-13: tag helper parameter must synthesize StrataTag component:\n{code}"
+    );
+    assert!(
+        code.contains("ChildOf(") && code.contains("up_child_of_q: Query<&ChildOf>"),
+        "GF-02: ChildOf relation insert and propagation expected:\n{code}"
+    );
+    assert!(
+        code.contains("populated_frames") && code.contains("off >= self.populated_frames"),
+        "BUG-SW-05: spatial_history must guard unpopulated frames:\n{code}"
+    );
+    assert!(
+        code.contains("lift_vec2(") && code.contains("pos[ax0] - center[ax0]"),
+        "BUG-SW-06: spatial grid must honor plane_axes and lift vec2:\n{code}"
+    );
+    assert!(
+        code.contains("StrataSet_Alpha.before(StrataSet_Beta)")
+            && code.contains("StrataSet_Beta.after(StrataSet_Alpha)"),
+        "BUG-SW-07c: schedule group before/after constraints expected:\n{code}"
+    );
+    assert!(
+        code.contains(".get()") && !code.contains(".as_bool()"),
+        "BUG-SW-07d: run_if FfiBool must call .get() instead of .as_bool():\n{code}"
+    );
+    assert!(
+        code.contains("let _ = "),
+        "EQ-14: Option::map_or helper call or unused value must avoid unused_must_use:\n{code}"
+    );
+}
+
+#[test]
+fn bevy_native_wave2b_net_soa_chunking_nested_and_large_rpc_regressions() {
+    let mut comp_defs = String::new();
+    for i in 0..16 {
+        comp_defs.push_str(&format!(
+            "@net(reliable, channel = 0)\ncomponent NetC{i} {{ v: u32 = {i} }}\n"
+        ));
+    }
+    let src = format!(
+        r#"
+module test::wave2b_net @version(1.0.0);
+
+struct InnerNet {{
+    @quantize(min = -10.0, max = 10.0, bits = 8)
+    z: f32 = 0.0,
+}}
+
+struct SubNet {{
+    @quantize(min = -100.0, max = 100.0, bits = 12)
+    x: f32 = 0.0,
+    inner: InnerNet,
+}}
+
+@soa
+@net(reliable, channel = 0)
+component SoaRep {{
+    hot {{ x: f32 = 0.0 }}
+    cold meta {{ hp: f32 = 10.0 }}
+}}
+
+@net(reliable, channel = 1)
+component NestedNetComp {{
+    tag_u: u16 = 1,
+    sub: SubNet,
+}}
+
+@net_rpc(client_to_server, channel = 2)
+rpc BigOpaqueRpc {{
+    blob: [u8; 48],
+    sub: SubNet,
+}}
+
+{comp_defs}
+"#
+    );
+    let sema = analyze_source("wave2b_net.strata", &src);
+    assert!(sema.ok(), "{:?}", sema.diagnostics);
+    let mir = lower_to_mir(&sema);
+    verify_mir(&mir).expect("wave2b_net MIR must verify");
+    let art = emit(&mir, &BevyNativeOptions::default()).expect("emit bevy_native wave2b_net");
+    let code = &art.files[1].content;
+
+    assert!(
+        code.contains("strata_net_encode_SoaRep(src_0: &")
+            && code.contains("src_1: &")
+            && code.contains("StrataSoaRep__meta_"),
+        "NT-03: @soa net component must resolve hot and cold strata layouts:\n{code}"
+    );
+    assert!(
+        code.contains("strata_sys_net_rx_0(")
+            && code.contains("strata_sys_net_rx_1(")
+            && code.contains("strata_sys_net_tx_0(")
+            && code.contains("strata_sys_net_tx_1("),
+        "NT-05: >=15 net components must chunk into multiple <=15-param RX/TX systems:\n{code}"
+    );
+    assert!(
+        code.contains("impl Default for StrataRpc_BigOpaqueRpc")
+            && !code.contains("#[derive(Clone, Copy, Debug, Default, PartialEq)]\npub struct StrataRpc_BigOpaqueRpc {"),
+        "NT-06: >32-byte RPC array field must emit manual impl Default:\n{code}"
+    );
+    assert!(
+        code.contains("strata_net_encode_rpc_BigOpaqueRpc")
+            && code.contains(".strata_pod_read_sub("),
+        "NT-10b: nested dotted fields in component/RPC must decode via StrataPodBytes:\n{code}"
+    );
+}

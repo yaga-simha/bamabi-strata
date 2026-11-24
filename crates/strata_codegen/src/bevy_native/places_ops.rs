@@ -7,15 +7,6 @@ pub(super) struct PeelFieldStep {
     pub(super) blob_step: Option<(String, String, &'static str, &'static str)>,
 }
 
-pub(super) fn peel_ptr_fields(pt: &PtrTarget) -> (&PtrTarget, String) {
-    let (base, steps) = peel_ptr_field_steps(pt);
-    let suffix: String = steps
-        .into_iter()
-        .map(|s| format!(".{}", s.rfname))
-        .collect();
-    (base, suffix)
-}
-
 pub(super) fn peel_ptr_field_steps(mut pt: &PtrTarget) -> (&PtrTarget, Vec<PeelFieldStep>) {
     let mut steps = Vec::new();
     while let PtrTarget::Field {
@@ -318,6 +309,60 @@ pub(super) fn emit_place_mut_for_target(
             }
             writeln!(out, "{indent}}}").ok();
         }
+        PtrTarget::ArrayElem {
+            base,
+            ptr_local,
+            elem_size,
+            elem_align,
+            elem_rust_ty,
+            elem_needs_pod_unpack,
+            is_smallvec,
+            sv_cap,
+            ..
+        } => {
+            let id = ptr_local.0;
+            let ea = (*elem_align).max(1);
+            let stride = elem_size.div_ceil(ea) * ea;
+            emit_place_mut_for_target(
+                out,
+                base,
+                analysis,
+                query_plans,
+                in_chunk,
+                indent,
+                in_undo,
+                &|parent_place| {
+                    if *is_smallvec {
+                        if *elem_size == 0 {
+                            let inner = apply(&format!("(&mut {elem_rust_ty}::default())"));
+                            format!("if __arr_ptr_idx_{id} < {sv_cap} {{ {inner} }}")
+                        } else {
+                            let inner = apply(&format!("(&mut __ael_{id})"));
+                            format!(
+                                "{{ let __i_{id} = __arr_ptr_idx_{id}; if __i_{id} < {sv_cap} {{ let __off_{id} = 8usize + __i_{id} * {stride}; let mut __b_{id} = [0u8; {elem_size}]; ({parent_place}).strata_pod_read_sub(__off_{id}, &mut __b_{id}); let mut __ael_{id} = <{elem_rust_ty} as StrataPodBytes>::strata_pod_from_bytes(&__b_{id}); {inner} __ael_{id}.strata_pod_read_sub(0, &mut __b_{id}); ({parent_place}).strata_pod_write_bytes(__off_{id}, &__b_{id}); }} }}"
+                            )
+                        }
+                    } else if *elem_needs_pod_unpack {
+                        if *elem_size == 0 {
+                            let inner = apply(&format!("(&mut {elem_rust_ty}::default())"));
+                            format!(
+                                "{{ let __i_{id} = __arr_ptr_idx_{id}; if __i_{id} < ({parent_place}).len() {{ {inner} }} }}"
+                            )
+                        } else {
+                            let inner = apply(&format!("(&mut __ael_{id})"));
+                            format!(
+                                "{{ let __i_{id} = __arr_ptr_idx_{id}; if __i_{id} < ({parent_place}).len() {{ let mut __b_{id} = [0u8; {elem_size}]; ({parent_place})[__i_{id}].strata_pod_read_sub(0, &mut __b_{id}); let mut __ael_{id} = <{elem_rust_ty} as StrataPodBytes>::strata_pod_from_bytes(&__b_{id}); {inner} __ael_{id}.strata_pod_read_sub(0, &mut __b_{id}); ({parent_place})[__i_{id}].strata_pod_write_bytes(0, &__b_{id}); }} }}"
+                            )
+                        }
+                    } else {
+                        let inner = apply(&format!("(&mut ({parent_place})[__i_{id}])"));
+                        format!(
+                            "{{ let __i_{id} = __arr_ptr_idx_{id}; if __i_{id} < ({parent_place}).len() {{ {inner} }} }}"
+                        )
+                    }
+                },
+            );
+        }
         _ => {}
     }
 }
@@ -342,12 +387,39 @@ pub(super) fn emit_place_mut_res_for_target(
     in_undo: bool,
     build: &dyn Fn(&str) -> String,
 ) -> Option<String> {
-    let (base_pt, suffix) = peel_ptr_fields(pt);
+    let (base_pt, steps) = peel_ptr_field_steps(pt);
+    let has_blob = steps.iter().any(|s| s.blob_step.is_some());
     let apply = |base_expr: &str| {
-        if suffix.is_empty() {
-            build(base_expr)
+        if !has_blob {
+            let suffix: String = steps.iter().map(|s| format!(".{}", s.rfname)).collect();
+            if suffix.is_empty() {
+                build(base_expr)
+            } else {
+                build(&format!("(&mut {base_expr}{suffix})"))
+            }
         } else {
-            build(&format!("(&mut {base_expr}{suffix})"))
+            let mut stmts = Vec::new();
+            let mut cur_place = base_expr.to_owned();
+            let mut bindings: Vec<(String, String, String, &'static str)> = Vec::new();
+            for (idx, step) in steps.iter().enumerate() {
+                if let Some((ref rfname, ref sname, unpack_fn, pack_fn)) = step.blob_step {
+                    let bvar = format!("__bmr_{}_{idx}", steps.len());
+                    stmts.push(format!(
+                        "let mut {bvar} = {sname}::{unpack_fn}(&{cur_place}.{rfname});"
+                    ));
+                    bindings.push((cur_place.clone(), rfname.clone(), bvar.clone(), pack_fn));
+                    cur_place = bvar;
+                } else {
+                    cur_place = format!("{cur_place}.{}", step.rfname);
+                }
+            }
+            let res_b = build(&format!("(&mut {cur_place})"));
+            stmts.push(format!("let __bmr_res = {res_b};"));
+            for (parent_place, rfname, bvar, pack_fn) in bindings.into_iter().rev() {
+                stmts.push(format!("{parent_place}.{rfname} = {bvar}.{pack_fn}();"));
+            }
+            stmts.push("__bmr_res".to_owned());
+            format!("{{ {} }}", stmts.join(" "))
         }
     };
     let dirty_flag_stmt = |qi: u32, si: usize| -> String {
@@ -534,6 +606,60 @@ pub(super) fn emit_place_mut_res_for_target(
                 slot_local.0
             ))
         }
+        PtrTarget::ArrayElem {
+            base,
+            ptr_local,
+            elem_size,
+            elem_align,
+            elem_rust_ty,
+            elem_needs_pod_unpack,
+            is_smallvec,
+            sv_cap,
+            ..
+        } => {
+            let id = ptr_local.0;
+            let ea = (*elem_align).max(1);
+            let stride = elem_size.div_ceil(ea) * ea;
+            emit_place_mut_res_for_target(
+                base,
+                analysis,
+                query_plans,
+                in_chunk,
+                in_undo,
+                &|parent_place| {
+                    if *is_smallvec {
+                        if *elem_size == 0 {
+                            let inner = apply(&format!("(&mut {elem_rust_ty}::default())"));
+                            format!(
+                                "if __arr_ptr_idx_{id} < {sv_cap} {{ {inner} }} else {{ false }}"
+                            )
+                        } else {
+                            let inner = apply(&format!("(&mut __ael_{id})"));
+                            format!(
+                                "{{ let __i_{id} = __arr_ptr_idx_{id}; if __i_{id} < {sv_cap} {{ let __off_{id} = 8usize + __i_{id} * {stride}; let mut __b_{id} = [0u8; {elem_size}]; ({parent_place}).strata_pod_read_sub(__off_{id}, &mut __b_{id}); let mut __ael_{id} = <{elem_rust_ty} as StrataPodBytes>::strata_pod_from_bytes(&__b_{id}); let __r_{id} = {inner}; __ael_{id}.strata_pod_read_sub(0, &mut __b_{id}); ({parent_place}).strata_pod_write_bytes(__off_{id}, &__b_{id}); __r_{id} }} else {{ false }} }}"
+                            )
+                        }
+                    } else if *elem_needs_pod_unpack {
+                        if *elem_size == 0 {
+                            let inner = apply(&format!("(&mut {elem_rust_ty}::default())"));
+                            format!(
+                                "{{ let __i_{id} = __arr_ptr_idx_{id}; if __i_{id} < ({parent_place}).len() {{ {inner} }} else {{ false }} }}"
+                            )
+                        } else {
+                            let inner = apply(&format!("(&mut __ael_{id})"));
+                            format!(
+                                "{{ let __i_{id} = __arr_ptr_idx_{id}; if __i_{id} < ({parent_place}).len() {{ let mut __b_{id} = [0u8; {elem_size}]; ({parent_place})[__i_{id}].strata_pod_read_sub(0, &mut __b_{id}); let mut __ael_{id} = <{elem_rust_ty} as StrataPodBytes>::strata_pod_from_bytes(&__b_{id}); let __r_{id} = {inner}; __ael_{id}.strata_pod_read_sub(0, &mut __b_{id}); ({parent_place})[__i_{id}].strata_pod_write_bytes(0, &__b_{id}); __r_{id} }} else {{ false }} }}"
+                            )
+                        }
+                    } else {
+                        let inner = apply(&format!("(&mut ({parent_place})[__i_{id}])"));
+                        format!(
+                            "{{ let __i_{id} = __arr_ptr_idx_{id}; if __i_{id} < ({parent_place}).len() {{ {inner} }} else {{ false }} }}"
+                        )
+                    }
+                },
+            )
+        }
         _ => None,
     }
 }
@@ -709,6 +835,60 @@ pub(super) fn emit_place_ref_for_target(
                 slot_local.0
             )
         }
+        PtrTarget::ArrayElem {
+            base,
+            ptr_local,
+            elem_size,
+            elem_align,
+            elem_rust_ty,
+            elem_needs_pod_unpack,
+            is_smallvec,
+            sv_cap,
+            ..
+        } => {
+            let id = ptr_local.0;
+            let ea = (*elem_align).max(1);
+            let stride = elem_size.div_ceil(ea) * ea;
+            emit_place_ref_for_target(
+                base,
+                analysis,
+                query_plans,
+                in_chunk,
+                &|parent_place| {
+                    if *is_smallvec {
+                        if *elem_size == 0 {
+                            let inner = apply(&format!("(&{elem_rust_ty}::default())"));
+                            format!(
+                                "if __arr_ptr_idx_{id} < {sv_cap} {{ {inner} }} else {{ {default_expr} }}"
+                            )
+                        } else {
+                            let inner = apply(&format!("(&__rael_{id})"));
+                            format!(
+                                "{{ let __ri_{id} = __arr_ptr_idx_{id}; if __ri_{id} < {sv_cap} {{ let __roff_{id} = 8usize + __ri_{id} * {stride}; let mut __rb_{id} = [0u8; {elem_size}]; ({parent_place}).strata_pod_read_sub(__roff_{id}, &mut __rb_{id}); let __rael_{id} = <{elem_rust_ty} as StrataPodBytes>::strata_pod_from_bytes(&__rb_{id}); {inner} }} else {{ {default_expr} }} }}"
+                            )
+                        }
+                    } else if *elem_needs_pod_unpack {
+                        if *elem_size == 0 {
+                            let inner = apply(&format!("(&{elem_rust_ty}::default())"));
+                            format!(
+                                "{{ let __ri_{id} = __arr_ptr_idx_{id}; if __ri_{id} < ({parent_place}).len() {{ {inner} }} else {{ {default_expr} }} }}"
+                            )
+                        } else {
+                            let inner = apply(&format!("(&__rael_{id})"));
+                            format!(
+                                "{{ let __ri_{id} = __arr_ptr_idx_{id}; if __ri_{id} < ({parent_place}).len() {{ let mut __rb_{id} = [0u8; {elem_size}]; ({parent_place})[__ri_{id}].strata_pod_read_sub(0, &mut __rb_{id}); let __rael_{id} = <{elem_rust_ty} as StrataPodBytes>::strata_pod_from_bytes(&__rb_{id}); {inner} }} else {{ {default_expr} }} }}"
+                            )
+                        }
+                    } else {
+                        let inner = apply(&format!("(&({parent_place})[__ri_{id}])"));
+                        format!(
+                            "{{ let __ri_{id} = __arr_ptr_idx_{id}; if __ri_{id} < ({parent_place}).len() {{ {inner} }} else {{ {default_expr} }} }}"
+                        )
+                    }
+                },
+                default_expr,
+            )
+        }
         _ => default_expr.to_owned(),
     }
 }
@@ -725,7 +905,66 @@ pub(super) struct ResolvedFieldAccess<'a> {
     pub(super) leaf_chain: String,
     pub(super) sf_opt: Option<&'a SolvedField>,
     pub(super) is_vec_lane: bool,
+    pub(super) swizzle_lanes: Vec<usize>,
+    pub(super) swizzle_scalar_ty: ValTy,
     pub(super) is_entity_ev: bool,
+}
+
+pub(super) fn vec_ty_dim_and_scalar(ty: &Ty) -> Option<(usize, ValTy)> {
+    match ty {
+        Ty::Vec2 => Some((2, ValTy::F32)),
+        Ty::Vec3 => Some((3, ValTy::F32)),
+        Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => Some((4, ValTy::F32)),
+        Ty::IVec2 => Some((2, ValTy::I32)),
+        Ty::IVec3 => Some((3, ValTy::I32)),
+        Ty::UVec2 => Some((2, ValTy::U32)),
+        _ => None,
+    }
+}
+
+pub(super) fn vec_val_ty_dim_and_scalar(vt: &ValTy) -> Option<(usize, ValTy)> {
+    match vt {
+        ValTy::Vec2 => Some((2, ValTy::F32)),
+        ValTy::Vec3 => Some((3, ValTy::F32)),
+        ValTy::Vec4 => Some((4, ValTy::F32)),
+        ValTy::IVec2 => Some((2, ValTy::I32)),
+        ValTy::IVec3 => Some((3, ValTy::I32)),
+        ValTy::UVec2 => Some((2, ValTy::U32)),
+        _ => None,
+    }
+}
+
+pub(super) fn vec_val_ty_for_len(len: usize, scalar_vt: &ValTy) -> ValTy {
+    match (len, scalar_vt) {
+        (1, _) => scalar_vt.clone(),
+        (2, ValTy::I32) => ValTy::IVec2,
+        (3, ValTy::I32) => ValTy::IVec3,
+        (2, ValTy::U32) => ValTy::UVec2,
+        (2, _) => ValTy::Vec2,
+        (3, _) => ValTy::Vec3,
+        _ => ValTy::Vec4,
+    }
+}
+
+pub(super) fn parse_swizzle_lanes(s: &str, max_dim: usize) -> Option<Vec<usize>> {
+    if s.is_empty() || s.len() > 4 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len());
+    for b in s.bytes() {
+        let idx = match b {
+            b'x' | b'r' => 0,
+            b'y' | b'g' => 1,
+            b'z' | b'b' => 2,
+            b'w' | b'a' => 3,
+            _ => return None,
+        };
+        if idx >= max_dim {
+            return None;
+        }
+        out.push(idx);
+    }
+    Some(out)
 }
 
 pub(super) fn resolve_blob_field_access<'a>(
@@ -747,40 +986,24 @@ pub(super) fn resolve_blob_field_access<'a>(
                     leaf_chain: sanitize_rust_ident(part),
                     sf_opt: Some(sf),
                     is_vec_lane: false,
+                    swizzle_lanes: Vec::new(),
+                    swizzle_scalar_ty: ValTy::F32,
                     is_entity_ev,
                 };
             }
             if i + 2 == parts.len()
-                && matches!(
-                    sf.ty,
-                    Ty::Vec2
-                        | Ty::Vec3
-                        | Ty::Vec3a
-                        | Ty::Vec4
-                        | Ty::Quat
-                        | Ty::Rgba
-                        | Ty::IVec2
-                        | Ty::IVec3
-                        | Ty::UVec2
-                )
+                && let Some((dim, scalar_vt)) = vec_ty_dim_and_scalar(&sf.ty)
+                && let Some(lanes) = parse_swizzle_lanes(parts[i + 1], dim)
             {
-                let lane = parts[i + 1];
-                let idx = match lane {
-                    "x" | "r" => Some(0),
-                    "y" | "g" => Some(1),
-                    "z" | "b" => Some(2),
-                    "w" | "a" => Some(3),
-                    _ => None,
+                return ResolvedFieldAccess {
+                    steps,
+                    leaf_chain: sanitize_rust_ident(part),
+                    sf_opt: Some(sf),
+                    is_vec_lane: lanes.len() == 1,
+                    swizzle_lanes: lanes,
+                    swizzle_scalar_ty: scalar_vt,
+                    is_entity_ev: false,
                 };
-                if let Some(li) = idx {
-                    return ResolvedFieldAccess {
-                        steps,
-                        leaf_chain: format!("{}[{li}]", sanitize_rust_ident(part)),
-                        sf_opt: None,
-                        is_vec_lane: true,
-                        is_entity_ev: false,
-                    };
-                }
             }
             if let Ty::Named(ref inner_key) = sf.ty
                 && let Some(next_entry) = ctx.find_layout_entry(inner_key)
@@ -808,8 +1031,37 @@ pub(super) fn resolve_blob_field_access<'a>(
                 leaf_chain: rem_chain,
                 sf_opt: Some(sf),
                 is_vec_lane: false,
+                swizzle_lanes: Vec::new(),
+                swizzle_scalar_ty: ValTy::F32,
                 is_entity_ev,
             };
+        }
+    } else if let Some(tb) = ctx.tables_by_key.get(layout_key)
+        && let Some((top, rest)) = field.split_once('.')
+        && let Some((_, fty)) = tb.fields.iter().find(|(fnm, _)| fnm == top)
+    {
+        if let Some((dim, scalar_vt)) = vec_ty_dim_and_scalar(fty)
+            && let Some(lanes) = parse_swizzle_lanes(rest, dim)
+        {
+            return ResolvedFieldAccess {
+                steps: Vec::new(),
+                leaf_chain: sanitize_rust_ident(top),
+                sf_opt: None,
+                is_vec_lane: lanes.len() == 1,
+                swizzle_lanes: lanes,
+                swizzle_scalar_ty: scalar_vt,
+                is_entity_ev: false,
+            };
+        }
+        if let Ty::Named(inner_key) = fty {
+            let mut sub = resolve_blob_field_access(inner_key, rest, ctx);
+            let top_ident = sanitize_rust_ident(top);
+            if let Some(first) = sub.steps.first_mut() {
+                first.rfname = format!("{top_ident}.{}", first.rfname);
+            } else {
+                sub.leaf_chain = format!("{top_ident}.{}", sub.leaf_chain);
+            }
+            return sub;
         }
     }
     let field_parts: Vec<&str> = field.split('.').collect();
@@ -823,6 +1075,8 @@ pub(super) fn resolve_blob_field_access<'a>(
         leaf_chain: chain,
         sf_opt: None,
         is_vec_lane: false,
+        swizzle_lanes: Vec::new(),
+        swizzle_scalar_ty: ValTy::F32,
         is_entity_ev: false,
     }
 }
@@ -841,6 +1095,20 @@ pub(super) fn build_field_load_from_place(
         );
     }
     let raw = format!("{cur}.{}", access.leaf_chain);
+    if !access.swizzle_lanes.is_empty() {
+        if access.swizzle_lanes.len() == 1 {
+            let l0 = access.swizzle_lanes[0];
+            return coerce_expr(&format!("{raw}[{l0}]"), &access.swizzle_scalar_ty, dst_vt);
+        }
+        let parts: Vec<String> = access
+            .swizzle_lanes
+            .iter()
+            .map(|l| format!("__sw[{l}]"))
+            .collect();
+        let src_vec_vt = vec_val_ty_for_len(access.swizzle_lanes.len(), &access.swizzle_scalar_ty);
+        let sw_expr = format!("{{ let __sw = {raw}; [{}] }}", parts.join(", "));
+        return coerce_expr(&sw_expr, &src_vec_vt, dst_vt);
+    }
     if let Some(sf) = access.sf_opt {
         let raw_adj = if access.is_entity_ev && access.steps.is_empty() && sf.name == "entity" {
             format!("{raw}.0")
@@ -852,6 +1120,38 @@ pub(super) fn build_field_load_from_place(
         coerce_expr(&raw, &ValTy::F32, dst_vt)
     } else {
         raw
+    }
+}
+
+pub(super) fn target_vec_val_ty(
+    base_ptr: LocalId,
+    analysis: &FnAnalysis,
+    ctx: &NativeCtx<'_>,
+) -> Option<ValTy> {
+    match analysis.ptr_targets.get(&base_ptr) {
+        Some(PtrTarget::SlotRef { slot_local }) => analysis
+            .slot_tys
+            .get(slot_local)
+            .cloned()
+            .or_else(|| Some(analysis.val_tys[slot_local.0 as usize].clone())),
+        Some(PtrTarget::ArrayElem { elem_ty, .. }) => Some(ValTy::from_sema_ty(elem_ty, ctx)),
+        Some(PtrTarget::ParamPtr {
+            projected: Some((_, _, fvt)),
+            ..
+        })
+        | Some(PtrTarget::QueryCol {
+            projected: Some((_, _, fvt)),
+            ..
+        })
+        | Some(PtrTarget::QueryRow {
+            projected: Some((_, _, fvt)),
+            ..
+        })
+        | Some(PtrTarget::EntityRow {
+            projected: Some((_, _, fvt)),
+            ..
+        }) => Some(fvt.clone()),
+        _ => Some(analysis.val_tys[base_ptr.0 as usize].clone()),
     }
 }
 
@@ -879,7 +1179,70 @@ pub(super) fn emit_field_load_expr(
         return raw;
     }
 
-    let access = resolve_blob_field_access(layout_key, field, ctx);
+    if layout_key == "SmallVec" && field == "len" {
+        let read_sv_len = |place: &str| -> String {
+            let expr = format!(
+                "{{ let mut __lb = [0u8; 4]; ({place}).strata_pod_read_sub(0, &mut __lb); u32::from_le_bytes(__lb) }}"
+            );
+            coerce_expr(&expr, &ValTy::U32, dst_vt)
+        };
+        if !analysis.ptr_targets.contains_key(&base_ptr) {
+            return read_sv_len(&format!("__loc_{}", base_ptr.0));
+        }
+        let def_expr = dst_vt.default_expr();
+        return emit_place_ref_expr(
+            base_ptr,
+            analysis,
+            query_plans,
+            in_chunk,
+            read_sv_len,
+            &def_expr,
+        );
+    }
+
+    let eff_lk = if layout_key.is_empty()
+        && let ValTy::TableRow(ref tn) = analysis.val_tys[base_ptr.0 as usize]
+    {
+        tn.as_str()
+    } else {
+        layout_key
+    };
+    let access = resolve_blob_field_access(eff_lk, field, ctx);
+
+    // Local/target vector swizzle read when layout_key didn't resolve as a struct
+    if access.sf_opt.is_none()
+        && access.swizzle_lanes.is_empty()
+        && let Some(vec_vt) = target_vec_val_ty(base_ptr, analysis, ctx)
+        && let Some((dim, scalar_vt)) = vec_val_ty_dim_and_scalar(&vec_vt)
+        && let Some(lanes) = parse_swizzle_lanes(field, dim)
+    {
+        let load_swizzle = |place: &str| -> String {
+            if lanes.len() == 1 {
+                coerce_expr(&format!("({place})[{}]", lanes[0]), &scalar_vt, dst_vt)
+            } else {
+                let parts: Vec<String> = lanes.iter().map(|l| format!("__sw[{l}]")).collect();
+                let src_vec_vt = vec_val_ty_for_len(lanes.len(), &scalar_vt);
+                coerce_expr(
+                    &format!("{{ let __sw = *({place}); [{}] }}", parts.join(", ")),
+                    &src_vec_vt,
+                    dst_vt,
+                )
+            }
+        };
+        if !analysis.ptr_targets.contains_key(&base_ptr) {
+            let p = format!("(&__loc_{})", base_ptr.0);
+            return load_swizzle(&p);
+        }
+        let def_expr = dst_vt.default_expr();
+        return emit_place_ref_expr(
+            base_ptr,
+            analysis,
+            query_plans,
+            in_chunk,
+            load_swizzle,
+            &def_expr,
+        );
+    }
 
     // Value-held table row or struct in an SSA register
     if !analysis.ptr_targets.contains_key(&base_ptr) {
@@ -913,19 +1276,146 @@ pub(super) fn emit_field_store_stmt(
     in_chunk: Option<&ChunkLoopInfo>,
     in_undo: bool,
 ) {
+    let (src_vt, src_raw_expr) =
+        effective_local_val_and_expr(val, analysis, query_plans, in_chunk, ctx);
+    let local_id_opt = (analysis.val_tys[val.0 as usize] != ValTy::PtrMarker).then_some(val);
+
+    if let Some(PtrTarget::ParamPtr {
+        var_name,
+        projected: Some((_, proj_field, fvt)),
+        ..
+    }) = analysis.ptr_targets.get(&base_ptr)
+        && field == *proj_field
+    {
+        let coerced = coerce_local_expr(local_id_opt, &src_raw_expr, &src_vt, fvt, analysis);
+        writeln!(out, "{indent}*{var_name} = {coerced};").ok();
+        return;
+    }
+
+    if layout_key == "SmallVec" && field == "len" {
+        let val_u32 =
+            coerce_local_expr(local_id_opt, &src_raw_expr, &src_vt, &ValTy::U32, analysis);
+        emit_place_mut(
+            out,
+            base_ptr,
+            analysis,
+            query_plans,
+            in_chunk,
+            indent,
+            in_undo,
+            |place| format!("({place}).strata_pod_write_bytes(0, &({val_u32}).to_le_bytes());"),
+        );
+        return;
+    }
+
     let access = resolve_blob_field_access(layout_key, field, ctx);
-    if access.sf_opt.is_none() && !access.is_vec_lane && ctx.find_layout_entry(layout_key).is_some()
+
+    // Local/target vector swizzle store when layout_key didn't resolve as a struct
+    if access.sf_opt.is_none()
+        && access.swizzle_lanes.is_empty()
+        && let Some(vec_vt) = target_vec_val_ty(base_ptr, analysis, ctx)
+        && let Some((dim, scalar_vt)) = vec_val_ty_dim_and_scalar(&vec_vt)
+        && let Some(lanes) = parse_swizzle_lanes(field, dim)
+    {
+        let rhs_vt = vec_val_ty_for_len(lanes.len(), &scalar_vt);
+        let rhs_expr = coerce_local_expr(local_id_opt, &src_raw_expr, &src_vt, &rhs_vt, analysis);
+        emit_place_mut(
+            out,
+            base_ptr,
+            analysis,
+            query_plans,
+            in_chunk,
+            indent,
+            in_undo,
+            |place| {
+                if lanes.len() == 1 {
+                    format!("{place}[{}] = {rhs_expr};", lanes[0])
+                } else {
+                    let assigns: Vec<String> = lanes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| format!("{place}[{l}] = __swv[{i}];"))
+                        .collect();
+                    format!("{{ let __swv = {rhs_expr}; {} }}", assigns.join(" "))
+                }
+            },
+        );
+        return;
+    }
+
+    if access.sf_opt.is_none()
+        && !access.is_vec_lane
+        && access.swizzle_lanes.is_empty()
+        && ctx.find_layout_entry(layout_key).is_some()
     {
         return;
     }
 
-    let (src_vt, src_raw_expr) =
-        effective_local_val_and_expr(val, analysis, query_plans, in_chunk, ctx);
-    let local_id_opt = if analysis.val_tys[val.0 as usize] != ValTy::PtrMarker {
-        Some(val)
-    } else {
-        None
-    };
+    if !access.swizzle_lanes.is_empty() {
+        let rhs_vt = vec_val_ty_for_len(access.swizzle_lanes.len(), &access.swizzle_scalar_ty);
+        let val_expr = coerce_local_expr(local_id_opt, &src_raw_expr, &src_vt, &rhs_vt, analysis);
+        emit_place_mut(
+            out,
+            base_ptr,
+            analysis,
+            query_plans,
+            in_chunk,
+            indent,
+            in_undo,
+            |place| {
+                let mut stmts = Vec::new();
+                for (idx, step) in access.steps.iter().enumerate() {
+                    let src_expr = if idx == 0 {
+                        format!("{place}.{}", step.rfname)
+                    } else {
+                        format!("__bs_{}.{}", idx - 1, step.rfname)
+                    };
+                    stmts.push(format!(
+                        "let mut __bs_{idx} = {}::{}(&{src_expr});",
+                        step.struct_name, step.unpack_fn
+                    ));
+                }
+                let target_base = if access.steps.is_empty() {
+                    place.to_owned()
+                } else {
+                    format!("__bs_{}", access.steps.len() - 1)
+                };
+                if access.swizzle_lanes.len() == 1 {
+                    stmts.push(format!(
+                        "{target_base}.{}[{}] = {val_expr};",
+                        access.leaf_chain, access.swizzle_lanes[0]
+                    ));
+                } else {
+                    stmts.push(format!("let __swv = {val_expr};"));
+                    for (i, l) in access.swizzle_lanes.iter().enumerate() {
+                        stmts.push(format!(
+                            "{target_base}.{}[{l}] = __swv[{i}];",
+                            access.leaf_chain
+                        ));
+                    }
+                }
+                for idx in (1..access.steps.len()).rev() {
+                    let step = &access.steps[idx];
+                    stmts.push(format!(
+                        "__bs_{}.{} = __bs_{idx}.{}();",
+                        idx - 1,
+                        step.rfname,
+                        step.pack_fn
+                    ));
+                }
+                if !access.steps.is_empty() {
+                    let first = &access.steps[0];
+                    stmts.push(format!(
+                        "{place}.{} = __bs_0.{}();",
+                        first.rfname, first.pack_fn
+                    ));
+                }
+                format!("{{ {} }}", stmts.join(" "))
+            },
+        );
+        return;
+    }
+
     let val_expr = if let Some(sf) = access.sf_opt {
         let target_vt = ValTy::from_solved_field(sf, ctx);
         let coerced = coerce_local_expr(local_id_opt, &src_raw_expr, &src_vt, &target_vt, analysis);
@@ -1228,8 +1718,55 @@ pub(super) fn coerce_expr_depth(expr: &str, from: &ValTy, to: &ValTy, depth: usi
         ),
         (ValTy::Bool, t) if t.is_int() => format!("(({expr} as u8) as {})", t.rust_type()),
         (f, ValTy::Bool) if f.is_int() => format!("(({expr}) != 0)"),
+        (ValTy::F32, ValTy::Bool) => format!("(({expr}) != 0.0_f32)"),
+        (ValTy::F64, ValTy::Bool) => format!("(({expr}) != 0.0_f64)"),
+        (ValTy::InlineStr(_), ValTy::InlineStr(to_cap)) => {
+            let to_words = 1 + to_cap.div_ceil(4);
+            format!("strata_inline_str_resize::<_, {to_words}>(&({expr}), {to_cap})")
+        }
         (f, t) if (f.is_int() || f.is_float()) && (t.is_int() || t.is_float()) => {
             format!("(({expr}) as {})", t.rust_type())
+        }
+        (
+            ValTy::Array(fe, flen),
+            ValTy::SmallVec {
+                elem: te,
+                cap,
+                elem_size,
+                elem_align,
+            },
+        ) => {
+            let ea = (*elem_align).max(1);
+            let stride = elem_size.div_ceil(ea) * ea;
+            let count = (*flen).min(*cap);
+            let sv_def = to.default_expr();
+            let ev_var = format!("__sve_{depth}");
+            let inner = coerce_expr_depth(&ev_var, fe, te, depth + 1);
+            let wrapped = match te.as_ref() {
+                ValTy::Bool => format!("FfiBool::from_bool({inner})"),
+                ValTy::Fix32 | ValTy::Fix64 => format!("({inner}).0"),
+                _ => inner,
+            };
+            format!(
+                "{{ let __src_{depth} = {expr}; let mut __sv_{depth} = {sv_def}; ({count} as u32); __sv_{depth}.strata_pod_write_bytes(0, &(({count} as u32).to_le_bytes())); let mut __si_{depth} = 0usize; while __si_{depth} < {count} {{ let {ev_var} = __src_{depth}[__si_{depth}]; let __w_{depth} = {wrapped}; let mut __eb_{depth} = [0u8; {elem_size}]; __w_{depth}.strata_pod_read_sub(0, &mut __eb_{depth}); __sv_{depth}.strata_pod_write_bytes(8 + __si_{depth} * {stride}, &__eb_{depth}); __si_{depth} += 1; }} __sv_{depth} }}"
+            )
+        }
+        (
+            ValTy::SmallVec { .. },
+            ValTy::SmallVec {
+                cap: to_cap,
+                elem_size,
+                elem_align,
+                ..
+            },
+        ) => {
+            let ea = (*elem_align).max(1);
+            let stride = elem_size.div_ceil(ea) * ea;
+            let to_bytes = 8 + stride * *to_cap;
+            let sv_def = to.default_expr();
+            format!(
+                "{{ let __src_{depth} = {expr}; let mut __dst_{depth} = {sv_def}; let mut __sb_{depth} = [0u8; {to_bytes}]; __src_{depth}.strata_pod_read_sub(0, &mut __sb_{depth}); let __old_len_{depth} = u32::from_le_bytes([__sb_{depth}[0], __sb_{depth}[1], __sb_{depth}[2], __sb_{depth}[3]]).min({to_cap} as u32); __dst_{depth}.strata_pod_write_bytes(0, &__sb_{depth}); __dst_{depth}.strata_pod_write_bytes(0, &__old_len_{depth}.to_le_bytes()); __dst_{depth} }}"
+            )
         }
         (ValTy::Array(fe, flen), ValTy::Array(te, tlen)) if flen == tlen => {
             let var = format!("__cae_{depth}");
@@ -1248,7 +1785,8 @@ pub(super) fn ptr_projected_field(pt: &PtrTarget) -> Option<&(String, String, Va
     match pt {
         PtrTarget::QueryCol { projected, .. }
         | PtrTarget::QueryRow { projected, .. }
-        | PtrTarget::EntityRow { projected, .. } => projected.as_ref(),
+        | PtrTarget::EntityRow { projected, .. }
+        | PtrTarget::ParamPtr { projected, .. } => projected.as_ref(),
         _ => None,
     }
 }
@@ -1263,19 +1801,47 @@ pub(super) fn effective_local_val_and_expr(
     let vt = &analysis.val_tys[lid.0 as usize];
     if *vt == ValTy::PtrMarker
         && let Some(pt) = analysis.ptr_targets.get(&lid)
-        && let Some((canon, pf, fvt)) = ptr_projected_field(pt)
     {
-        let access = resolve_blob_field_access(canon, pf, ctx);
-        let def_e = fvt.default_expr();
-        let expr = emit_place_ref_for_target(
-            pt,
-            analysis,
-            query_plans,
-            in_chunk,
-            &|place| build_field_load_from_place(place, &access, fvt, ctx),
-            &def_e,
-        );
-        return (fvt.clone(), expr);
+        if let PtrTarget::ParamPtr {
+            var_name,
+            projected: Some((_, _, fvt)),
+            ..
+        } = pt
+        {
+            return (fvt.clone(), format!("(*{var_name})"));
+        }
+        if let PtrTarget::QueryEntityRow {
+            query_idx,
+            row_idx_local,
+        } = pt
+        {
+            let use_row = query_plans
+                .iter()
+                .find(|p| p.query_idx == *query_idx)
+                .is_some_and(QueryEmitPlan::uses_row_iter);
+            let expr = if use_row {
+                format!("FfiEntity::from_bits(__q{query_idx}_ent.to_bits())")
+            } else {
+                format!(
+                    "FfiEntity::from_bits(__q{query_idx}_entities[__loc_{} as usize].to_bits())",
+                    row_idx_local.0
+                )
+            };
+            return (ValTy::Entity, expr);
+        }
+        if let Some((canon, pf, fvt)) = ptr_projected_field(pt) {
+            let access = resolve_blob_field_access(canon, pf, ctx);
+            let def_e = fvt.default_expr();
+            let expr = emit_place_ref_for_target(
+                pt,
+                analysis,
+                query_plans,
+                in_chunk,
+                &|place| build_field_load_from_place(place, &access, fvt, ctx),
+                &def_e,
+            );
+            return (fvt.clone(), expr);
+        }
     }
     (vt.clone(), format!("__loc_{}", lid.0))
 }
@@ -1373,33 +1939,98 @@ pub(super) fn emit_binop_expr(
         };
     }
 
+    if op == "quat_mul" {
+        let lc = coerce_expr(&le, lt, &ValTy::Vec4);
+        let rc = coerce_expr(&re, rt, &ValTy::Vec4);
+        return format!("strata_quat_mul({lc}, {rc})");
+    }
+    if op == "quat_mul_vec3" {
+        let lc = coerce_expr(&le, lt, &ValTy::Vec4);
+        let rc = coerce_expr(&re, rt, &ValTy::Vec3);
+        return format!("strata_quat_mul_vec3({lc}, {rc})");
+    }
+
     // Vector binary ops
-    if let (Some(d), Some(rd)) = (lt.is_ivec(), rt.is_ivec())
-        && d == rd
-    {
-        if matches!(op, "==" | "!=") {
+    match (lt.is_ivec(), rt.is_ivec()) {
+        (Some(d), Some(rd)) if d == rd => {
+            if matches!(op, "==" | "!=") {
+                let re_c = coerce_expr(&re, rt, lt);
+                return format!("({le} {op} {re_c})");
+            }
             let re_c = coerce_expr(&re, rt, lt);
-            return format!("({le} {op} {re_c})");
+            let meth = match op {
+                "-" => "wrapping_sub",
+                "*" => "wrapping_mul",
+                "/" => "wrapping_div",
+                "%" => "wrapping_rem",
+                _ => "wrapping_add",
+            };
+            let lanes: Vec<String> = (0..d)
+                .map(|i| {
+                    if matches!(op, "/" | "%") {
+                        format!(
+                            "if {re_c}[{i}] == 0 {{ 0 }} else {{ ({le}[{i}]).{meth}({re_c}[{i}]) }}"
+                        )
+                    } else {
+                        format!("({le}[{i}]).{meth}({re_c}[{i}])")
+                    }
+                })
+                .collect();
+            return format!("[{}]", lanes.join(", "));
         }
-        let re_c = coerce_expr(&re, rt, lt);
-        let meth = match op {
-            "-" => "wrapping_sub",
-            "*" => "wrapping_mul",
-            "/" => "wrapping_div",
-            _ => "wrapping_add",
-        };
-        let lanes: Vec<String> = (0..d)
-            .map(|i| {
-                if op == "/" {
-                    format!(
-                        "if {re_c}[{i}] == 0 {{ 0 }} else {{ ({le}[{i}]).{meth}({re_c}[{i}]) }}"
-                    )
-                } else {
-                    format!("({le}[{i}]).{meth}({re_c}[{i}])")
-                }
-            })
-            .collect();
-        return format!("[{}]", lanes.join(", "));
+        (Some(d), None) => {
+            let s_vt = if *lt == ValTy::UVec2 {
+                ValTy::U32
+            } else {
+                ValTy::I32
+            };
+            let s = coerce_expr(&re, rt, &s_vt);
+            let meth = match op {
+                "-" => "wrapping_sub",
+                "*" => "wrapping_mul",
+                "/" => "wrapping_div",
+                "%" => "wrapping_rem",
+                _ => "wrapping_add",
+            };
+            let lanes: Vec<String> = (0..d)
+                .map(|i| {
+                    if matches!(op, "/" | "%") {
+                        format!("if __sv == 0 {{ 0 }} else {{ ({le}[{i}]).{meth}(__sv) }}")
+                    } else {
+                        format!("({le}[{i}]).{meth}(__sv)")
+                    }
+                })
+                .collect();
+            let expr = format!("{{ let __sv = {s}; [{}] }}", lanes.join(", "));
+            return coerce_expr(&expr, lt, dst_vt);
+        }
+        (None, Some(d)) => {
+            let s_vt = if *rt == ValTy::UVec2 {
+                ValTy::U32
+            } else {
+                ValTy::I32
+            };
+            let s = coerce_expr(&le, lt, &s_vt);
+            let meth = match op {
+                "-" => "wrapping_sub",
+                "*" => "wrapping_mul",
+                "/" => "wrapping_div",
+                "%" => "wrapping_rem",
+                _ => "wrapping_add",
+            };
+            let lanes: Vec<String> = (0..d)
+                .map(|i| {
+                    if matches!(op, "/" | "%") {
+                        format!("if {re}[{i}] == 0 {{ 0 }} else {{ (__sv).{meth}({re}[{i}]) }}")
+                    } else {
+                        format!("(__sv).{meth}({re}[{i}])")
+                    }
+                })
+                .collect();
+            let expr = format!("{{ let __sv = {s}; [{}] }}", lanes.join(", "));
+            return coerce_expr(&expr, rt, dst_vt);
+        }
+        _ => {}
     }
     match (lt.is_vec(), rt.is_vec()) {
         (Some(d), Some(_)) => {
@@ -1570,7 +2201,8 @@ pub(super) fn emit_intrinsic_math(
             expected.default_expr()
         }
     };
-    match name.rsplit("::").next().unwrap_or(name) {
+    let short = name.rsplit("::").next().unwrap_or(name);
+    match short {
         "vec2" | "Vec2" => format!("[{}, {}]", arg_s(0, &ValTy::F32), arg_s(1, &ValTy::F32)),
         "vec3" | "Vec3" => format!(
             "[{}, {}, {}]",
@@ -1599,13 +2231,60 @@ pub(super) fn emit_intrinsic_math(
             arg_s(2, &ValTy::I32)
         ),
         "uvec2" | "UVec2" => format!("[{}, {}]", arg_s(0, &ValTy::U32), arg_s(1, &ValTy::U32)),
-        "sin" | "cos" | "tan" | "sqrt" | "abs" | "floor" | "ceil" | "round" | "exp" | "ln" => {
+        "abs" => {
+            let (vt, e) = arg_raw(0);
+            let target = if *dst_vt != ValTy::Unit && *dst_vt != ValTy::PtrMarker {
+                dst_vt
+            } else {
+                &vt
+            };
+            let expr = match target {
+                ValTy::Fix32 => format!(
+                    "Fixed32(({}).0.wrapping_abs())",
+                    coerce_expr(&e, &vt, target)
+                ),
+                ValTy::Fix64 => format!(
+                    "Fixed64(({}).0.wrapping_abs())",
+                    coerce_expr(&e, &vt, target)
+                ),
+                ValTy::I8 | ValTy::I16 | ValTy::I32 | ValTy::I64 => {
+                    format!("({}).wrapping_abs()", coerce_expr(&e, &vt, target))
+                }
+                ValTy::U8 | ValTy::U16 | ValTy::U32 | ValTy::U64 | ValTy::UVec2 => {
+                    coerce_expr(&e, &vt, target)
+                }
+                _ if target.is_ivec().is_some() => {
+                    let d = target.is_ivec().unwrap_or(2);
+                    let ae = coerce_expr(&e, &vt, target);
+                    let lanes: Vec<String> = (0..d)
+                        .map(|i| format!("__av[{i}].wrapping_abs()"))
+                        .collect();
+                    format!("{{ let __av = {ae}; [{}] }}", lanes.join(", "))
+                }
+                _ if target.is_vec().is_some() => {
+                    let d = target.is_vec().unwrap_or(2);
+                    let ae = coerce_expr(&e, &vt, target);
+                    let lanes: Vec<String> = (0..d).map(|i| format!("__av[{i}].abs()")).collect();
+                    format!("{{ let __av = {ae}; [{}] }}", lanes.join(", "))
+                }
+                _ => {
+                    let fty = if *target == ValTy::F64 {
+                        ValTy::F64
+                    } else {
+                        ValTy::F32
+                    };
+                    format!("({}).abs()", coerce_expr(&e, &vt, &fty))
+                }
+            };
+            coerce_expr(&expr, target, dst_vt)
+        }
+        "sin" | "cos" | "tan" | "sqrt" | "floor" | "ceil" | "round" | "exp" | "ln" => {
             let fty = if *dst_vt == ValTy::F64 {
                 ValTy::F64
             } else {
                 ValTy::F32
             };
-            format!("({}).{name}()", arg_s(0, &fty))
+            format!("({}).{short}()", arg_s(0, &fty))
         }
         "atan2" | "pow" => {
             let fty = if *dst_vt == ValTy::F64 {
@@ -1613,52 +2292,176 @@ pub(super) fn emit_intrinsic_math(
             } else {
                 ValTy::F32
             };
-            let m = if name == "pow" { "powf" } else { "atan2" };
+            let m = if short == "pow" { "powf" } else { "atan2" };
             format!("({}).{m}({})", arg_s(0, &fty), arg_s(1, &fty))
         }
         "min" | "max" => {
-            let (t0, _) = arg_raw(0);
-            let (t1, _) = arg_raw(1);
-            let ct = if *dst_vt != ValTy::Unit {
+            let (t0, e0) = arg_raw(0);
+            let (t1, e1) = arg_raw(1);
+            let ct = if *dst_vt != ValTy::Unit && *dst_vt != ValTy::PtrMarker {
                 dst_vt.clone()
+            } else if t0.is_vec().is_some() || t0.is_ivec().is_some() {
+                t0.clone()
+            } else if t1.is_vec().is_some() || t1.is_ivec().is_some() {
+                t1.clone()
             } else {
                 common_scalar_type(&t0, &t1)
             };
-            format!("({}).{name}({})", arg_s(0, &ct), arg_s(1, &ct))
+            if let Some(d) = ct.is_vec() {
+                let a = coerce_expr(&e0, &t0, &ct);
+                let b = if t1.is_vec().is_some() {
+                    coerce_expr(&e1, &t1, &ct)
+                } else {
+                    let s = coerce_expr(&e1, &t1, &ValTy::F32);
+                    format!("[{s}; {d}]")
+                };
+                let lanes: Vec<String> = (0..d)
+                    .map(|i| format!("__ma[{i}].{short}(__mb[{i}])"))
+                    .collect();
+                format!(
+                    "{{ let __ma = {a}; let __mb = {b}; [{}] }}",
+                    lanes.join(", ")
+                )
+            } else if let Some(d) = ct.is_ivec() {
+                let svt = if ct == ValTy::UVec2 {
+                    ValTy::U32
+                } else {
+                    ValTy::I32
+                };
+                let a = coerce_expr(&e0, &t0, &ct);
+                let b = if t1.is_ivec().is_some() {
+                    coerce_expr(&e1, &t1, &ct)
+                } else {
+                    let s = coerce_expr(&e1, &t1, &svt);
+                    format!("[{s}; {d}]")
+                };
+                let lanes: Vec<String> = (0..d)
+                    .map(|i| format!("__ma[{i}].{short}(__mb[{i}])"))
+                    .collect();
+                format!(
+                    "{{ let __ma = {a}; let __mb = {b}; [{}] }}",
+                    lanes.join(", ")
+                )
+            } else {
+                format!("({}).{short}({})", arg_s(0, &ct), arg_s(1, &ct))
+            }
         }
         "clamp" => {
-            let ct = if *dst_vt != ValTy::Unit {
+            let (t0, e0) = arg_raw(0);
+            let (t1, e1) = arg_raw(1);
+            let (t2, e2) = arg_raw(2);
+            let ct = if *dst_vt != ValTy::Unit && *dst_vt != ValTy::PtrMarker {
                 dst_vt.clone()
+            } else if t0.is_vec().is_some() || t0.is_ivec().is_some() {
+                t0.clone()
             } else {
-                ValTy::F32
+                common_scalar_type(&common_scalar_type(&t0, &t1), &t2)
             };
-            format!(
-                "({}).clamp({}, {})",
-                arg_s(0, &ct),
-                arg_s(1, &ct),
-                arg_s(2, &ct)
-            )
+            if let Some(d) = ct.is_vec() {
+                let a = coerce_expr(&e0, &t0, &ct);
+                let lo = if t1.is_vec().is_some() {
+                    coerce_expr(&e1, &t1, &ct)
+                } else {
+                    let s = coerce_expr(&e1, &t1, &ValTy::F32);
+                    format!("[{s}; {d}]")
+                };
+                let hi = if t2.is_vec().is_some() {
+                    coerce_expr(&e2, &t2, &ct)
+                } else {
+                    let s = coerce_expr(&e2, &t2, &ValTy::F32);
+                    format!("[{s}; {d}]")
+                };
+                let lanes: Vec<String> = (0..d)
+                    .map(|i| {
+                        format!(
+                            "if __lo[{i}] > __hi[{i}] {{ __lo[{i}] }} else if __cx[{i}] < __lo[{i}] {{ __lo[{i}] }} else if __cx[{i}] > __hi[{i}] {{ __hi[{i}] }} else {{ __cx[{i}] }}"
+                        )
+                    })
+                    .collect();
+                format!(
+                    "{{ let __cx = {a}; let __lo = {lo}; let __hi = {hi}; [{}] }}",
+                    lanes.join(", ")
+                )
+            } else if let Some(d) = ct.is_ivec() {
+                let svt = if ct == ValTy::UVec2 {
+                    ValTy::U32
+                } else {
+                    ValTy::I32
+                };
+                let a = coerce_expr(&e0, &t0, &ct);
+                let lo = if t1.is_ivec().is_some() {
+                    coerce_expr(&e1, &t1, &ct)
+                } else {
+                    let s = coerce_expr(&e1, &t1, &svt);
+                    format!("[{s}; {d}]")
+                };
+                let hi = if t2.is_ivec().is_some() {
+                    coerce_expr(&e2, &t2, &ct)
+                } else {
+                    let s = coerce_expr(&e2, &t2, &svt);
+                    format!("[{s}; {d}]")
+                };
+                let lanes: Vec<String> = (0..d)
+                    .map(|i| {
+                        format!(
+                            "if __lo[{i}] > __hi[{i}] {{ __lo[{i}] }} else {{ __cx[{i}].clamp(__lo[{i}], __hi[{i}]) }}"
+                        )
+                    })
+                    .collect();
+                format!(
+                    "{{ let __cx = {a}; let __lo = {lo}; let __hi = {hi}; [{}] }}",
+                    lanes.join(", ")
+                )
+            } else {
+                let a = arg_s(0, &ct);
+                let lo = arg_s(1, &ct);
+                let hi = arg_s(2, &ct);
+                format!(
+                    "{{ let __cx = {a}; let __lo = {lo}; let __hi = {hi}; if __lo > __hi {{ __lo }} else if __cx < __lo {{ __lo }} else if __cx > __hi {{ __hi }} else {{ __cx }} }}"
+                )
+            }
         }
         "lerp" => {
-            let ct = if *dst_vt != ValTy::Unit {
+            let ct = if *dst_vt != ValTy::Unit && *dst_vt != ValTy::PtrMarker {
                 dst_vt.clone()
             } else {
                 ValTy::F32
             };
             let a = arg_s(0, &ct);
             let b = arg_s(1, &ct);
-            let t = arg_s(2, &ValTy::F32);
             match ct.is_vec() {
                 Some(2) => {
+                    let t = arg_s(2, &ValTy::F32);
                     format!("strata_v2_add({a}, strata_v2_scale(strata_v2_sub({b}, {a}), {t}))")
                 }
                 Some(3) => {
+                    let t = arg_s(2, &ValTy::F32);
                     format!("strata_v3_add({a}, strata_v3_scale(strata_v3_sub({b}, {a}), {t}))")
                 }
                 Some(4) => {
+                    let t = arg_s(2, &ValTy::F32);
                     format!("strata_v4_add({a}, strata_v4_scale(strata_v4_sub({b}, {a}), {t}))")
                 }
-                _ => format!("({a} + ({b} - {a}) * {t})"),
+                _ if ct == ValTy::F64 => {
+                    let t = arg_s(2, &ValTy::F64);
+                    format!("({a} + ({b} - {a}) * {t})")
+                }
+                _ if ct == ValTy::Fix32 => {
+                    let t = arg_s(2, &ValTy::Fix32);
+                    format!(
+                        "{{ let __a = ({a}).0 as i64; let __b = ({b}).0 as i64; let __t = ({t}).0 as i64; Fixed32((__a + (((__b - __a) * __t) >> 16)) as i32) }}"
+                    )
+                }
+                _ if ct == ValTy::Fix64 => {
+                    let t = arg_s(2, &ValTy::Fix64);
+                    format!(
+                        "{{ let __a = ({a}).0 as i128; let __b = ({b}).0 as i128; let __t = ({t}).0 as i128; Fixed64((__a + (((__b - __a) * __t) >> 32)) as i64) }}"
+                    )
+                }
+                _ => {
+                    let t = arg_s(2, &ValTy::F32);
+                    format!("({a} + ({b} - {a}) * {t})")
+                }
             }
         }
         "dot" => {
@@ -1670,10 +2473,19 @@ pub(super) fn emit_intrinsic_math(
             let (_, e0) = arg_raw(0);
             format!("strata_len(&({e0}))")
         }
+        "length_sq" | "len_sq" => {
+            let (_, e0) = arg_raw(0);
+            format!("{{ let __v = &({e0}); strata_dot(__v, __v) }}")
+        }
         "distance" => {
             let (_, e0) = arg_raw(0);
             let (_, e1) = arg_raw(1);
             format!("strata_dist(&({e0}), &({e1}))")
+        }
+        "distance_sq" => {
+            let (_, e0) = arg_raw(0);
+            let (_, e1) = arg_raw(1);
+            format!("strata_dist_sq(&({e0}), &({e1}))")
         }
         "normalize" => {
             let (t0, e0) = arg_raw(0);
@@ -1827,7 +2639,59 @@ pub(super) fn emit_call_expr(
             let vt = dst_vt.unwrap_or(&ValTy::F32);
             let (avt, ae) = effective_local_val_and_expr(a0, analysis, query_plans, in_chunk, ctx);
             let x = coerce_expr(&ae, &avt, vt);
-            Ok(format!("({x} * {x})"))
+            match vt {
+                ValTy::Fix32 => Ok(format!(
+                    "{{ let __x = ({x}).0 as i64; Fixed32(((__x * __x) >> 16) as i32) }}"
+                )),
+                ValTy::Fix64 => Ok(format!(
+                    "{{ let __x = ({x}).0 as i128; Fixed64(((__x * __x) >> 32) as i64) }}"
+                )),
+                t if t.is_int() => Ok(format!("({x}).wrapping_mul({x})")),
+                _ => Ok(format!("({x} * {x})")),
+            }
+        }
+        "signum" => {
+            let a0 = args.first().copied().unwrap_or(LocalId(0));
+            let vt = dst_vt.unwrap_or(&ValTy::F32);
+            let (avt, ae) = effective_local_val_and_expr(a0, analysis, query_plans, in_chunk, ctx);
+            let x = coerce_expr(&ae, &avt, vt);
+            match vt {
+                ValTy::Fix32 => Ok(format!(
+                    "{{ let __v = ({x}).0; Fixed32(if __v > 0 {{ 65536 }} else if __v < 0 {{ -65536 }} else {{ 0 }}) }}"
+                )),
+                ValTy::Fix64 => Ok(format!(
+                    "{{ let __v = ({x}).0; Fixed64(if __v > 0 {{ 4294967296 }} else if __v < 0 {{ -4294967296 }} else {{ 0 }}) }}"
+                )),
+                ValTy::U8 | ValTy::U16 | ValTy::U32 | ValTy::U64 => {
+                    Ok(format!("if ({x}) > 0 {{ 1 }} else {{ 0 }}"))
+                }
+                _ => Ok(format!("({x}).signum()")),
+            }
+        }
+        "remap" => {
+            let get_f = |i: usize| -> String {
+                args.get(i).map_or_else(
+                    || "0.0_f32".to_owned(),
+                    |&l| {
+                        let (vt, e) =
+                            effective_local_val_and_expr(l, analysis, query_plans, in_chunk, ctx);
+                        coerce_expr(&e, &vt, dst_vt.unwrap_or(&ValTy::F32))
+                    },
+                )
+            };
+            let v = get_f(0);
+            let in_lo = get_f(1);
+            let in_hi = get_f(2);
+            let out_lo = get_f(3);
+            let out_hi = get_f(4);
+            Ok(format!(
+                "{{ let __d = ({in_hi}) - ({in_lo}); if __d == 0.0 {{ {out_lo} }} else {{ ({out_lo}) + (({v}) - ({in_lo})) / __d * (({out_hi}) - ({out_lo})) }} }}"
+            ))
+        }
+        "length_sq" | "len_sq" => {
+            let a0 = args.first().copied().unwrap_or(LocalId(0));
+            let e0 = effective_local_val_and_expr(a0, analysis, query_plans, in_chunk, ctx).1;
+            Ok(format!("{{ let __v = &({e0}); strata_dot(__v, __v) }}"))
         }
         "distance_sq" => {
             let a0 = args.first().copied().unwrap_or(LocalId(0));
@@ -1835,6 +2699,76 @@ pub(super) fn emit_call_expr(
             let e0 = effective_local_val_and_expr(a0, analysis, query_plans, in_chunk, ctx).1;
             let e1 = effective_local_val_and_expr(a1, analysis, query_plans, in_chunk, ctx).1;
             Ok(format!("strata_dist_sq(&({e0}), &({e1}))"))
+        }
+        "mat3" | "Mat3" => {
+            if args.is_empty() {
+                Ok("[0.0_f32; 9]".to_owned())
+            } else if args.len() == 9 {
+                let parts: Vec<String> = args
+                    .iter()
+                    .map(|&l| {
+                        let (vt, e) =
+                            effective_local_val_and_expr(l, analysis, query_plans, in_chunk, ctx);
+                        coerce_expr(&e, &vt, &ValTy::F32)
+                    })
+                    .collect();
+                Ok(format!("[{}]", parts.join(", ")))
+            } else if args.len() == 3 {
+                let cols: Vec<String> = args
+                    .iter()
+                    .map(|&l| {
+                        let (vt, e) =
+                            effective_local_val_and_expr(l, analysis, query_plans, in_chunk, ctx);
+                        coerce_expr(&e, &vt, &ValTy::Vec3)
+                    })
+                    .collect();
+                Ok(format!(
+                    "{{ let __c0 = {}; let __c1 = {}; let __c2 = {}; [__c0[0], __c0[1], __c0[2], __c1[0], __c1[1], __c1[2], __c2[0], __c2[1], __c2[2]] }}",
+                    cols[0], cols[1], cols[2]
+                ))
+            } else {
+                let (vt, e) =
+                    effective_local_val_and_expr(args[0], analysis, query_plans, in_chunk, ctx);
+                let s = coerce_expr(&e, &vt, &ValTy::F32);
+                Ok(format!(
+                    "{{ let __s = {s}; [__s, 0.0_f32, 0.0_f32, 0.0_f32, __s, 0.0_f32, 0.0_f32, 0.0_f32, __s] }}"
+                ))
+            }
+        }
+        "mat4" | "Mat4" => {
+            if args.is_empty() {
+                Ok("[0.0_f32; 16]".to_owned())
+            } else if args.len() == 16 {
+                let parts: Vec<String> = args
+                    .iter()
+                    .map(|&l| {
+                        let (vt, e) =
+                            effective_local_val_and_expr(l, analysis, query_plans, in_chunk, ctx);
+                        coerce_expr(&e, &vt, &ValTy::F32)
+                    })
+                    .collect();
+                Ok(format!("[{}]", parts.join(", ")))
+            } else if args.len() == 4 {
+                let cols: Vec<String> = args
+                    .iter()
+                    .map(|&l| {
+                        let (vt, e) =
+                            effective_local_val_and_expr(l, analysis, query_plans, in_chunk, ctx);
+                        coerce_expr(&e, &vt, &ValTy::Vec4)
+                    })
+                    .collect();
+                Ok(format!(
+                    "{{ let __c0 = {}; let __c1 = {}; let __c2 = {}; let __c3 = {}; [__c0[0], __c0[1], __c0[2], __c0[3], __c1[0], __c1[1], __c1[2], __c1[3], __c2[0], __c2[1], __c2[2], __c2[3], __c3[0], __c3[1], __c3[2], __c3[3]] }}",
+                    cols[0], cols[1], cols[2], cols[3]
+                ))
+            } else {
+                let (vt, e) =
+                    effective_local_val_and_expr(args[0], analysis, query_plans, in_chunk, ctx);
+                let s = coerce_expr(&e, &vt, &ValTy::F32);
+                Ok(format!(
+                    "{{ let __s = {s}; [__s, 0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32, __s, 0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32, __s, 0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32, __s] }}"
+                ))
+            }
         }
         "ivec2" | "IVec2" => {
             let x = args.first().map_or_else(

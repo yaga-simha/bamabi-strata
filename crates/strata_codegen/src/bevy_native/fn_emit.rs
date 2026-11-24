@@ -39,7 +39,7 @@ pub(super) fn emit_single_function(
     }
 
     let (query_plans, up_plans) = build_query_plans(func, ctx);
-    let chunk_loops = collect_chunk_loops(func, &query_plans, &up_plans);
+    let chunk_loops = collect_chunk_loops(func, ctx, &query_plans, &up_plans);
     let analysis = analyze_function(func, ctx, &query_plans, &up_plans, &chunk_loops);
 
     let fname = sanitize_ident(&func.name);
@@ -49,38 +49,70 @@ pub(super) fn emit_single_function(
 
     match &func.kind {
         MirFnKind::HelperFn => {
+            let resolve_ref_ty = |pt_opt: Option<&PtrTarget>, fallback_ty: &MirType| -> String {
+                if let Some(PtrTarget::ParamPtr {
+                    layout_key,
+                    projected,
+                    ..
+                }) = pt_opt
+                {
+                    if let Some((_, _, fvt)) = projected {
+                        return fvt.rust_type();
+                    }
+                    if let Some(entry) = ctx.find_layout_entry(layout_key) {
+                        return entry.struct_name.clone();
+                    }
+                    let short = layout_key
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(layout_key.as_str());
+                    if let Some(&tidx) = ctx
+                        .tags_by_key
+                        .get(layout_key.as_str())
+                        .or_else(|| ctx.tags_by_key.get(short))
+                    {
+                        return ctx.tags[tidx].struct_name.clone();
+                    }
+                    if let Some(en) = ctx
+                        .enums_by_key
+                        .get(layout_key.as_str())
+                        .or_else(|| ctx.enums_by_key.get(short))
+                    {
+                        return en.rust_repr().to_owned();
+                    }
+                }
+                ValTy::from_mir(fallback_ty, ctx).rust_type()
+            };
             for p in &func.params {
                 let pname = format!("arg_{}", sanitize_rust_ident(&p.name));
                 let pty = match p.kind {
                     HirParamKind::Ref => {
-                        let s = p
-                            .local
-                            .and_then(|l| analysis.ptr_targets.get(&l))
-                            .and_then(|pt| match pt {
-                                PtrTarget::ParamPtr { layout_key, .. } => ctx
-                                    .find_layout_entry(layout_key)
-                                    .map(|e| e.struct_name.clone()),
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| "()".to_owned());
+                        let s = resolve_ref_ty(
+                            p.local.and_then(|l| analysis.ptr_targets.get(&l)),
+                            &p.ty,
+                        );
                         format!("&{s}")
                     }
                     HirParamKind::RefMut => {
-                        let s = p
-                            .local
-                            .and_then(|l| analysis.ptr_targets.get(&l))
-                            .and_then(|pt| match pt {
-                                PtrTarget::ParamPtr { layout_key, .. } => ctx
-                                    .find_layout_entry(layout_key)
-                                    .map(|e| e.struct_name.clone()),
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| "()".to_owned());
+                        let s = resolve_ref_ty(
+                            p.local.and_then(|l| analysis.ptr_targets.get(&l)),
+                            &p.ty,
+                        );
                         format!("&mut {s}")
                     }
                     _ => ValTy::from_mir(&p.ty, ctx).rust_type(),
                 };
                 sig_params.push(format!("{pname}: {pty}"));
+            }
+            for (canon, (vname, is_mut, sname)) in &analysis.implicit_res_map {
+                if func.resources.iter().any(|r| r.canonical_name == *canon) {
+                    continue;
+                }
+                if *is_mut {
+                    sig_params.push(format!("{vname}: &mut {sname}"));
+                } else {
+                    sig_params.push(format!("{vname}: &{sname}"));
+                }
             }
             let ret_ty = ValTy::from_mir(&func.ret_ty, ctx).rust_type();
             if ret_ty == "()" {
@@ -335,6 +367,19 @@ pub(super) fn emit_single_function(
         HashSet::new()
     };
 
+    let has_chunk_return = chunk_loops.iter().any(|cl| {
+        !cl.use_par
+            && cl.loop_blocks.iter().any(|bid| {
+                matches!(
+                    func.blocks[bid.0 as usize].terminator,
+                    Terminator::Return(_)
+                )
+            })
+    });
+    let has_tx_ret_val = analysis.has_checkpoint
+        && matches!(func.kind, MirFnKind::HelperFn)
+        && !matches!(func.ret_ty, MirType::Unit);
+
     for (idx, vt) in analysis.val_tys.iter().enumerate() {
         let lid = LocalId(idx as u32);
         if param_value_locals.contains(&lid) {
@@ -342,7 +387,9 @@ pub(super) fn emit_single_function(
         }
         let is_outer = local_used_outer[idx] || local_loops[idx].len() > 1;
         if is_outer {
-            if let Some(slot_vt) = analysis.slot_tys.get(&lid) {
+            if analysis.array_ptr_locals.contains(&lid) {
+                writeln!(out, "    let mut __arr_ptr_idx_{idx}: usize = 0usize;").ok();
+            } else if let Some(slot_vt) = analysis.slot_tys.get(&lid) {
                 writeln!(
                     out,
                     "    let mut __slot_{idx}: {} = {};",
@@ -382,12 +429,68 @@ pub(super) fn emit_single_function(
         }
     }
 
+    if has_chunk_return {
+        writeln!(out, "    let mut __returned = false;").ok();
+    }
+    if has_tx_ret_val {
+        let rvt = ValTy::from_mir_ret(&func.ret_ty);
+        let def_e = if matches!(func.ret_ty, MirType::Named(_)) {
+            "Default::default()".to_owned()
+        } else {
+            rvt.default_expr()
+        };
+        let rty = if matches!(func.ret_ty, MirType::Named(_)) {
+            ValTy::from_mir(&func.ret_ty, ctx).rust_type()
+        } else {
+            rvt.rust_type()
+        };
+        writeln!(out, "    let mut __tx_ret_val: {rty} = {def_e};").ok();
+    }
+
+    let tx_streams: Vec<(String, String, String)> = analysis
+        .stream_writers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (canon, mw_var))| {
+            ctx.find_layout_entry(canon)
+                .map(|e| (format!("Stream_{i}"), mw_var.clone(), e.struct_name.clone()))
+        })
+        .collect();
+    let tx_rels: Vec<(String, String, String)> = analysis
+        .relation_res_map
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, (_, is_mut)))| *is_mut)
+        .map(|(i, (rel_name, (rel_var, _)))| {
+            let p_ty = ctx
+                .mir
+                .relations
+                .iter()
+                .find(|r| r.name == *rel_name)
+                .and_then(|r| r.payload_layout.as_ref())
+                .and_then(|pl| ctx.find_layout_entry(&pl.canonical_name))
+                .map_or_else(|| "()".to_owned(), |e| e.struct_name.clone());
+            (format!("Rel_{i}"), rel_var.clone(), p_ty)
+        })
+        .collect();
+
     if analysis.has_checkpoint {
+        let mut variants = vec!["Spawn(Box<dyn FnOnce(&mut Commands) + Send + Sync>)".to_owned()];
+        for (vtag, _, stype) in &tx_streams {
+            variants.push(format!("{vtag}({stype})"));
+        }
+        for (vtag, _, p_ty) in &tx_rels {
+            variants.push(format!("{vtag}Insert(Entity, Entity, {p_ty})"));
+            variants.push(format!("{vtag}Remove(Entity, Entity)"));
+        }
         writeln!(
             out,
-            "    enum __StrataTxCmd {{ Spawn(Box<dyn FnOnce(&mut Commands) + Send + Sync>) }}\n\
+            "    #[allow(dead_code)]\n\
+             \x20   enum __StrataTxCmd {{ {} }}\n\
              \x20   let mut __tx_cmds: Vec<__StrataTxCmd> = Vec::new();\n\
-             \x20   let mut __tx_active = false;"
+             \x20   let mut __tx_depth: u32 = 0;\n\
+             \x20   let mut __tx_active = false;",
+            variants.join(", ")
         )
         .ok();
     }
@@ -410,12 +513,17 @@ pub(super) fn emit_single_function(
                 func,
                 ctx,
                 &query_plans,
+                &chunk_loops,
                 cl,
                 &analysis,
                 &local_used_outer,
                 &local_loops,
                 cl_idx,
+                has_chunk_return,
             )?;
+            if has_chunk_return {
+                writeln!(out, "                if __returned {{ break; }}").ok();
+            }
             writeln!(out, "                __bb = {};", cl.exit_bb.0).ok();
             writeln!(out, "            }}").ok();
             continue;
@@ -440,6 +548,7 @@ pub(super) fn emit_single_function(
         emit_terminator(
             out,
             func,
+            ctx,
             &analysis,
             &bb.terminator,
             "                ",
@@ -449,17 +558,39 @@ pub(super) fn emit_single_function(
     }
     writeln!(out, "            _ => break,\n        }}\n    }}").ok();
 
-    if analysis.has_checkpoint && analysis.needs_commands {
+    if analysis.has_checkpoint {
+        let mut arms = Vec::new();
+        if analysis.needs_commands {
+            arms.push("__StrataTxCmd::Spawn(f) => f(&mut commands),".to_owned());
+        } else {
+            arms.push("__StrataTxCmd::Spawn(_) => {},".to_owned());
+        }
+        for (vtag, mw_var, _) in &tx_streams {
+            arms.push(format!(
+                "__StrataTxCmd::{vtag}(ev) => {{ {mw_var}.write(ev); }}"
+            ));
+        }
+        for (vtag, rel_var, _) in &tx_rels {
+            arms.push(format!(
+                "__StrataTxCmd::{vtag}Insert(s, d, p) => {{ {rel_var}.insert(s, d, p); }}"
+            ));
+            arms.push(format!(
+                "__StrataTxCmd::{vtag}Remove(s, d) => {{ {rel_var}.remove(s, d); }}"
+            ));
+        }
         writeln!(
             out,
             "    for cmd in __tx_cmds {{\n\
-             \x20       match cmd {{ __StrataTxCmd::Spawn(f) => f(&mut commands) }}\n\
-             \x20   }}"
+             \x20       match cmd {{ {} }}\n\
+             \x20   }}",
+            arms.join(" ")
         )
         .ok();
     }
 
-    if matches!(func.kind, MirFnKind::HelperFn) && !matches!(func.ret_ty, MirType::Unit) {
+    if has_tx_ret_val {
+        writeln!(out, "    return __tx_ret_val;").ok();
+    } else if matches!(func.kind, MirFnKind::HelperFn) && !matches!(func.ret_ty, MirType::Unit) {
         if matches!(func.ret_ty, MirType::Named(_)) {
             writeln!(out, "    Default::default()").ok();
         } else {
@@ -482,11 +613,13 @@ pub(super) fn emit_chunk_loop(
     func: &MirFunction,
     ctx: &NativeCtx<'_>,
     query_plans: &[QueryEmitPlan],
+    chunk_loops: &[ChunkLoopInfo],
     cl: &ChunkLoopInfo,
     analysis: &FnAnalysis,
     local_used_outer: &[bool],
     local_loops: &[HashSet<usize>],
     cl_idx: usize,
+    has_chunk_return: bool,
 ) -> Result<(), CodegenError> {
     let plan = query_plans
         .iter()
@@ -600,7 +733,10 @@ pub(super) fn emit_chunk_loop(
         writeln!(
             out,
             "                let mut __q{qi}_snap: Vec<_> = {q_access}.iter().map(|{pat_ro}| {map_out}).collect();\n\
-             \x20               for __q{qi}_srow in &mut __q{qi}_snap {{"
+             \x20               #[allow(unused_mut)]\n\
+             \x20               let mut __broke_loop = false;\n\
+             \x20               for __q{qi}_srow in &mut __q{qi}_snap {{\n\
+             \x20                   if __broke_loop {{ break; }}"
         )
         .ok();
     } else if plan.uses_row_iter() {
@@ -611,7 +747,10 @@ pub(super) fn emit_chunk_loop(
         };
         writeln!(
             out,
-            "                for {pat_str} in {q_access}.{iter_m} {{"
+            "                #[allow(unused_mut)]\n\
+             \x20               let mut __broke_loop = false;\n\
+             \x20               for {pat_str} in {q_access}.{iter_m} {{\n\
+             \x20                   if __broke_loop {{ break; }}"
         )
         .ok();
     } else if cl.use_par {
@@ -635,6 +774,7 @@ pub(super) fn emit_chunk_loop(
         writeln!(
             out,
             "                if let Ok(__chunks) = {q_access}.{seq_m} {{\n\
+             \x20                   #[allow(unused_mut)]\n\
              \x20                   let mut __broke_loop = false;\n\
              \x20                   for {pat_str} in __chunks {{\n\
              \x20                       if __broke_loop {{ break; }}"
@@ -818,7 +958,9 @@ pub(super) fn emit_chunk_loop(
             && local_loops[idx].len() == 1
             && local_loops[idx].contains(&cl_idx)
         {
-            if let Some(slot_vt) = analysis.slot_tys.get(&lid) {
+            if analysis.array_ptr_locals.contains(&lid) {
+                writeln!(out, "{indent}let mut __arr_ptr_idx_{idx}: usize = 0usize;").ok();
+            } else if let Some(slot_vt) = analysis.slot_tys.get(&lid) {
                 writeln!(
                     out,
                     "{indent}let mut __slot_{idx}: {} = {};",
@@ -888,6 +1030,59 @@ pub(super) fn emit_chunk_loop(
     let mut ordered_blocks: Vec<BlockId> = cl.loop_blocks.iter().copied().collect();
     ordered_blocks.sort_by_key(|b| b.0);
     for bid in ordered_blocks {
+        if let Some(sub_cl_idx) = chunk_loops
+            .iter()
+            .position(|c| c.hdr_bb == bid && c.hdr_bb != cl.hdr_bb)
+        {
+            let sub_cl = &chunk_loops[sub_cl_idx];
+            writeln!(out, "{indent}        {} => {{", bid.0).ok();
+            emit_chunk_loop(
+                out,
+                func,
+                ctx,
+                query_plans,
+                chunk_loops,
+                sub_cl,
+                analysis,
+                local_used_outer,
+                local_loops,
+                sub_cl_idx,
+                has_chunk_return,
+            )?;
+            if has_chunk_return {
+                if cl.use_par {
+                    writeln!(out, "{indent}            if __returned {{ break; }}").ok();
+                } else {
+                    writeln!(
+                        out,
+                        "{indent}            if __returned {{ __broke_loop = true; break; }}"
+                    )
+                    .ok();
+                }
+            }
+            if sub_cl.exit_bb == cl.hdr_bb {
+                writeln!(out, "{indent}            break;").ok();
+            } else if sub_cl.exit_bb == cl.exit_bb {
+                if cl.use_par {
+                    writeln!(out, "{indent}            break;").ok();
+                } else {
+                    writeln!(
+                        out,
+                        "{indent}            __broke_loop = true;\n{indent}            break;"
+                    )
+                    .ok();
+                }
+            } else {
+                writeln!(
+                    out,
+                    "{indent}            __inner_bb = {};",
+                    sub_cl.exit_bb.0
+                )
+                .ok();
+            }
+            writeln!(out, "{indent}        }}").ok();
+            continue;
+        }
         let bb = &func.blocks[bid.0 as usize];
         writeln!(out, "{indent}        {} => {{", bid.0).ok();
         for (si, st) in bb.stmts.iter().enumerate() {
@@ -908,6 +1103,7 @@ pub(super) fn emit_chunk_loop(
         emit_terminator(
             out,
             func,
+            ctx,
             analysis,
             &bb.terminator,
             "                                    ",
@@ -970,7 +1166,7 @@ pub(super) fn emit_chunk_loop(
         writeln!(out, "{indent}if let Ok(mut __g) = __par_red.lock() {{").ok();
         for (ri, (_, op, vty)) in reduce_info.iter().enumerate() {
             let expr =
-                reduce_combine_expr(op, vty, &format!("__g.{ri}"), &format!("__chunk_red_{ri}"));
+                reduce_merge_expr(op, vty, &format!("__g.{ri}"), &format!("__chunk_red_{ri}"));
             writeln!(out, "{indent}    __g.{ri} = {expr};").ok();
         }
         writeln!(out, "{indent}}}").ok();
@@ -1055,21 +1251,55 @@ pub(super) fn reduce_identity_expr(op: &str, vty: &ValTy) -> String {
             ValTy::F32 => "f32::MAX".to_owned(),
             ValTy::F64 => "f64::MAX".to_owned(),
             ValTy::U32 => "u32::MAX".to_owned(),
+            ValTy::U64 => "u64::MAX".to_owned(),
             ValTy::I32 => "i32::MAX".to_owned(),
+            ValTy::I64 => "i64::MAX".to_owned(),
+            ValTy::Fix32 => "Fixed32(i32::MAX)".to_owned(),
+            ValTy::Fix64 => "Fixed64(i64::MAX)".to_owned(),
+            ValTy::Vec2 => "[f32::MAX; 2]".to_owned(),
+            ValTy::Vec3 => "[f32::MAX; 3]".to_owned(),
+            ValTy::Vec4 => "[f32::MAX; 4]".to_owned(),
+            ValTy::IVec2 => "[i32::MAX; 2]".to_owned(),
+            ValTy::IVec3 => "[i32::MAX; 3]".to_owned(),
+            ValTy::UVec2 => "[u32::MAX; 2]".to_owned(),
             _ => vty.default_expr(),
         },
         "max" => match vty {
             ValTy::F32 => "f32::MIN".to_owned(),
             ValTy::F64 => "f64::MIN".to_owned(),
             ValTy::U32 => "0u32".to_owned(),
+            ValTy::U64 => "0u64".to_owned(),
             ValTy::I32 => "i32::MIN".to_owned(),
+            ValTy::I64 => "i64::MIN".to_owned(),
+            ValTy::Fix32 => "Fixed32(i32::MIN)".to_owned(),
+            ValTy::Fix64 => "Fixed64(i64::MIN)".to_owned(),
+            ValTy::Vec2 => "[f32::MIN; 2]".to_owned(),
+            ValTy::Vec3 => "[f32::MIN; 3]".to_owned(),
+            ValTy::Vec4 => "[f32::MIN; 4]".to_owned(),
+            ValTy::IVec2 => "[i32::MIN; 2]".to_owned(),
+            ValTy::IVec3 => "[i32::MIN; 3]".to_owned(),
+            ValTy::UVec2 => "[0u32; 2]".to_owned(),
             _ => vty.default_expr(),
         },
         "prod" => match vty {
             ValTy::F32 => "1.0_f32".to_owned(),
             ValTy::F64 => "1.0_f64".to_owned(),
+            ValTy::U8 => "1u8".to_owned(),
+            ValTy::U16 => "1u16".to_owned(),
             ValTy::U32 => "1u32".to_owned(),
+            ValTy::U64 => "1u64".to_owned(),
+            ValTy::I8 => "1i8".to_owned(),
+            ValTy::I16 => "1i16".to_owned(),
             ValTy::I32 => "1i32".to_owned(),
+            ValTy::I64 => "1i64".to_owned(),
+            ValTy::Fix32 => "Fixed32(65536)".to_owned(),
+            ValTy::Fix64 => "Fixed64(4294967296)".to_owned(),
+            ValTy::Vec2 => "[1.0_f32; 2]".to_owned(),
+            ValTy::Vec3 => "[1.0_f32; 3]".to_owned(),
+            ValTy::Vec4 => "[1.0_f32; 4]".to_owned(),
+            ValTy::IVec2 => "[1i32; 2]".to_owned(),
+            ValTy::IVec3 => "[1i32; 3]".to_owned(),
+            ValTy::UVec2 => "[1u32; 2]".to_owned(),
             _ => vty.default_expr(),
         },
         "all" => "true".to_owned(),
@@ -1077,20 +1307,147 @@ pub(super) fn reduce_identity_expr(op: &str, vty: &ValTy) -> String {
     }
 }
 
-pub(super) fn reduce_combine_expr(op: &str, vty: &ValTy, acc: &str, val: &str) -> String {
-    let rhs = if *vty == ValTy::Bool {
-        val.to_owned()
-    } else {
-        format!("({val}) as {}", vty.rust_type())
-    };
+pub(super) fn reduce_combine_same_ty(op: &str, vty: &ValTy, acc: &str, rhs: &str) -> String {
+    if let Some(d) = vty.is_vec() {
+        let lanes: Vec<String> = match op {
+            "min" => (0..d)
+                .map(|i| format!("__rl[{i}].min(__rr[{i}])"))
+                .collect(),
+            "max" => (0..d)
+                .map(|i| format!("__rl[{i}].max(__rr[{i}])"))
+                .collect(),
+            "prod" => (0..d).map(|i| format!("__rl[{i}] * __rr[{i}]")).collect(),
+            _ => (0..d).map(|i| format!("__rl[{i}] + __rr[{i}]")).collect(),
+        };
+        return format!(
+            "{{ let __rl = {acc}; let __rr = {rhs}; [{}] }}",
+            lanes.join(", ")
+        );
+    }
+    if let Some(d) = vty.is_ivec() {
+        let lanes: Vec<String> = match op {
+            "min" => (0..d)
+                .map(|i| format!("__rl[{i}].min(__rr[{i}])"))
+                .collect(),
+            "max" => (0..d)
+                .map(|i| format!("__rl[{i}].max(__rr[{i}])"))
+                .collect(),
+            "prod" => (0..d)
+                .map(|i| format!("__rl[{i}].wrapping_mul(__rr[{i}])"))
+                .collect(),
+            _ => (0..d)
+                .map(|i| format!("__rl[{i}].wrapping_add(__rr[{i}])"))
+                .collect(),
+        };
+        return format!(
+            "{{ let __rl = {acc}; let __rr = {rhs}; [{}] }}",
+            lanes.join(", ")
+        );
+    }
     match op {
         "min" => format!("({acc}).min({rhs})"),
         "max" => format!("({acc}).max({rhs})"),
-        "prod" => format!("({acc}) * ({rhs})"),
+        "prod" => match vty {
+            ValTy::Fix32 => {
+                format!("Fixed32(((({acc}).0 as i64).wrapping_mul(({rhs}).0 as i64) >> 16) as i32)")
+            }
+            ValTy::Fix64 => format!(
+                "Fixed64(((({acc}).0 as i128).wrapping_mul(({rhs}).0 as i128) >> 32) as i64)"
+            ),
+            t if t.is_int() => format!("({acc}).wrapping_mul({rhs})"),
+            _ => format!("({acc}) * ({rhs})"),
+        },
         "any" => format!("({acc}) || ({rhs})"),
         "all" => format!("({acc}) && ({rhs})"),
-        _ => format!("({acc}) + ({rhs})"),
+        _ => {
+            if vty.is_int() {
+                format!("({acc}).wrapping_add({rhs})")
+            } else {
+                format!("({acc}) + ({rhs})")
+            }
+        }
     }
+}
+
+pub(super) fn reduce_accum_expr(
+    op: &str,
+    acc_vt: &ValTy,
+    val_vt: &ValTy,
+    acc: &str,
+    val: &str,
+) -> String {
+    match op {
+        "count" => {
+            let inc = if *val_vt == ValTy::Bool {
+                format!("(if {val} {{ 1 }} else {{ 0 }})")
+            } else if val_vt.is_int() {
+                format!("(if ({val}) != 0 {{ 1 }} else {{ 0 }})")
+            } else {
+                coerce_expr(val, val_vt, acc_vt)
+            };
+            if acc_vt.is_int() {
+                format!("({acc}).wrapping_add({inc})")
+            } else {
+                format!("({acc}) + ({inc})")
+            }
+        }
+        "any" | "all" => {
+            let b = coerce_expr(val, val_vt, &ValTy::Bool);
+            reduce_combine_same_ty(op, &ValTy::Bool, acc, &b)
+        }
+        _ => {
+            let rhs = coerce_expr(val, val_vt, acc_vt);
+            reduce_combine_same_ty(op, acc_vt, acc, &rhs)
+        }
+    }
+}
+
+pub(super) fn reduce_merge_expr(op: &str, vty: &ValTy, acc: &str, partial: &str) -> String {
+    reduce_combine_same_ty(op, vty, acc, partial)
+}
+
+fn resolve_entity_local_expr(
+    tgt: LocalId,
+    func: &MirFunction,
+    analysis: &FnAnalysis,
+    in_chunk: Option<&ChunkLoopInfo>,
+) -> String {
+    if analysis.val_tys[tgt.0 as usize] == ValTy::Entity {
+        return format!("__loc_{}", tgt.0);
+    }
+    match analysis.ptr_targets.get(&tgt) {
+        Some(PtrTarget::EntityRow { entity_local, .. }) => {
+            return resolve_entity_local_expr(*entity_local, func, analysis, in_chunk);
+        }
+        Some(PtrTarget::QueryRow {
+            query_idx,
+            row_idx_local,
+            ..
+        })
+        | Some(PtrTarget::QueryEntityRow {
+            query_idx,
+            row_idx_local,
+        }) => {
+            return format!(
+                "FfiEntity::from_bits(__q{query_idx}_entities[__loc_{} as usize].to_bits())",
+                row_idx_local.0
+            );
+        }
+        _ => {}
+    }
+    if let Some(cl) = in_chunk {
+        for &bid in &cl.loop_blocks {
+            for s in &func.blocks[bid.0 as usize].stmts {
+                if matches!(s.inst, Inst::EntityAtRow { .. })
+                    && let Some(ed) = s.dst
+                    && analysis.val_tys[ed.0 as usize] == ValTy::Entity
+                {
+                    return format!("__loc_{}", ed.0);
+                }
+            }
+        }
+    }
+    "FfiEntity::NULL".to_owned()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1220,12 +1577,9 @@ pub(super) fn emit_stmt(
                 && analysis.val_tys[d.0 as usize] != ValTy::PtrMarker
                 && analysis.val_tys[d.0 as usize] != ValTy::Unit
             {
-                let src_e = format!("__loc_{}", val.0);
-                let coerced = coerce_expr(
-                    &src_e,
-                    &analysis.val_tys[val.0 as usize],
-                    &analysis.val_tys[d.0 as usize],
-                );
+                let (src_vt, src_e) =
+                    effective_local_val_and_expr(*val, analysis, query_plans, in_chunk, ctx);
+                let coerced = coerce_expr(&src_e, &src_vt, &analysis.val_tys[d.0 as usize]);
                 writeln!(out, "{indent}__loc_{} = {coerced};", d.0).ok();
             }
         }
@@ -1357,15 +1711,35 @@ pub(super) fn emit_stmt(
             }
         }
         Inst::Call { callee, args } => {
-            if let Some(hf) = ctx.helpers_by_key.get(callee.as_str())
-                && hf
-                    .params
-                    .iter()
-                    .any(|p| matches!(p.kind, HirParamKind::Ref | HirParamKind::RefMut))
+            let hf_opt =
+                ctx.helpers_by_key
+                    .get(callee.as_str())
+                    .copied()
+                    .or_else(|| {
+                        let short = callee.rsplit("::").next().unwrap_or(callee);
+                        ctx.mir.fns.iter().find(|f| {
+                            f.name == *callee || f.name.rsplit("::").next() == Some(short)
+                        })
+                    });
+            let needs_places_or_imp = hf_opt.is_some_and(|hf| {
+                let mut hres = BTreeMap::new();
+                collect_helper_implicit_res(&hf.name, ctx, &mut hres, &mut HashSet::new());
+                let has_imp = hres
+                    .keys()
+                    .any(|canon| !hf.resources.iter().any(|r| r.canonical_name == *canon));
+                has_imp
+                    || hf
+                        .params
+                        .iter()
+                        .any(|p| matches!(p.kind, HirParamKind::Ref | HirParamKind::RefMut))
+            });
+            if let Some(hf) = hf_opt
+                && needs_places_or_imp
             {
                 let in_undo = func.blocks[bb_idx].label == "tx_undo_field";
                 emit_helper_call_with_places(
                     out,
+                    func,
                     hf,
                     args,
                     st.dst,
@@ -1402,19 +1776,27 @@ pub(super) fn emit_stmt(
                         .iter()
                         .enumerate()
                         .map(|(idx, (_, l))| {
-                            let src_vt = &analysis.val_tys[l.0 as usize];
+                            let (src_vt, raw_expr) = effective_local_val_and_expr(
+                                *l,
+                                analysis,
+                                query_plans,
+                                in_chunk,
+                                ctx,
+                            );
+                            let local_opt =
+                                (analysis.val_tys[l.0 as usize] != ValTy::PtrMarker).then_some(*l);
                             if let ValTy::Tuple(ref item_tys) = *dt
                                 && let Some(dst_item_vt) = item_tys.get(idx)
                             {
                                 coerce_local_expr(
-                                    Some(*l),
-                                    &format!("__loc_{}", l.0),
-                                    src_vt,
+                                    local_opt,
+                                    &raw_expr,
+                                    &src_vt,
                                     dst_item_vt,
                                     analysis,
                                 )
                             } else {
-                                format!("__loc_{}", l.0)
+                                raw_expr
                             }
                         })
                         .collect();
@@ -1428,18 +1810,27 @@ pub(super) fn emit_stmt(
                     let mut finits = Vec::new();
                     for (fname, flocal) in fields {
                         let rfname = sanitize_rust_ident(fname);
-                        let src_vt = &analysis.val_tys[flocal.0 as usize];
+                        let (mut src_vt, mut raw_expr) = effective_local_val_and_expr(
+                            *flocal,
+                            analysis,
+                            query_plans,
+                            in_chunk,
+                            ctx,
+                        );
                         let fval = if let Some(sf) =
                             entry.layout.fields.iter().find(|f| f.name == *fname)
                         {
                             let dst_vt = ValTy::from_solved_field(sf, ctx);
-                            let e = coerce_local_expr(
-                                Some(*flocal),
-                                &format!("__loc_{}", flocal.0),
-                                src_vt,
-                                &dst_vt,
-                                analysis,
-                            );
+                            if dst_vt == ValTy::Entity && src_vt != ValTy::Entity {
+                                raw_expr =
+                                    resolve_entity_local_expr(*flocal, func, analysis, in_chunk);
+                                src_vt = ValTy::Entity;
+                            }
+                            let local_opt = (analysis.val_tys[flocal.0 as usize]
+                                != ValTy::PtrMarker)
+                                .then_some(*flocal);
+                            let e =
+                                coerce_local_expr(local_opt, &raw_expr, &src_vt, &dst_vt, analysis);
                             wrap_abi_field_store(
                                 &e,
                                 sf,
@@ -1448,7 +1839,7 @@ pub(super) fn emit_stmt(
                                     && ctx.entity_events.contains(&entry.layout.canonical_name),
                             )
                         } else {
-                            format!("__loc_{}", flocal.0)
+                            raw_expr
                         };
                         finits.push(format!("{rfname}: {fval}"));
                     }
@@ -1476,51 +1867,184 @@ pub(super) fn emit_stmt(
             if let Some(d) = st.dst {
                 let dt = &analysis.val_tys[d.0 as usize];
                 let elem_vt = match dt {
-                    ValTy::Array(ev, _) => Some(ev.as_ref()),
+                    ValTy::Array(ev, _) | ValTy::SmallVec { elem: ev, .. } => Some(ev.as_ref()),
                     _ => None,
                 };
                 let parts: Vec<String> = elems
                     .iter()
                     .map(|l| {
-                        let raw = format!("__loc_{}", l.0);
+                        let (src_vt, raw) =
+                            effective_local_val_and_expr(*l, analysis, query_plans, in_chunk, ctx);
+                        let local_opt =
+                            (analysis.val_tys[l.0 as usize] != ValTy::PtrMarker).then_some(*l);
                         if let Some(target_ev) = elem_vt {
-                            coerce_local_expr(
-                                Some(*l),
-                                &raw,
-                                &analysis.val_tys[l.0 as usize],
-                                target_ev,
-                                analysis,
-                            )
+                            coerce_local_expr(local_opt, &raw, &src_vt, target_ev, analysis)
                         } else {
                             raw
                         }
                     })
                     .collect();
-                writeln!(out, "{indent}__loc_{} = [{}];", d.0, parts.join(", ")).ok();
+                let arr_expr = format!("[{}]", parts.join(", "));
+                let final_expr = if matches!(dt, ValTy::SmallVec { .. }) {
+                    let src_arr = ValTy::Array(
+                        Box::new(elem_vt.cloned().unwrap_or(ValTy::U32)),
+                        elems.len(),
+                    );
+                    coerce_expr(&arr_expr, &src_arr, dt)
+                } else {
+                    arr_expr
+                };
+                writeln!(out, "{indent}__loc_{} = {final_expr};", d.0).ok();
             }
         }
         Inst::ArrayIndex { base, index } => {
             if let Some(d) = st.dst {
+                let idx_e = coerce_expr(
+                    &format!("__loc_{}", index.0),
+                    &analysis.val_tys[index.0 as usize],
+                    &ValTy::U64,
+                );
+                if analysis.array_ptr_locals.contains(&d) {
+                    writeln!(out, "{indent}__arr_ptr_idx_{} = ({idx_e}) as usize;", d.0).ok();
+                    return Ok(());
+                }
                 let dt = &analysis.val_tys[d.0 as usize];
+                let def_e = dt.default_expr();
+                if analysis.ptr_targets.contains_key(base) {
+                    let meta = analysis
+                        .field_ptr_array_meta
+                        .get(base)
+                        .cloned()
+                        .or_else(|| {
+                            analysis
+                                .smallvec_ptr_meta
+                                .get(base)
+                                .map(|(et, es, ea, cap)| (et.clone(), *es, *ea, true, *cap))
+                        });
+                    if let Some((sema_elem_ty, elem_sz, elem_align, is_sv, sv_cap)) = meta {
+                        let ea = elem_align.max(1);
+                        let stride = elem_sz.div_ceil(ea) * ea;
+                        let elem_rust_ty = match &sema_elem_ty {
+                            Ty::Named(n) => {
+                                let short = n.rsplit("::").next().unwrap_or(n);
+                                if !ctx.enums_by_key.contains_key(n.as_str())
+                                    && !ctx.enums_by_key.contains_key(short)
+                                    && let Some(entry) = ctx.find_layout_entry(n)
+                                    && entry.layout.size > 0
+                                    && !entry.layout.fields.is_empty()
+                                {
+                                    entry.struct_name.clone()
+                                } else {
+                                    rust_abi_type_for_ty(&sema_elem_ty, elem_sz, ctx.mir)
+                                }
+                            }
+                            Ty::SmallVec { .. } | Ty::Tuple(_) | Ty::InputBuffer { .. } => {
+                                aligned_blob_type(elem_sz, elem_align)
+                            }
+                            _ => rust_abi_type_for_ty(&sema_elem_ty, elem_sz, ctx.mir),
+                        };
+                        let unpacked = unwrap_abi_ty_load(
+                            "__el_raw",
+                            &sema_elem_ty,
+                            elem_sz,
+                            elem_align,
+                            ctx,
+                            0,
+                        );
+                        let load_expr = emit_place_ref_expr(
+                            *base,
+                            analysis,
+                            query_plans,
+                            in_chunk,
+                            |place| {
+                                if is_sv {
+                                    if elem_sz == 0 {
+                                        let (raw_e, raw_vt) =
+                                            (&format!("{elem_rust_ty}::default()"), dt.clone());
+                                        let _ = raw_vt;
+                                        raw_e.clone()
+                                    } else {
+                                        let conv = if unpacked.0 == "__el_raw" {
+                                            coerce_expr("__el_raw", &unpacked.1, dt)
+                                        } else {
+                                            coerce_expr(&unpacked.0, &unpacked.1, dt)
+                                        };
+                                        format!(
+                                            "{{ let __ai = ({idx_e}) as usize; if __ai < {sv_cap} {{ let mut __eb = [0u8; {elem_sz}]; ({place}).strata_pod_read_sub(8 + __ai * {stride}, &mut __eb); let __el_raw = <{elem_rust_ty} as StrataPodBytes>::strata_pod_from_bytes(&__eb); {conv} }} else {{ {def_e} }} }}"
+                                        )
+                                    }
+                                } else {
+                                    let conv = coerce_expr(&unpacked.0, &unpacked.1, dt);
+                                    format!(
+                                        "{{ let __ai = ({idx_e}) as usize; if __ai < ({place}).len() {{ let __el_raw = ({place})[__ai]; {conv} }} else {{ {def_e} }} }}"
+                                    )
+                                }
+                            },
+                            &def_e,
+                        );
+                        writeln!(out, "{indent}__loc_{} = {load_expr};", d.0).ok();
+                        return Ok(());
+                    }
+                }
                 let base_expr = if analysis.slot_tys.contains_key(base) {
                     format!("__slot_{}", base.0)
                 } else {
                     format!("__loc_{}", base.0)
                 };
-                let elem_raw = format!("{base_expr}[__arr_idx]");
-                let (expr, def_e) =
-                    if let ValTy::Array(elem_vt, _) = &analysis.val_tys[base.0 as usize] {
-                        (coerce_expr(&elem_raw, elem_vt, dt), dt.default_expr())
-                    } else {
-                        (elem_raw, dt.default_expr())
-                    };
-                writeln!(
-                    out,
-                    "{indent}let __arr_idx = __loc_{} as usize;\n\
-                     {indent}__loc_{} = if __arr_idx < {base_expr}.len() {{ {expr} }} else {{ {def_e} }};",
-                    index.0, d.0
-                )
-                .ok();
+                match &analysis.val_tys[base.0 as usize] {
+                    ValTy::SmallVec {
+                        elem,
+                        cap,
+                        elem_size,
+                        elem_align,
+                    } => {
+                        let ea = (*elem_align).max(1);
+                        let stride = elem_size.div_ceil(ea) * ea;
+                        let sema_elem = val_ty_to_sema_hint(elem);
+                        let elem_rust_ty = match &sema_elem {
+                            Ty::Named(n) => ctx
+                                .find_layout_entry(n)
+                                .map_or_else(|| elem.rust_type(), |e| e.struct_name.clone()),
+                            Ty::SmallVec { .. } => aligned_blob_type(*elem_size, *elem_align),
+                            _ => rust_abi_type_for_ty(&sema_elem, *elem_size, ctx.mir),
+                        };
+                        let unpacked = unwrap_abi_ty_load(
+                            "__el_raw",
+                            &sema_elem,
+                            *elem_size,
+                            *elem_align,
+                            ctx,
+                            0,
+                        );
+                        let conv = coerce_expr(&unpacked.0, &unpacked.1, dt);
+                        writeln!(
+                            out,
+                            "{indent}__loc_{} = if (({idx_e}) as usize) < {cap} {{ let mut __eb = [0u8; {elem_size}]; {base_expr}.strata_pod_read_sub(8 + (({idx_e}) as usize) * {stride}, &mut __eb); let __el_raw = <{elem_rust_ty} as StrataPodBytes>::strata_pod_from_bytes(&__eb); {conv} }} else {{ {def_e} }};",
+                            d.0
+                        )
+                        .ok();
+                    }
+                    ValTy::Array(elem_vt, _) => {
+                        let elem_raw = format!("{base_expr}[__arr_idx]");
+                        let expr = coerce_expr(&elem_raw, elem_vt, dt);
+                        writeln!(
+                            out,
+                            "{indent}let __arr_idx = ({idx_e}) as usize;\n\
+                             {indent}__loc_{} = if __arr_idx < {base_expr}.len() {{ {expr} }} else {{ {def_e} }};",
+                            d.0
+                        )
+                        .ok();
+                    }
+                    _ => {
+                        writeln!(
+                            out,
+                            "{indent}let __arr_idx = ({idx_e}) as usize;\n\
+                             {indent}__loc_{} = if __arr_idx < {base_expr}.len() {{ {base_expr}[__arr_idx] }} else {{ {def_e} }};",
+                            d.0
+                        )
+                        .ok();
+                    }
+                }
             }
         }
         Inst::SlotLoad { slot } => {
@@ -1577,18 +2101,14 @@ pub(super) fn emit_stmt(
                 .get(slot)
                 .cloned()
                 .unwrap_or_else(|| format!("__slot_{}", slot.0));
-            let val_vt = &analysis.val_tys[val.0 as usize];
-            if *val_vt == ValTy::PtrMarker || *val_vt == ValTy::Unit {
+            let (eff_vt, eff_expr) =
+                effective_local_val_and_expr(*val, analysis, query_plans, in_chunk, ctx);
+            if eff_vt == ValTy::PtrMarker || eff_vt == ValTy::Unit {
                 return Ok(());
             }
-            let slot_vt = analysis.slot_tys.get(slot).unwrap_or(val_vt);
-            let coerced = coerce_local_expr(
-                Some(*val),
-                &format!("__loc_{}", val.0),
-                val_vt,
-                slot_vt,
-                analysis,
-            );
+            let local_opt = (analysis.val_tys[val.0 as usize] != ValTy::PtrMarker).then_some(*val);
+            let slot_vt = analysis.slot_tys.get(slot).unwrap_or(&eff_vt);
+            let coerced = coerce_local_expr(local_opt, &eff_expr, &eff_vt, slot_vt, analysis);
             writeln!(out, "{indent}{slot_name} = {coerced};").ok();
         }
         Inst::SlotAlloc { .. }
@@ -1623,8 +2143,9 @@ pub(super) fn emit_stmt(
                 && let Some(PtrTarget::UpCascadeDirect { up_q_expr, .. }) =
                     analysis.ptr_targets.get(&d)
             {
-                let parent_step = if let Some((rel_var, _)) =
-                    analysis.relation_res_map.get(relation.as_str())
+                let resolved_rel = resolve_custom_relation_name(ctx, relation);
+                let parent_step = if !is_child_of_relation(relation)
+                    && let Some((rel_var, _)) = analysis.relation_res_map.get(resolved_rel)
                 {
                     format!(
                         "{rel_var}.edges.iter().find_map(|&(s, d, _)| (s == __cur).then_some(d))"
@@ -1671,11 +2192,16 @@ pub(super) fn emit_stmt(
         Inst::SpatialCsrCount { index_name, pos } => {
             let resolved = resolve_spatial_name(ctx, func, index_name);
             if let Some((vname, _)) = analysis.spatial_res_map.get(resolved.as_str()) {
-                let p3 = match analysis.val_tys[pos.0 as usize] {
-                    ValTy::Vec2 => format!("[__loc_{0}[0], __loc_{0}[1], 0.0_f32]", pos.0),
-                    _ => format!("__loc_{}", pos.0),
-                };
-                writeln!(out, "{indent}{vname}.csr_count({p3});").ok();
+                if analysis.val_tys[pos.0 as usize] == ValTy::Vec2 {
+                    writeln!(
+                        out,
+                        "{indent}let __sp_pos = {vname}.lift_vec2(__loc_{});\n{indent}{vname}.csr_count(__sp_pos);",
+                        pos.0
+                    )
+                    .ok();
+                } else {
+                    writeln!(out, "{indent}{vname}.csr_count(__loc_{});", pos.0).ok();
+                }
             }
         }
         Inst::SpatialCsrPrefixSum { index_name } => {
@@ -1691,16 +2217,21 @@ pub(super) fn emit_stmt(
         } => {
             let resolved = resolve_spatial_name(ctx, func, index_name);
             if let Some((vname, _)) = analysis.spatial_res_map.get(resolved.as_str()) {
-                let p3 = match analysis.val_tys[pos.0 as usize] {
-                    ValTy::Vec2 => format!("[__loc_{0}[0], __loc_{0}[1], 0.0_f32]", pos.0),
-                    _ => format!("__loc_{}", pos.0),
-                };
-                writeln!(
-                    out,
-                    "{indent}if let Some(__ce) = Entity::try_from_bits(__loc_{}.to_bits()) {{ {vname}.csr_scatter(__ce, {p3}); }}",
-                    entity.0
-                )
-                .ok();
+                if analysis.val_tys[pos.0 as usize] == ValTy::Vec2 {
+                    writeln!(
+                        out,
+                        "{indent}if let Some(__ce) = Entity::try_from_bits(__loc_{}.to_bits()) {{ let __sp_pos = {vname}.lift_vec2(__loc_{}); {vname}.csr_scatter(__ce, __sp_pos); }}",
+                        entity.0, pos.0
+                    )
+                    .ok();
+                } else {
+                    writeln!(
+                        out,
+                        "{indent}if let Some(__ce) = Entity::try_from_bits(__loc_{}.to_bits()) {{ {vname}.csr_scatter(__ce, __loc_{}); }}",
+                        entity.0, pos.0
+                    )
+                    .ok();
+                }
             }
         }
         Inst::ArrayStore {
@@ -1710,7 +2241,21 @@ pub(super) fn emit_stmt(
             elem_ty,
         } => {
             let in_undo = func.blocks[bb_idx].label == "tx_undo_field";
-            let target_elem_vt = ValTy::from_mir(elem_ty, ctx);
+            let meta = analysis
+                .field_ptr_array_meta
+                .get(base_ptr)
+                .cloned()
+                .or_else(|| {
+                    analysis
+                        .smallvec_ptr_meta
+                        .get(base_ptr)
+                        .map(|(et, es, ea, cap)| (et.clone(), *es, *ea, true, *cap))
+                });
+            let target_elem_vt = if let Some((ref sema_elem_ty, _, _, _, _)) = meta {
+                ValTy::from_sema_ty(sema_elem_ty, ctx)
+            } else {
+                ValTy::from_mir(elem_ty, ctx)
+            };
             let (src_vt, src_raw_expr) =
                 effective_local_val_and_expr(*val, analysis, query_plans, in_chunk, ctx);
             let local_id_opt = if analysis.val_tys[val.0 as usize] != ValTy::PtrMarker {
@@ -1725,14 +2270,36 @@ pub(super) fn emit_stmt(
                 &target_elem_vt,
                 analysis,
             );
-            let wrapped_val = if let Some((sema_elem_ty, elem_sz, elem_align)) =
-                analysis.field_ptr_array_meta.get(base_ptr)
-            {
-                wrap_abi_ty_store(&coerced, sema_elem_ty, *elem_sz, *elem_align, ctx, 0)
+            let wrapped_val = if let Some((ref sema_elem_ty, elem_sz, elem_align, _, _)) = meta {
+                wrap_abi_ty_store(&coerced, sema_elem_ty, elem_sz, elem_align, ctx, 0)
             } else {
                 coerced
             };
             let idx_expr = format!("(__loc_{} as usize)", index.0);
+            let sv_dims = meta
+                .as_ref()
+                .and_then(|(_, es, ea, is_sv, cap)| is_sv.then_some((*es, *ea, *cap)))
+                .or_else(|| {
+                    let vt = analysis
+                        .ptr_targets
+                        .get(base_ptr)
+                        .and_then(|pt| match pt {
+                            PtrTarget::SlotRef { slot_local } => analysis.slot_tys.get(slot_local),
+                            _ => None,
+                        })
+                        .unwrap_or(&analysis.val_tys[base_ptr.0 as usize]);
+                    if let ValTy::SmallVec {
+                        cap,
+                        elem_size,
+                        elem_align,
+                        ..
+                    } = vt
+                    {
+                        Some((*elem_size, *elem_align, *cap))
+                    } else {
+                        None
+                    }
+                });
             if analysis.ptr_targets.contains_key(base_ptr) {
                 emit_place_mut(
                     out,
@@ -1743,9 +2310,21 @@ pub(super) fn emit_stmt(
                     indent,
                     in_undo,
                     |place| {
-                        format!(
-                            "let __arr_idx = {idx_expr}; if __arr_idx < {place}.len() {{ {place}[__arr_idx] = {wrapped_val}; }}"
-                        )
+                        if let Some((elem_sz, elem_align, sv_cap)) = sv_dims {
+                            if elem_sz == 0 {
+                                format!("let _ = {wrapped_val};")
+                            } else {
+                                let ea = elem_align.max(1);
+                                let stride = elem_sz.div_ceil(ea) * ea;
+                                format!(
+                                    "let __arr_idx = {idx_expr}; if __arr_idx < {sv_cap} {{ let __wv = {wrapped_val}; let mut __wb = [0u8; {elem_sz}]; __wv.strata_pod_read_sub(0, &mut __wb); ({place}).strata_pod_write_bytes(8 + __arr_idx * {stride}, &__wb); }}"
+                                )
+                            }
+                        } else {
+                            format!(
+                                "let __arr_idx = {idx_expr}; if __arr_idx < {place}.len() {{ {place}[__arr_idx] = {wrapped_val}; }}"
+                            )
+                        }
                     },
                 );
             } else {
@@ -1754,11 +2333,25 @@ pub(super) fn emit_stmt(
                 } else {
                     format!("__loc_{}", base_ptr.0)
                 };
-                writeln!(
-                    out,
-                    "{indent}let __arr_idx = {idx_expr}; if __arr_idx < {base_expr}.len() {{ {base_expr}[__arr_idx] = {wrapped_val}; }}"
-                )
-                .ok();
+                if let Some((elem_sz, elem_align, sv_cap)) = sv_dims {
+                    if elem_sz == 0 {
+                        writeln!(out, "{indent}let _ = {wrapped_val};").ok();
+                    } else {
+                        let ea = elem_align.max(1);
+                        let stride = elem_sz.div_ceil(ea) * ea;
+                        writeln!(
+                            out,
+                            "{indent}let __arr_idx = {idx_expr}; if __arr_idx < {sv_cap} {{ let __wv = {wrapped_val}; let mut __wb = [0u8; {elem_sz}]; __wv.strata_pod_read_sub(0, &mut __wb); {base_expr}.strata_pod_write_bytes(8 + __arr_idx * {stride}, &__wb); }}"
+                        )
+                        .ok();
+                    }
+                } else {
+                    writeln!(
+                        out,
+                        "{indent}let __arr_idx = {idx_expr}; if __arr_idx < {base_expr}.len() {{ {base_expr}[__arr_idx] = {wrapped_val}; }}"
+                    )
+                    .ok();
+                }
             }
         }
 
@@ -1953,12 +2546,10 @@ pub(super) fn emit_stmt(
         Inst::ReduceAccum { acc, op, val } => {
             if let Some(d) = st.dst {
                 let dt = &analysis.val_tys[d.0 as usize];
-                let expr = reduce_combine_expr(
-                    op,
-                    dt,
-                    &format!("__loc_{}", acc.0),
-                    &format!("__loc_{}", val.0),
-                );
+                let (val_vt, val_expr) =
+                    effective_local_val_and_expr(*val, analysis, query_plans, in_chunk, ctx);
+                let expr =
+                    reduce_accum_expr(op, dt, &val_vt, &format!("__loc_{}", acc.0), &val_expr);
                 writeln!(out, "{indent}__loc_{} = {expr};", d.0).ok();
             }
         }
@@ -1987,9 +2578,19 @@ pub(super) fn emit_stmt(
                         query_idx,
                         slot_idx,
                         selective,
+                        optional,
+                        ..
+                    })
+                    | Some(PtrTarget::QueryRow {
+                        query_idx,
+                        slot_idx,
+                        selective,
+                        optional,
                         ..
                     }) => {
-                        if *selective {
+                        if !*optional {
+                            "true".to_owned()
+                        } else if *selective {
                             format!("__q{query_idx}_sel_{slot_idx}.is_some()")
                         } else {
                             format!("__q{query_idx}_col_{slot_idx}.is_some()")
@@ -2233,30 +2834,48 @@ pub(super) fn emit_stmt(
         Inst::BitSetSet { ptr, bit, .. } => {
             let in_undo = func.blocks[bb_idx].label == "tx_undo_field";
             let b = format!("(__loc_{} as u32)", bit.0);
-            emit_place_mut(
-                out,
-                *ptr,
-                analysis,
-                query_plans,
-                in_chunk,
-                indent,
-                in_undo,
-                |place| format!("strata_bitset_set({place}.as_mut_slice(), {b});"),
-            );
+            if analysis.ptr_targets.contains_key(ptr) {
+                emit_place_mut(
+                    out,
+                    *ptr,
+                    analysis,
+                    query_plans,
+                    in_chunk,
+                    indent,
+                    in_undo,
+                    |place| format!("strata_bitset_set({place}.as_mut_slice(), {b});"),
+                );
+            } else if analysis.val_tys[ptr.0 as usize] != ValTy::PtrMarker {
+                writeln!(
+                    out,
+                    "{indent}strata_bitset_set(__loc_{}.as_mut_slice(), {b});",
+                    ptr.0
+                )
+                .ok();
+            }
         }
         Inst::BitSetClear { ptr, bit, .. } => {
             let in_undo = func.blocks[bb_idx].label == "tx_undo_field";
             let b = format!("(__loc_{} as u32)", bit.0);
-            emit_place_mut(
-                out,
-                *ptr,
-                analysis,
-                query_plans,
-                in_chunk,
-                indent,
-                in_undo,
-                |place| format!("strata_bitset_clear({place}.as_mut_slice(), {b});"),
-            );
+            if analysis.ptr_targets.contains_key(ptr) {
+                emit_place_mut(
+                    out,
+                    *ptr,
+                    analysis,
+                    query_plans,
+                    in_chunk,
+                    indent,
+                    in_undo,
+                    |place| format!("strata_bitset_clear({place}.as_mut_slice(), {b});"),
+                );
+            } else if analysis.val_tys[ptr.0 as usize] != ValTy::PtrMarker {
+                writeln!(
+                    out,
+                    "{indent}strata_bitset_clear(__loc_{}.as_mut_slice(), {b});",
+                    ptr.0
+                )
+                .ok();
+            }
         }
         Inst::BitSetGet { ptr, bit, .. } => {
             if let Some(d) = st.dst {
@@ -2335,19 +2954,18 @@ pub(super) fn emit_stmt(
             field,
         } => {
             if let Some(d) = st.dst {
+                let dt = &analysis.val_tys[d.0 as usize];
                 let tident = sanitize_ident(table_name);
-                let row_e = format!(
-                    "STRATA_TABLE_{tident}.get(__loc_{} as usize).copied().unwrap_or_default()",
-                    key.0
-                );
+                let row_e = format!("strata_table_get_{tident}((__loc_{}) as i64)", key.0);
                 if field.is_empty() {
                     writeln!(out, "{indent}__loc_{} = {row_e};", d.0).ok();
                 } else {
+                    let access = resolve_blob_field_access(table_name, field, ctx);
+                    let loaded = build_field_load_from_place("__trow", &access, dt, ctx);
                     writeln!(
                         out,
-                        "{indent}__loc_{} = {row_e}.{};",
-                        d.0,
-                        sanitize_rust_ident(field)
+                        "{indent}{{ let __trow = {row_e}; __loc_{} = {loaded}; }}",
+                        d.0
                     )
                     .ok();
                 }
@@ -2379,7 +2997,7 @@ pub(super) fn emit_stmt(
                 && let Some((vname, _)) = analysis.spatial_res_map.get(resolved.as_str())
             {
                 let c3 = match analysis.val_tys[center.0 as usize] {
-                    ValTy::Vec2 => format!("[__loc_{0}[0], __loc_{0}[1], 0.0_f32]", center.0),
+                    ValTy::Vec2 => format!("{vname}.lift_vec2(__loc_{})", center.0),
                     _ => format!("__loc_{}", center.0),
                 };
                 let r = coerce_expr(
@@ -2407,11 +3025,11 @@ pub(super) fn emit_stmt(
                 && let Some((vname, _)) = analysis.spatial_res_map.get(resolved.as_str())
             {
                 let s3 = match analysis.val_tys[start.0 as usize] {
-                    ValTy::Vec2 => format!("[__loc_{0}[0], __loc_{0}[1], 0.0_f32]", start.0),
+                    ValTy::Vec2 => format!("{vname}.lift_vec2(__loc_{})", start.0),
                     _ => format!("__loc_{}", start.0),
                 };
                 let e3 = match analysis.val_tys[end.0 as usize] {
-                    ValTy::Vec2 => format!("[__loc_{0}[0], __loc_{0}[1], 0.0_f32]", end.0),
+                    ValTy::Vec2 => format!("{vname}.lift_vec2(__loc_{})", end.0),
                     _ => format!("__loc_{}", end.0),
                 };
                 let r = coerce_expr(
@@ -2419,10 +3037,15 @@ pub(super) fn emit_stmt(
                     &analysis.val_tys[radius.0 as usize],
                     &ValTy::F32,
                 );
+                let toff = coerce_expr(
+                    &format!("__loc_{}", tick_offset.0),
+                    &analysis.val_tys[tick_offset.0 as usize],
+                    &ValTy::U32,
+                );
                 writeln!(
                     out,
-                    "{indent}__loc_{} = {vname}.query_segment_at(__loc_{} as u32, {s3}, {e3}, {r});",
-                    d.0, tick_offset.0
+                    "{indent}__loc_{} = {vname}.query_segment_at({toff}, {s3}, {e3}, {r});",
+                    d.0
                 )
                 .ok();
             }
@@ -2584,10 +3207,11 @@ pub(super) fn emit_stmt(
             }
         }
         Inst::CmdDespawn { entity } => {
-            let ent = format!("__loc_{}", entity.0);
+            let ent = resolve_entity_local_expr(*entity, func, analysis, in_chunk);
+            writeln!(out, "{indent}let __cmd_ent = {ent};").ok();
             emit_cmd_block(out, analysis, indent, |cmds| {
                 format!(
-                    "if let Some(__e) = Entity::try_from_bits({ent}.to_bits()) {{ {cmds}.entity(__e).despawn(); }}"
+                    "if let Some(__e) = Entity::try_from_bits(__cmd_ent.to_bits()) {{ {cmds}.entity(__e).despawn(); }}"
                 )
             });
         }
@@ -2616,7 +3240,7 @@ pub(super) fn emit_stmt(
             data,
             if_new,
         } => {
-            let ent = format!("__loc_{}", entity.0);
+            let ent = resolve_entity_local_expr(*entity, func, analysis, in_chunk);
             let val_expr = if let Some(d) = data {
                 if ctx.is_zst_component(component) {
                     ctx.resolve_ecs_struct_name(component)
@@ -2632,18 +3256,24 @@ pub(super) fn emit_stmt(
                 )
             };
             let method = if *if_new { "insert_if_new" } else { "insert" };
+            writeln!(
+                out,
+                "{indent}let __cmd_ent = {ent};\n{indent}let __cmd_val = {val_expr};"
+            )
+            .ok();
             emit_cmd_block(out, analysis, indent, |cmds| {
                 format!(
-                    "if let Some(__e) = Entity::try_from_bits({ent}.to_bits()) {{ {cmds}.entity(__e).{method}({val_expr}); }}"
+                    "if let Some(__e) = Entity::try_from_bits(__cmd_ent.to_bits()) {{ {cmds}.entity(__e).{method}(__cmd_val); }}"
                 )
             });
         }
         Inst::CmdRemove { entity, component } => {
             if let Some(sname) = ctx.resolve_ecs_struct_name(component) {
-                let ent = format!("__loc_{}", entity.0);
+                let ent = resolve_entity_local_expr(*entity, func, analysis, in_chunk);
+                writeln!(out, "{indent}let __cmd_ent = {ent};").ok();
                 emit_cmd_block(out, analysis, indent, |cmds| {
                     format!(
-                        "if let Some(__e) = Entity::try_from_bits({ent}.to_bits()) {{ {cmds}.entity(__e).remove::<{sname}>(); }}"
+                        "if let Some(__e) = Entity::try_from_bits(__cmd_ent.to_bits()) {{ {cmds}.entity(__e).remove::<{sname}>(); }}"
                     )
                 });
             }
@@ -2652,55 +3282,129 @@ pub(super) fn emit_stmt(
             event,
             target,
             payload,
-            ..
+            propagate,
         } => {
             if let Some(ev_entry) = ctx.find_layout_entry(event) {
+                let is_zst_ev = ev_entry.layout.size == 0 || ev_entry.layout.fields.is_empty();
                 let mut ev_expr = if let Some(pl) = payload {
-                    if ev_entry.layout.size == 0 || ev_entry.layout.fields.is_empty() {
+                    if is_zst_ev {
                         ev_entry.struct_name.clone()
+                    } else if analysis.val_tys[pl.0 as usize] == ValTy::PtrMarker {
+                        if matches!(
+                            analysis.ptr_targets.get(pl),
+                            Some(PtrTarget::TriggerPayload)
+                        ) {
+                            if in_chunk.is_some_and(|c| c.use_par) {
+                                "__obs_ev_copy".to_owned()
+                            } else {
+                                "(*on.event())".to_owned()
+                            }
+                        } else if analysis.ptr_targets.contains_key(pl) {
+                            let def_s = format!("{}::default()", ev_entry.struct_name);
+                            emit_place_ref_expr(
+                                *pl,
+                                analysis,
+                                query_plans,
+                                in_chunk,
+                                |place| format!("(*({place}))"),
+                                &def_s,
+                            )
+                        } else {
+                            format!("{}::default()", ev_entry.struct_name)
+                        }
                     } else {
                         format!("__loc_{}", pl.0)
                     }
-                } else if ev_entry.layout.size == 0 || ev_entry.layout.fields.is_empty() {
+                } else if is_zst_ev {
                     ev_entry.struct_name.clone()
                 } else {
                     format!("{}::default()", ev_entry.struct_name)
                 };
                 let is_entity_ev = ctx.entity_events.contains(&ev_entry.layout.canonical_name);
                 let resolve_trig_target = |tgt: LocalId| -> String {
-                    if analysis.val_tys[tgt.0 as usize] == ValTy::Entity {
-                        return format!("__loc_{}", tgt.0);
-                    }
-                    if let Some(cl) = in_chunk {
-                        for &bid in &cl.loop_blocks {
-                            for s in &func.blocks[bid.0 as usize].stmts {
-                                if matches!(s.inst, Inst::EntityAtRow { .. })
-                                    && let Some(ed) = s.dst
-                                    && analysis.val_tys[ed.0 as usize] == ValTy::Entity
-                                {
-                                    return format!("__loc_{}", ed.0);
-                                }
-                            }
-                        }
-                    }
-                    "FfiEntity::NULL".to_owned()
+                    resolve_entity_local_expr(tgt, func, analysis, in_chunk)
                 };
-                if is_entity_ev {
+                if *propagate {
+                    let t_expr_opt = target.map(resolve_trig_target);
+                    if let Some(ref t_expr) = t_expr_opt {
+                        writeln!(
+                            out,
+                            "{indent}let __trig_ev = {ev_expr}; let __trig_tgt = {t_expr};"
+                        )
+                        .ok();
+                    } else {
+                        writeln!(out, "{indent}let __trig_ev = {ev_expr};").ok();
+                    }
+                    let start_ent = if is_entity_ev {
+                        if t_expr_opt.is_some() {
+                            "if __trig_ev.entity.0 == FfiEntity::NULL { __trig_tgt } else { __trig_ev.entity.0 }"
+                        } else {
+                            "__trig_ev.entity.0"
+                        }
+                    } else {
+                        "__trig_tgt"
+                    };
+                    if t_expr_opt.is_some() || is_entity_ev {
+                        emit_cmd_block(out, analysis, indent, |cmds| {
+                            if is_entity_ev {
+                                format!(
+                                    "{cmds}.queue(move |__w: &mut World| {{\n\
+                                     \x20   let mut __cur_opt = Entity::try_from_bits(({start_ent}).to_bits());\n\
+                                     \x20   let mut __guard = 0u32;\n\
+                                     \x20   while let Some(__ce) = __cur_opt {{\n\
+                                     \x20       if __guard >= 256 {{ break; }}\n\
+                                     \x20       __guard += 1;\n\
+                                     \x20       let mut __ev = __trig_ev;\n\
+                                     \x20       __ev.entity = StrataTargetEntity(FfiEntity::from_bits(__ce.to_bits()));\n\
+                                     \x20       __w.trigger(__ev);\n\
+                                     \x20       __cur_opt = __w.get::<ChildOf>(__ce).map(|__co| __co.parent());\n\
+                                     \x20   }}\n\
+                                     }});"
+                                )
+                            } else {
+                                format!(
+                                    "{cmds}.queue(move |__w: &mut World| {{\n\
+                                     \x20   let mut __cur_opt = Entity::try_from_bits(({start_ent}).to_bits());\n\
+                                     \x20   let mut __guard = 0u32;\n\
+                                     \x20   while let Some(__ce) = __cur_opt {{\n\
+                                     \x20       if __guard >= 256 {{ break; }}\n\
+                                     \x20       __guard += 1;\n\
+                                     \x20       let __has = __w.contains_resource::<StrataTriggerTargetStack>();\n\
+                                     \x20       if __has {{ __w.resource_mut::<StrataTriggerTargetStack>().0.push(FfiEntity::from_bits(__ce.to_bits())); }}\n\
+                                     \x20       __w.trigger(__trig_ev);\n\
+                                     \x20       if __has {{ __w.resource_mut::<StrataTriggerTargetStack>().0.pop(); }}\n\
+                                     \x20       __cur_opt = __w.get::<ChildOf>(__ce).map(|__co| __co.parent());\n\
+                                     \x20   }}\n\
+                                     }});"
+                                )
+                            }
+                        });
+                    } else {
+                        emit_cmd_block(out, analysis, indent, |cmds| {
+                            format!("{cmds}.trigger(__trig_ev);")
+                        });
+                    }
+                } else if is_entity_ev {
                     if let Some(tgt) = target {
                         let t_expr = resolve_trig_target(*tgt);
                         ev_expr = format!(
                             "{{ let mut __ev = {ev_expr}; if __ev.entity.0 == FfiEntity::NULL {{ __ev.entity = StrataTargetEntity({t_expr}); }} __ev }}"
                         );
                     }
+                    writeln!(out, "{indent}let __trig_ev = {ev_expr};").ok();
                     emit_cmd_block(out, analysis, indent, |cmds| {
-                        format!("{cmds}.trigger({ev_expr});")
+                        format!("{cmds}.trigger(__trig_ev);")
                     });
                 } else if let Some(tgt) = target {
                     let t_expr = resolve_trig_target(*tgt);
+                    writeln!(
+                        out,
+                        "{indent}let __ev_p = {ev_expr}; let __ev_t = {t_expr};"
+                    )
+                    .ok();
                     emit_cmd_block(out, analysis, indent, |cmds| {
                         format!(
-                            "let __ev_p = {ev_expr}; let __ev_t = {t_expr};\n\
-                             {cmds}.queue(move |__w: &mut World| {{\n\
+                            "{cmds}.queue(move |__w: &mut World| {{\n\
                              \x20   let __has = __w.contains_resource::<StrataTriggerTargetStack>();\n\
                              \x20   if __has {{ __w.resource_mut::<StrataTriggerTargetStack>().0.push(__ev_t); }}\n\
                              \x20   __w.trigger(__ev_p);\n\
@@ -2709,8 +3413,9 @@ pub(super) fn emit_stmt(
                         )
                     });
                 } else {
+                    writeln!(out, "{indent}let __trig_ev = {ev_expr};").ok();
                     emit_cmd_block(out, analysis, indent, |cmds| {
-                        format!("{cmds}.trigger({ev_expr});")
+                        format!("{cmds}.trigger(__trig_ev);")
                     });
                 }
             }
@@ -2719,6 +3424,29 @@ pub(super) fn emit_stmt(
             if let Some(entry) = ctx.find_layout_entry(stream) {
                 let p_expr = if entry.layout.size == 0 || entry.layout.fields.is_empty() {
                     entry.struct_name.clone()
+                } else if analysis.val_tys[payload.0 as usize] == ValTy::PtrMarker {
+                    if matches!(
+                        analysis.ptr_targets.get(payload),
+                        Some(PtrTarget::TriggerPayload)
+                    ) {
+                        if in_chunk.is_some_and(|c| c.use_par) {
+                            "__obs_ev_copy".to_owned()
+                        } else {
+                            "(*on.event())".to_owned()
+                        }
+                    } else if analysis.ptr_targets.contains_key(payload) {
+                        let def_s = format!("{}::default()", entry.struct_name);
+                        emit_place_ref_expr(
+                            *payload,
+                            analysis,
+                            query_plans,
+                            in_chunk,
+                            |place| format!("(*({place}))"),
+                            &def_s,
+                        )
+                    } else {
+                        format!("{}::default()", entry.struct_name)
+                    }
                 } else {
                     format!("__loc_{}", payload.0)
                 };
@@ -2731,7 +3459,20 @@ pub(super) fn emit_stmt(
                 } else if let Some(mw_name) =
                     analysis.stream_writers.get(&entry.layout.canonical_name)
                 {
-                    writeln!(out, "{indent}{mw_name}.write({p_expr});").ok();
+                    if analysis.has_checkpoint
+                        && let Some(s_idx) = analysis
+                            .stream_writers
+                            .keys()
+                            .position(|k| k == &entry.layout.canonical_name)
+                    {
+                        writeln!(
+                            out,
+                            "{indent}if __tx_active {{ __tx_cmds.push(__StrataTxCmd::Stream_{s_idx}({p_expr})); }} else {{ {mw_name}.write({p_expr}); }}"
+                        )
+                        .ok();
+                    } else {
+                        writeln!(out, "{indent}{mw_name}.write({p_expr});").ok();
+                    }
                 }
             }
         }
@@ -2739,7 +3480,7 @@ pub(super) fn emit_stmt(
             if let Some(d) = st.dst {
                 writeln!(
                     out,
-                    "{indent}__loc_{} = __tx_cmds.len(); __tx_active = true;",
+                    "{indent}__loc_{} = __tx_cmds.len(); __tx_depth += 1; __tx_active = true;",
                     d.0
                 )
                 .ok();
@@ -2748,7 +3489,7 @@ pub(super) fn emit_stmt(
         Inst::CmdRollback { checkpoint } => {
             writeln!(
                 out,
-                "{indent}__tx_cmds.truncate(__loc_{}); __tx_active = false;",
+                "{indent}__tx_cmds.truncate(__loc_{}); __tx_depth = __tx_depth.saturating_sub(1); __tx_active = __tx_depth > 0;",
                 checkpoint.0
             )
             .ok();
@@ -2762,9 +3503,17 @@ pub(super) fn emit_stmt(
                     {
                         let si = slot.slot_idx;
                         if plan.uses_row_iter() || cl.is_pset_snap {
-                            writeln!(out, "{indent}__q{qi}_tx_dirty_{si} = false;").ok();
+                            writeln!(
+                                out,
+                                "{indent}if !__tx_active {{ __q{qi}_tx_dirty_{si} = false; }}"
+                            )
+                            .ok();
                         } else {
-                            writeln!(out, "{indent}__q{qi}_tx_rows_{si}.clear();").ok();
+                            writeln!(
+                                out,
+                                "{indent}if !__tx_active {{ __q{qi}_tx_rows_{si}.clear(); }}"
+                            )
+                            .ok();
                         }
                     }
                 }
@@ -2772,7 +3521,11 @@ pub(super) fn emit_stmt(
         }
         Inst::ShadowCommit { .. } => {
             if analysis.has_checkpoint {
-                writeln!(out, "{indent}__tx_active = false;").ok();
+                writeln!(
+                    out,
+                    "{indent}__tx_depth = __tx_depth.saturating_sub(1); __tx_active = __tx_depth > 0;"
+                )
+                .ok();
                 if let Some(cl) = in_chunk
                     && let Some(plan) = query_plans.iter().find(|p| p.query_idx == cl.query_idx)
                 {
@@ -2785,19 +3538,19 @@ pub(super) fn emit_stmt(
                             if plan.uses_row_iter() || cl.is_pset_snap {
                                 writeln!(
                                     out,
-                                    "{indent}__q{qi}_dirty_{si} |= core::mem::take(&mut __q{qi}_tx_dirty_{si});"
+                                    "{indent}if !__tx_active {{ __q{qi}_dirty_{si} |= core::mem::take(&mut __q{qi}_tx_dirty_{si}); }}"
                                 )
                                 .ok();
                             } else if slot.mode == TermAccessMode::OptionalWrite {
                                 writeln!(
                                     out,
-                                    "{indent}if let Some(ref mut __opt_sel) = __q{qi}_sel_{si} {{ for __r in __q{qi}_tx_rows_{si}.drain(..) {{ __opt_sel.mark_dirty_row(__r); }} }} else {{ __q{qi}_tx_rows_{si}.clear(); }}"
+                                    "{indent}if !__tx_active {{ if let Some(ref mut __opt_sel) = __q{qi}_sel_{si} {{ for __r in __q{qi}_tx_rows_{si}.drain(..) {{ __opt_sel.mark_dirty_row(__r); }} }} else {{ __q{qi}_tx_rows_{si}.clear(); }} }}"
                                 )
                                 .ok();
                             } else {
                                 writeln!(
                                     out,
-                                    "{indent}for __r in __q{qi}_tx_rows_{si}.drain(..) {{ __q{qi}_sel_{si}.mark_dirty_row(__r); }}"
+                                    "{indent}if !__tx_active {{ for __r in __q{qi}_tx_rows_{si}.drain(..) {{ __q{qi}_sel_{si}.mark_dirty_row(__r); }} }}"
                                 )
                                 .ok();
                             }
@@ -2812,18 +3565,49 @@ pub(super) fn emit_stmt(
             target,
             payload,
         } => {
-            if let Some((vname, _)) = analysis.relation_res_map.get(relation.as_str()) {
-                let p_expr = payload
-                    .map(|p| format!("__loc_{}", p.0))
-                    .unwrap_or_else(|| "()".to_owned());
+            let ent = resolve_entity_local_expr(*entity, func, analysis, in_chunk);
+            let tgt = resolve_entity_local_expr(*target, func, analysis, in_chunk);
+            if is_child_of_relation(relation) {
                 writeln!(
                     out,
-                    "{indent}if let (Some(__s), Some(__d)) = (Entity::try_from_bits(__loc_{}.to_bits()), Entity::try_from_bits(__loc_{}.to_bits())) {{\n\
-                     {indent}    {vname}.insert(__s, __d, {p_expr});\n\
-                     {indent}}}",
-                    entity.0, target.0
+                    "{indent}let __cmd_ent = {ent};\n{indent}let __cmd_tgt = {tgt};"
                 )
                 .ok();
+                emit_cmd_block(out, analysis, indent, |cmds| {
+                    format!(
+                        "if let (Some(__s), Some(__d)) = (Entity::try_from_bits(__cmd_ent.to_bits()), Entity::try_from_bits(__cmd_tgt.to_bits())) {{ {cmds}.entity(__s).insert(ChildOf(__d)); }}"
+                    )
+                });
+            } else {
+                let resolved_rel = resolve_custom_relation_name(ctx, relation);
+                if let Some((vname, _)) = analysis.relation_res_map.get(resolved_rel) {
+                    let p_expr = payload
+                        .map(|p| format!("__loc_{}", p.0))
+                        .unwrap_or_else(|| "()".to_owned());
+                    let r_idx_opt = analysis
+                        .relation_res_map
+                        .keys()
+                        .position(|k| k == resolved_rel);
+                    if analysis.has_checkpoint
+                        && let Some(r_idx) = r_idx_opt
+                    {
+                        writeln!(
+                            out,
+                            "{indent}if let (Some(__s), Some(__d)) = (Entity::try_from_bits({ent}.to_bits()), Entity::try_from_bits({tgt}.to_bits())) {{\n\
+                             {indent}    if __tx_active {{ __tx_cmds.push(__StrataTxCmd::Rel_{r_idx}Insert(__s, __d, {p_expr})); }} else {{ {vname}.insert(__s, __d, {p_expr}); }}\n\
+                             {indent}}}"
+                        )
+                        .ok();
+                    } else {
+                        writeln!(
+                            out,
+                            "{indent}if let (Some(__s), Some(__d)) = (Entity::try_from_bits({ent}.to_bits()), Entity::try_from_bits({tgt}.to_bits())) {{\n\
+                             {indent}    {vname}.insert(__s, __d, {p_expr});\n\
+                             {indent}}}"
+                        )
+                        .ok();
+                    }
+                }
             }
         }
         Inst::CmdRemoveRelation {
@@ -2831,15 +3615,42 @@ pub(super) fn emit_stmt(
             entity,
             target,
         } => {
-            if let Some((vname, _)) = analysis.relation_res_map.get(relation.as_str()) {
-                writeln!(
-                    out,
-                    "{indent}if let (Some(__s), Some(__d)) = (Entity::try_from_bits(__loc_{}.to_bits()), Entity::try_from_bits(__loc_{}.to_bits())) {{\n\
-                     {indent}    {vname}.remove(__s, __d);\n\
-                     {indent}}}",
-                    entity.0, target.0
-                )
-                .ok();
+            let ent = resolve_entity_local_expr(*entity, func, analysis, in_chunk);
+            if is_child_of_relation(relation) {
+                writeln!(out, "{indent}let __cmd_ent = {ent};").ok();
+                emit_cmd_block(out, analysis, indent, |cmds| {
+                    format!(
+                        "if let Some(__s) = Entity::try_from_bits(__cmd_ent.to_bits()) {{ {cmds}.entity(__s).remove::<ChildOf>(); }}"
+                    )
+                });
+            } else {
+                let tgt = resolve_entity_local_expr(*target, func, analysis, in_chunk);
+                let resolved_rel = resolve_custom_relation_name(ctx, relation);
+                if let Some((vname, _)) = analysis.relation_res_map.get(resolved_rel) {
+                    let r_idx_opt = analysis
+                        .relation_res_map
+                        .keys()
+                        .position(|k| k == resolved_rel);
+                    if analysis.has_checkpoint
+                        && let Some(r_idx) = r_idx_opt
+                    {
+                        writeln!(
+                            out,
+                            "{indent}if let (Some(__s), Some(__d)) = (Entity::try_from_bits({ent}.to_bits()), Entity::try_from_bits({tgt}.to_bits())) {{\n\
+                             {indent}    if __tx_active {{ __tx_cmds.push(__StrataTxCmd::Rel_{r_idx}Remove(__s, __d)); }} else {{ {vname}.remove(__s, __d); }}\n\
+                             {indent}}}"
+                        )
+                        .ok();
+                    } else {
+                        writeln!(
+                            out,
+                            "{indent}if let (Some(__s), Some(__d)) = (Entity::try_from_bits({ent}.to_bits()), Entity::try_from_bits({tgt}.to_bits())) {{\n\
+                             {indent}    {vname}.remove(__s, __d);\n\
+                             {indent}}}"
+                        )
+                        .ok();
+                    }
+                }
             }
         }
     }
@@ -2933,35 +3744,61 @@ pub(super) fn chunk_len_expr(
 pub(super) fn emit_terminator(
     out: &mut String,
     func: &MirFunction,
+    ctx: &NativeCtx<'_>,
     analysis: &FnAnalysis,
     term: &Terminator,
     indent: &str,
     in_chunk: Option<&ChunkLoopInfo>,
 ) {
+    let ret_val_expr = |l: LocalId| -> String {
+        let ret_vt = ValTy::from_mir_ret(&func.ret_ty);
+        if matches!(func.ret_ty, MirType::Named(_)) {
+            let (vt, ve) = effective_local_val_and_expr(l, analysis, &[], in_chunk, ctx);
+            let _ = vt;
+            ve
+        } else {
+            coerce_local_expr(
+                Some(l),
+                &format!("__loc_{}", l.0),
+                &analysis.val_tys[l.0 as usize],
+                &ret_vt,
+                analysis,
+            )
+        }
+    };
+    let has_tx_ret_val = analysis.has_checkpoint
+        && matches!(func.kind, MirFnKind::HelperFn)
+        && !matches!(func.ret_ty, MirType::Unit);
     match term {
         Terminator::Return(opt_l) => {
             if let Some(cl) = in_chunk {
                 if !cl.use_par {
-                    writeln!(out, "{indent}__broke_loop = true;").ok();
+                    if has_tx_ret_val
+                        && let Some(l) = opt_l
+                        && analysis.val_tys[l.0 as usize] != ValTy::Unit
+                    {
+                        writeln!(out, "{indent}__tx_ret_val = {};", ret_val_expr(*l)).ok();
+                    }
+                    writeln!(
+                        out,
+                        "{indent}__returned = true;\n{indent}__broke_loop = true;"
+                    )
+                    .ok();
+                }
+                writeln!(out, "{indent}break;").ok();
+            } else if analysis.has_checkpoint {
+                if has_tx_ret_val
+                    && let Some(l) = opt_l
+                    && analysis.val_tys[l.0 as usize] != ValTy::Unit
+                {
+                    writeln!(out, "{indent}__tx_ret_val = {};", ret_val_expr(*l)).ok();
                 }
                 writeln!(out, "{indent}break;").ok();
             } else if let Some(l) = opt_l
                 && matches!(func.kind, MirFnKind::HelperFn)
                 && analysis.val_tys[l.0 as usize] != ValTy::Unit
             {
-                let ret_vt = ValTy::from_mir_ret(&func.ret_ty);
-                let coerced = if matches!(func.ret_ty, MirType::Named(_)) {
-                    format!("__loc_{}", l.0)
-                } else {
-                    coerce_local_expr(
-                        Some(*l),
-                        &format!("__loc_{}", l.0),
-                        &analysis.val_tys[l.0 as usize],
-                        &ret_vt,
-                        analysis,
-                    )
-                };
-                writeln!(out, "{indent}return {coerced};").ok();
+                writeln!(out, "{indent}return {};", ret_val_expr(*l)).ok();
             } else {
                 writeln!(out, "{indent}return;").ok();
             }
@@ -3033,6 +3870,7 @@ pub(super) fn format_branch_target(target: BlockId, in_chunk: Option<&ChunkLoopI
 #[allow(clippy::too_many_arguments)]
 fn emit_helper_call_with_places(
     out: &mut String,
+    caller: &MirFunction,
     hf: &MirFunction,
     args: &[LocalId],
     dst: Option<LocalId>,
@@ -3061,6 +3899,29 @@ fn emit_helper_call_with_places(
         }
     }
 
+    let mut callee_implicit_res = BTreeMap::new();
+    collect_helper_implicit_res(&hf.name, ctx, &mut callee_implicit_res, &mut HashSet::new());
+    let mut extra_res_args = Vec::new();
+    let caller_is_helper = matches!(caller.kind, MirFnKind::HelperFn);
+    for (canon, (vname, is_mut, _)) in &callee_implicit_res {
+        if hf.resources.iter().any(|r| r.canonical_name == *canon) {
+            continue;
+        }
+        if caller_is_helper
+            && let Some((cvname, caller_mut, _)) = analysis.implicit_res_map.get(canon)
+        {
+            if *caller_mut && !*is_mut {
+                extra_res_args.push(format!("(&*{cvname})"));
+            } else {
+                extra_res_args.push(cvname.clone());
+            }
+        } else if *is_mut {
+            extra_res_args.push(format!("(&mut *{vname})"));
+        } else {
+            extra_res_args.push(format!("(&*{vname})"));
+        }
+    }
+
     let fn_ident = sanitize_ident(&hf.name);
     #[allow(clippy::too_many_arguments)]
     fn build_step(
@@ -3070,6 +3931,7 @@ fn emit_helper_call_with_places(
         args: &[LocalId],
         prebound: &[Option<String>],
         bound_args: &mut Vec<String>,
+        extra_res_args: &[String],
         dst: Option<LocalId>,
         ctx: &NativeCtx<'_>,
         analysis: &FnAnalysis,
@@ -3078,7 +3940,9 @@ fn emit_helper_call_with_places(
         in_undo: bool,
     ) -> String {
         if idx >= args.len() {
-            let call_expr = format!("strata_fn_{fn_ident}({})", bound_args.join(", "));
+            let mut all_args = bound_args.clone();
+            all_args.extend(extra_res_args.iter().cloned());
+            let call_expr = format!("strata_fn_{fn_ident}({})", all_args.join(", "));
             if let Some(d) = dst {
                 let dt = &analysis.val_tys[d.0 as usize];
                 if *dt != ValTy::Unit && *dt != ValTy::PtrMarker {
@@ -3098,6 +3962,7 @@ fn emit_helper_call_with_places(
                 args,
                 prebound,
                 bound_args,
+                extra_res_args,
                 dst,
                 ctx,
                 analysis,
@@ -3121,6 +3986,7 @@ fn emit_helper_call_with_places(
                         args,
                         prebound,
                         bound_args,
+                        extra_res_args,
                         dst,
                         ctx,
                         analysis,
@@ -3140,6 +4006,7 @@ fn emit_helper_call_with_places(
                         args,
                         prebound,
                         bound_args,
+                        extra_res_args,
                         dst,
                         ctx,
                         analysis,
@@ -3152,33 +4019,110 @@ fn emit_helper_call_with_places(
                 }
                 Some(pt) => {
                     let mut sub = String::new();
-                    emit_place_mut_for_target(
-                        &mut sub,
-                        pt,
-                        analysis,
-                        query_plans,
-                        in_chunk,
-                        "",
-                        in_undo,
-                        &|ref_e| {
-                            let mut next_args = bound_args.clone();
-                            next_args.push(ref_e.to_owned());
-                            build_step(
-                                idx + 1,
-                                hf,
-                                fn_ident,
-                                args,
-                                prebound,
-                                &mut next_args,
-                                dst,
-                                ctx,
-                                analysis,
-                                query_plans,
-                                in_chunk,
-                                in_undo,
-                            )
-                        },
-                    );
+                    if let Some((canon, pf, fvt)) = ptr_projected_field(pt) {
+                        let access = resolve_blob_field_access(canon, pf, ctx);
+                        let rty = fvt.rust_type();
+                        emit_place_mut_for_target(
+                            &mut sub,
+                            pt,
+                            analysis,
+                            query_plans,
+                            in_chunk,
+                            "",
+                            in_undo,
+                            &|place| {
+                                let ld = build_field_load_from_place(place, &access, fvt, ctx);
+                                let mut next_args = bound_args.clone();
+                                next_args.push("(&mut __pmut_arg)".to_owned());
+                                let call_s = build_step(
+                                    idx + 1,
+                                    hf,
+                                    fn_ident,
+                                    args,
+                                    prebound,
+                                    &mut next_args,
+                                    extra_res_args,
+                                    dst,
+                                    ctx,
+                                    analysis,
+                                    query_plans,
+                                    in_chunk,
+                                    in_undo,
+                                );
+                                let wb = if let Some(sf) = access.sf_opt {
+                                    wrap_abi_field_store("__pmut_arg", sf, ctx, false)
+                                } else {
+                                    "__pmut_arg".to_owned()
+                                };
+                                let assign = if access.steps.is_empty() {
+                                    format!("{place}.{} = {wb};", access.leaf_chain)
+                                } else {
+                                    let mut stmts = Vec::new();
+                                    for (sidx, step) in access.steps.iter().enumerate() {
+                                        let src_e = if sidx == 0 {
+                                            format!("{place}.{}", step.rfname)
+                                        } else {
+                                            format!("__pbs_{}.{}", sidx - 1, step.rfname)
+                                        };
+                                        stmts.push(format!(
+                                            "let mut __pbs_{sidx} = {}::{}(&{src_e});",
+                                            step.struct_name, step.unpack_fn
+                                        ));
+                                    }
+                                    let last = access.steps.len() - 1;
+                                    stmts.push(format!(
+                                        "__pbs_{last}.{} = {wb};",
+                                        access.leaf_chain
+                                    ));
+                                    for sidx in (1..access.steps.len()).rev() {
+                                        let step = &access.steps[sidx];
+                                        stmts.push(format!(
+                                            "__pbs_{}.{} = __pbs_{sidx}.{}();",
+                                            sidx - 1,
+                                            step.rfname,
+                                            step.pack_fn
+                                        ));
+                                    }
+                                    let first = &access.steps[0];
+                                    stmts.push(format!(
+                                        "{place}.{} = __pbs_0.{}();",
+                                        first.rfname, first.pack_fn
+                                    ));
+                                    stmts.join(" ")
+                                };
+                                format!("let mut __pmut_arg: {rty} = {ld}; {call_s} {assign}")
+                            },
+                        );
+                    } else {
+                        emit_place_mut_for_target(
+                            &mut sub,
+                            pt,
+                            analysis,
+                            query_plans,
+                            in_chunk,
+                            "",
+                            in_undo,
+                            &|ref_e| {
+                                let mut next_args = bound_args.clone();
+                                next_args.push(ref_e.to_owned());
+                                build_step(
+                                    idx + 1,
+                                    hf,
+                                    fn_ident,
+                                    args,
+                                    prebound,
+                                    &mut next_args,
+                                    extra_res_args,
+                                    dst,
+                                    ctx,
+                                    analysis,
+                                    query_plans,
+                                    in_chunk,
+                                    in_undo,
+                                )
+                            },
+                        );
+                    }
                     sub
                 }
                 None => {
@@ -3190,6 +4134,7 @@ fn emit_helper_call_with_places(
                         args,
                         prebound,
                         bound_args,
+                        extra_res_args,
                         dst,
                         ctx,
                         analysis,
@@ -3211,6 +4156,7 @@ fn emit_helper_call_with_places(
                         args,
                         prebound,
                         bound_args,
+                        extra_res_args,
                         dst,
                         ctx,
                         analysis,
@@ -3230,6 +4176,7 @@ fn emit_helper_call_with_places(
                         args,
                         prebound,
                         bound_args,
+                        extra_res_args,
                         dst,
                         ctx,
                         analysis,
@@ -3241,33 +4188,67 @@ fn emit_helper_call_with_places(
                     s
                 }
                 Some(pt) => {
-                    let expr = emit_place_ref_for_target(
-                        pt,
-                        analysis,
-                        query_plans,
-                        in_chunk,
-                        &|ref_e| {
-                            let mut next_args = bound_args.clone();
-                            next_args.push(ref_e.to_owned());
-                            let s = build_step(
-                                idx + 1,
-                                hf,
-                                fn_ident,
-                                args,
-                                prebound,
-                                &mut next_args,
-                                dst,
-                                ctx,
-                                analysis,
-                                query_plans,
-                                in_chunk,
-                                in_undo,
-                            );
-                            format!("{{ {s} }}")
-                        },
-                        "{}",
-                    );
-                    format!("{expr};")
+                    let expr = if let Some((canon, pf, fvt)) = ptr_projected_field(pt) {
+                        let access = resolve_blob_field_access(canon, pf, ctx);
+                        let rty = fvt.rust_type();
+                        emit_place_ref_for_target(
+                            pt,
+                            analysis,
+                            query_plans,
+                            in_chunk,
+                            &|place| {
+                                let ld = build_field_load_from_place(place, &access, fvt, ctx);
+                                let mut next_args = bound_args.clone();
+                                next_args.push("(&__pref_arg)".to_owned());
+                                let s = build_step(
+                                    idx + 1,
+                                    hf,
+                                    fn_ident,
+                                    args,
+                                    prebound,
+                                    &mut next_args,
+                                    extra_res_args,
+                                    dst,
+                                    ctx,
+                                    analysis,
+                                    query_plans,
+                                    in_chunk,
+                                    in_undo,
+                                );
+                                format!("{{ let __pref_arg: {rty} = {ld}; {s} }}")
+                            },
+                            "{}",
+                        )
+                    } else {
+                        emit_place_ref_for_target(
+                            pt,
+                            analysis,
+                            query_plans,
+                            in_chunk,
+                            &|ref_e| {
+                                let mut next_args = bound_args.clone();
+                                next_args.push(ref_e.to_owned());
+                                let s = build_step(
+                                    idx + 1,
+                                    hf,
+                                    fn_ident,
+                                    args,
+                                    prebound,
+                                    &mut next_args,
+                                    extra_res_args,
+                                    dst,
+                                    ctx,
+                                    analysis,
+                                    query_plans,
+                                    in_chunk,
+                                    in_undo,
+                                );
+                                format!("{{ {s} }}")
+                            },
+                            "{}",
+                        )
+                    };
+                    format!("let _ = {expr};")
                 }
                 None => {
                     bound_args.push(format!("(&__loc_{})", a.0));
@@ -3278,6 +4259,7 @@ fn emit_helper_call_with_places(
                         args,
                         prebound,
                         bound_args,
+                        extra_res_args,
                         dst,
                         ctx,
                         analysis,
@@ -3301,6 +4283,7 @@ fn emit_helper_call_with_places(
         args,
         &prebound,
         &mut bound_args,
+        &extra_res_args,
         dst,
         ctx,
         analysis,

@@ -34,7 +34,267 @@ pub(super) enum ValTy {
     BitSet(usize),
     InputBuf(usize),
     InlineStr(usize),
+    SmallVec {
+        elem: Box<ValTy>,
+        cap: usize,
+        elem_size: usize,
+        elem_align: usize,
+    },
     PtrMarker,
+}
+
+pub(super) fn aligned_blob_default_expr(byte_size: usize, align: usize) -> String {
+    if byte_size == 0 {
+        return "()".to_owned();
+    }
+    if align >= 8 && byte_size >= 8 && byte_size.is_multiple_of(8) {
+        format!("[0u64; {}]", byte_size / 8)
+    } else if align >= 4 && byte_size >= 4 && byte_size.is_multiple_of(4) {
+        format!("[0u32; {}]", byte_size / 4)
+    } else if align >= 2 && byte_size >= 2 && byte_size.is_multiple_of(2) {
+        format!("[0u16; {}]", byte_size / 2)
+    } else {
+        format!("[0u8; {byte_size}]")
+    }
+}
+
+pub(super) fn sema_ty_size_align(ty: &Ty, ctx: &NativeCtx<'_>) -> (usize, usize) {
+    match ty {
+        Ty::Bool | Ty::U8 | Ty::I8 => (1, 1),
+        Ty::U16 | Ty::I16 => (2, 2),
+        Ty::U32
+        | Ty::I32
+        | Ty::Fix32
+        | Ty::F32
+        | Ty::Sym
+        | Ty::Rgba8
+        | Ty::UnitScalar { .. }
+        | Ty::GraceWindow => (4, 4),
+        Ty::U64 | Ty::I64 | Ty::Fix64 | Ty::F64 | Ty::Ref(_) => (8, 8),
+        Ty::Asset(_) => (32, 8),
+        Ty::Vec2 | Ty::IVec2 | Ty::UVec2 => (8, 4),
+        Ty::Vec3 | Ty::IVec3 => (12, 4),
+        Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => (16, 4),
+        Ty::Mat3 => (36, 4),
+        Ty::Mat4 => (64, 4),
+        Ty::BitSet(bits) => ((*bits).div_ceil(32).max(1) * 4, 4),
+        Ty::InlineStr(cap) => (4 + cap.div_ceil(4) * 4, 4),
+        Ty::InputBuffer { cap, .. } => ((*cap).max(1) * 8, 4),
+        Ty::Array { elem, len } => {
+            let (es, ea) = sema_ty_size_align(elem, ctx);
+            let ea = ea.max(1);
+            let stride = es.div_ceil(ea) * ea;
+            (stride * *len, ea)
+        }
+        Ty::SmallVec { elem, cap } => {
+            let (es, ea) = sema_ty_size_align(elem, ctx);
+            let ea = ea.max(1);
+            let stride = es.div_ceil(ea) * ea;
+            (8 + stride * *cap, ea.max(4))
+        }
+        Ty::Tuple(items) => {
+            let mut cursor = 0usize;
+            let mut max_align = 1usize;
+            for it in items {
+                let (s, a) = sema_ty_size_align(it, ctx);
+                let a = a.max(1);
+                max_align = max_align.max(a);
+                cursor = cursor.div_ceil(a) * a + s;
+            }
+            (cursor.div_ceil(max_align) * max_align, max_align)
+        }
+        Ty::Named(n) => {
+            if let Some(le) = ctx.find_layout_entry(n) {
+                (le.layout.size, le.layout.align.max(1))
+            } else if let Some(en) = ctx.enums_by_key.get(n.as_str()).or_else(|| {
+                let s = n.rsplit("::").next().unwrap_or(n.as_str());
+                ctx.enums_by_key.get(s)
+            }) {
+                let sz = en.repr_bytes.max(1);
+                (sz, sz)
+            } else {
+                (4, 4)
+            }
+        }
+        _ => (0, 1),
+    }
+}
+
+pub(super) fn parse_mir_debug_ty(raw: &str) -> MirType {
+    let s = raw.trim();
+    match s {
+        "Unit" | "()" => MirType::Unit,
+        "Bool" | "bool" => MirType::Bool,
+        "U8" | "u8" => MirType::U8,
+        "U16" | "u16" => MirType::U16,
+        "U32" | "u32" => MirType::U32,
+        "Sym" | "sym" => MirType::Sym,
+        "U64" | "u64" => MirType::U64,
+        "I8" | "i8" => MirType::I8,
+        "I16" | "i16" => MirType::I16,
+        "I32" | "i32" => MirType::I32,
+        "I64" | "i64" => MirType::I64,
+        "F32" | "f32" => MirType::F32,
+        "F64" | "f64" => MirType::F64,
+        "Fix32" | "fix32" => MirType::Fix32,
+        "Fix64" | "fix64" => MirType::Fix64,
+        "Vec2" | "vec2" => MirType::Vec2,
+        "Vec3" | "vec3" => MirType::Vec3,
+        "Vec4" | "vec4" | "Vec3a" | "vec3a" | "Quat" | "quat" | "Rgba" | "rgba" => MirType::Vec4,
+        "IVec2" | "ivec2" => MirType::IVec2,
+        "IVec3" | "ivec3" => MirType::IVec3,
+        "UVec2" | "uvec2" => MirType::UVec2,
+        "Entity" => MirType::Entity,
+        "Ptr" => MirType::Ptr,
+        "MutPtr" => MirType::MutPtr,
+        _ => {
+            if let Some(inner) = s.strip_prefix("Named(").and_then(|r| r.strip_suffix(')')) {
+                let inner = inner.trim();
+                if let Some(unquoted) = inner.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                    let unescaped = unquoted.replace("\\\"", "\"").replace("\\\\", "\\");
+                    return MirType::Named(unescaped);
+                }
+                return MirType::Named(inner.to_owned());
+            }
+            if let Some(inner) = s.strip_prefix("Array {")
+                && let Some(body) = inner.strip_suffix('}')
+                && let Some((elem_part, len_part)) = body.rsplit_once(", len:")
+                && let Some(elem_raw) = elem_part.trim().strip_prefix("elem:")
+                && let Ok(len) = len_part.trim().parse::<usize>()
+            {
+                return MirType::Array {
+                    elem: Box::new(parse_mir_debug_ty(elem_raw)),
+                    len,
+                };
+            }
+            MirType::Named(s.to_owned())
+        }
+    }
+}
+
+pub(super) fn sema_ty_from_mir_with_ctx(mty: &MirType, ctx: &NativeCtx<'_>) -> Ty {
+    match mty {
+        MirType::Bool => Ty::Bool,
+        MirType::U8 => Ty::U8,
+        MirType::U16 => Ty::U16,
+        MirType::U32 => Ty::U32,
+        MirType::Sym => Ty::Sym,
+        MirType::U64 => Ty::U64,
+        MirType::I8 => Ty::I8,
+        MirType::I16 => Ty::I16,
+        MirType::I32 => Ty::I32,
+        MirType::I64 => Ty::I64,
+        MirType::F32 => Ty::F32,
+        MirType::F64 => Ty::F64,
+        MirType::Fix32 => Ty::Fix32,
+        MirType::Fix64 => Ty::Fix64,
+        MirType::Vec2 => Ty::Vec2,
+        MirType::Vec3 => Ty::Vec3,
+        MirType::Vec4 => Ty::Vec4,
+        MirType::IVec2 => Ty::IVec2,
+        MirType::IVec3 => Ty::IVec3,
+        MirType::UVec2 => Ty::UVec2,
+        MirType::Entity => Ty::Ref("Entity".to_owned()),
+        MirType::Array { elem, len } => Ty::Array {
+            elem: Box::new(sema_ty_from_mir_with_ctx(elem, ctx)),
+            len: *len,
+        },
+        MirType::Named(n) => {
+            if n == "GraceWindow" {
+                Ty::GraceWindow
+            } else if n == "mat3" || n == "Mat3" {
+                Ty::Mat3
+            } else if n == "mat4" || n == "Mat4" {
+                Ty::Mat4
+            } else if n == "InlineStr" {
+                Ty::InlineStr(64)
+            } else if let Some(inner) = n
+                .strip_prefix("InlineStr<")
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                Ty::InlineStr(inner.trim().parse().unwrap_or(64))
+            } else if let Some(inner) = n.strip_prefix("BitSet<").and_then(|s| s.strip_suffix('>'))
+            {
+                Ty::BitSet(inner.trim().parse().unwrap_or(32))
+            } else if let Some(inner) = n
+                .strip_prefix("InputBuffer<")
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                let (act, cap_s) = inner.rsplit_once(',').unwrap_or(("u16", "4"));
+                Ty::InputBuffer {
+                    action: act.trim().to_owned(),
+                    cap: cap_s.trim().parse().unwrap_or(4),
+                }
+            } else if let Some((elem_ty, cap)) = parse_mir_smallvec_parts(n, ctx) {
+                Ty::SmallVec {
+                    elem: Box::new(elem_ty),
+                    cap,
+                }
+            } else if n == "IVec2" {
+                Ty::IVec2
+            } else if n == "IVec3" {
+                Ty::IVec3
+            } else if n == "UVec2" {
+                Ty::UVec2
+            } else if n == "Vec3a" {
+                Ty::Vec3a
+            } else if let Some(inner) = n.strip_prefix("Asset<").and_then(|s| s.strip_suffix('>')) {
+                Ty::Asset(inner.to_owned())
+            } else {
+                Ty::Named(n.clone())
+            }
+        }
+        _ => Ty::Unknown,
+    }
+}
+
+pub(super) fn parse_mir_smallvec_parts(n: &str, ctx: &NativeCtx<'_>) -> Option<(Ty, usize)> {
+    let inner = n.strip_prefix("SmallVec<")?.strip_suffix('>')?;
+    let (elem_raw, cap_raw) = inner.rsplit_once(',')?;
+    let cap: usize = cap_raw.trim().parse().ok()?;
+    let elem_mir = parse_mir_debug_ty(elem_raw.trim());
+    Some((sema_ty_from_mir_with_ctx(&elem_mir, ctx), cap))
+}
+
+pub(super) fn val_ty_to_sema_hint(vt: &ValTy) -> Ty {
+    match vt {
+        ValTy::Bool => Ty::Bool,
+        ValTy::U8 => Ty::U8,
+        ValTy::U16 => Ty::U16,
+        ValTy::U32 => Ty::U32,
+        ValTy::U64 => Ty::U64,
+        ValTy::I8 => Ty::I8,
+        ValTy::I16 => Ty::I16,
+        ValTy::I32 => Ty::I32,
+        ValTy::I64 => Ty::I64,
+        ValTy::F32 => Ty::F32,
+        ValTy::F64 => Ty::F64,
+        ValTy::Fix32 => Ty::Fix32,
+        ValTy::Fix64 => Ty::Fix64,
+        ValTy::Vec2 => Ty::Vec2,
+        ValTy::Vec3 => Ty::Vec3,
+        ValTy::Vec4 => Ty::Vec4,
+        ValTy::IVec2 => Ty::IVec2,
+        ValTy::IVec3 => Ty::IVec3,
+        ValTy::UVec2 => Ty::UVec2,
+        ValTy::Entity => Ty::Ref("Entity".to_owned()),
+        ValTy::Array(elem, len) => Ty::Array {
+            elem: Box::new(val_ty_to_sema_hint(elem)),
+            len: *len,
+        },
+        ValTy::SmallVec { elem, cap, .. } => Ty::SmallVec {
+            elem: Box::new(val_ty_to_sema_hint(elem)),
+            cap: *cap,
+        },
+        ValTy::Struct(sname) => Ty::Named(sname.clone()),
+        ValTy::BitSet(b) => Ty::BitSet(*b),
+        ValTy::InputBuf(c) => Ty::InputBuffer {
+            action: "u16".to_owned(),
+            cap: *c,
+        },
+        ValTy::InlineStr(c) => Ty::InlineStr(*c),
+        _ => Ty::Unknown,
+    }
 }
 
 impl ValTy {
@@ -101,9 +361,18 @@ impl ValTy {
                     Self::Struct(entry.struct_name.clone())
                 } else if let Some(sname) = ctx.resolve_ecs_struct_name(n) {
                     Self::Struct(sname)
-                } else if n == "mat3" {
+                } else if let Some((elem_ty, cap)) = parse_mir_smallvec_parts(n, ctx) {
+                    let elem_vt = Self::from_sema_ty(&elem_ty, ctx);
+                    let (es, ea) = sema_ty_size_align(&elem_ty, ctx);
+                    Self::SmallVec {
+                        elem: Box::new(elem_vt),
+                        cap,
+                        elem_size: es,
+                        elem_align: ea.max(1),
+                    }
+                } else if n == "mat3" || n == "Mat3" {
                     Self::Array(Box::new(Self::F32), 9)
-                } else if n == "mat4" {
+                } else if n == "mat4" || n == "Mat4" {
                     Self::Array(Box::new(Self::F32), 16)
                 } else if n.starts_with("Asset<") {
                     Self::Struct("FfiAssetHandle".to_owned())
@@ -143,7 +412,19 @@ impl ValTy {
             Ty::BitSet(b) => Self::BitSet(*b),
             Ty::InputBuffer { cap, .. } => Self::InputBuf(*cap),
             Ty::InlineStr(cap) => Self::InlineStr(*cap),
+            Ty::Mat3 => Self::Array(Box::new(Self::F32), 9),
+            Ty::Mat4 => Self::Array(Box::new(Self::F32), 16),
             Ty::Array { elem, len } => Self::Array(Box::new(Self::from_sema_ty(elem, ctx)), *len),
+            Ty::SmallVec { elem, cap } => {
+                let elem_vt = Self::from_sema_ty(elem, ctx);
+                let (es, ea) = sema_ty_size_align(elem, ctx);
+                Self::SmallVec {
+                    elem: Box::new(elem_vt),
+                    cap: *cap,
+                    elem_size: es,
+                    elem_align: ea.max(1),
+                }
+            }
             Ty::Tuple(items) => {
                 Self::Tuple(items.iter().map(|t| Self::from_sema_ty(t, ctx)).collect())
             }
@@ -187,6 +468,16 @@ impl ValTy {
             Self::BitSet(bits) => format!("[u32; {}]", (*bits).div_ceil(32).max(1)),
             Self::InputBuf(cap) => format!("[u32; {}]", (*cap).max(1) * 2),
             Self::InlineStr(cap) => format!("[u32; {}]", 1 + cap.div_ceil(4)),
+            Self::SmallVec {
+                cap,
+                elem_size,
+                elem_align,
+                ..
+            } => {
+                let ea = (*elem_align).max(1);
+                let stride = elem_size.div_ceil(ea) * ea;
+                aligned_blob_type(8 + stride * *cap, ea.max(4))
+            }
         }
     }
 
@@ -224,6 +515,16 @@ impl ValTy {
             Self::BitSet(bits) => format!("[0u32; {}]", (*bits).div_ceil(32).max(1)),
             Self::InputBuf(cap) => format!("[0u32; {}]", (*cap).max(1) * 2),
             Self::InlineStr(cap) => format!("[0u32; {}]", 1 + cap.div_ceil(4)),
+            Self::SmallVec {
+                cap,
+                elem_size,
+                elem_align,
+                ..
+            } => {
+                let ea = (*elem_align).max(1);
+                let stride = elem_size.div_ceil(ea) * ea;
+                aligned_blob_default_expr(8 + stride * *cap, ea.max(4))
+            }
         }
     }
 
@@ -295,15 +596,34 @@ pub(super) enum PtrTarget {
     EntitiesSlice {
         query_idx: u32,
     },
+    QueryEntityCol {
+        query_idx: u32,
+    },
+    QueryEntityRow {
+        query_idx: u32,
+        row_idx_local: LocalId,
+    },
     TriggerPayload,
     ParamPtr {
         var_name: String,
         layout_key: String,
+        projected: Option<(String, String, ValTy)>,
     },
     Field {
         base: Box<PtrTarget>,
         field: String,
         blob_step: Option<(String, String, &'static str, &'static str)>,
+    },
+    ArrayElem {
+        base: Box<PtrTarget>,
+        ptr_local: LocalId,
+        elem_ty: Ty,
+        elem_size: usize,
+        elem_align: usize,
+        elem_rust_ty: String,
+        elem_needs_pod_unpack: bool,
+        is_smallvec: bool,
+        sv_cap: usize,
     },
     SlotRef {
         slot_local: LocalId,
@@ -353,11 +673,12 @@ pub(super) struct QueryEmitPlan {
     pub(super) with_filters: Vec<String>,
     pub(super) without_filters: Vec<String>,
     pub(super) changed_filters: Vec<String>,
+    pub(super) added_filters: Vec<String>,
 }
 
 impl QueryEmitPlan {
     pub(super) fn uses_row_iter(&self) -> bool {
-        self.is_sparse || !self.changed_filters.is_empty()
+        self.is_sparse || !self.changed_filters.is_empty() || !self.added_filters.is_empty()
     }
 }
 
@@ -441,6 +762,7 @@ pub(super) fn build_query_plans(
         let mut with_filters = Vec::new();
         let mut without_filters = Vec::new();
         let mut changed_filters = Vec::new();
+        let mut added_filters = Vec::new();
 
         for wf in &qb.with_filters {
             if let Some(sname) = ctx.resolve_ecs_struct_name(wf)
@@ -471,6 +793,22 @@ pub(super) fn build_query_plans(
                 {
                     changed_filters.push(sname);
                 }
+            }
+        }
+        for at in &func.added_terms {
+            if at.query_idx == qb.query_idx
+                && let Some(sname) = ctx.resolve_ecs_struct_name(&at.canonical_component)
+                && !added_filters.contains(&sname)
+            {
+                added_filters.push(sname);
+            }
+        }
+        for (qidx, af) in &func.added_filters {
+            if *qidx == qb.query_idx
+                && let Some(sname) = ctx.resolve_ecs_struct_name(af)
+                && !added_filters.contains(&sname)
+            {
+                added_filters.push(sname);
             }
         }
 
@@ -564,7 +902,11 @@ pub(super) fn build_query_plans(
                 )
             });
         let needs_entity = !qb.is_point_lookup
-            && (uses_entities || all_optional_or_empty || is_sparse || !changed_filters.is_empty());
+            && (uses_entities
+                || all_optional_or_empty
+                || is_sparse
+                || !changed_filters.is_empty()
+                || !added_filters.is_empty());
         let has_any_mut = slots.iter().any(|s| s.mode.is_mutable());
 
         plans.push(QueryEmitPlan {
@@ -579,6 +921,7 @@ pub(super) fn build_query_plans(
             with_filters,
             without_filters,
             changed_filters,
+            added_filters,
         });
     }
 
@@ -694,6 +1037,9 @@ pub(super) fn query_rust_types(plan: &QueryEmitPlan) -> (String, String) {
     for cf in &plan.changed_filters {
         f_parts.push(format!("Changed<{cf}>"));
     }
+    for af in &plan.added_filters {
+        f_parts.push(format!("Added<{af}>"));
+    }
     let filter_ty = if f_parts.is_empty() {
         "()".to_owned()
     } else {
@@ -758,12 +1104,98 @@ pub(super) fn compute_reachable_blocks(func: &MirFunction) -> HashSet<BlockId> {
     visited
 }
 
+pub(super) fn helper_is_par_unsafe(
+    callee: &str,
+    ctx: &NativeCtx<'_>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    let Some(hf) = ctx.helpers_by_key.get(callee).copied().or_else(|| {
+        let short = callee.rsplit("::").next().unwrap_or(callee);
+        ctx.mir
+            .fns
+            .iter()
+            .find(|f| f.name == callee || f.name.rsplit("::").next() == Some(short))
+    }) else {
+        return false;
+    };
+    if !visited.insert(hf.name.clone()) {
+        return false;
+    }
+    if hf.params.iter().any(|p| p.kind == HirParamKind::ResWrite)
+        || hf.resources.iter().any(|r| r.mutable)
+    {
+        return true;
+    }
+    for hbb in &hf.blocks {
+        for hs in &hbb.stmts {
+            match &hs.inst {
+                Inst::ResWrite { .. }
+                | Inst::CmdSpawn { .. }
+                | Inst::CmdSpawnBatch { .. }
+                | Inst::SpawnBatchBegin { .. }
+                | Inst::SpawnBatchPush { .. }
+                | Inst::SpawnBatchCommit { .. }
+                | Inst::CmdDespawn { .. }
+                | Inst::CmdDespawnAll { .. }
+                | Inst::CmdInsert { .. }
+                | Inst::CmdRemove { .. }
+                | Inst::CmdTrigger { .. }
+                | Inst::StreamEmit { .. }
+                | Inst::CmdCheckpoint
+                | Inst::CmdRollback { .. }
+                | Inst::CmdInsertRelation { .. }
+                | Inst::CmdRemoveRelation { .. }
+                | Inst::EntityGet { .. }
+                | Inst::EntityGetMut { .. }
+                | Inst::ResolveNamedObject { .. }
+                | Inst::BindNamedObject { .. }
+                | Inst::IterCount { .. }
+                | Inst::IterUpCascade { .. }
+                | Inst::IterReset { .. }
+                | Inst::IterNextChunk { .. }
+                | Inst::ParForEachChunk { .. }
+                | Inst::ParForEachChunkReadonly { .. }
+                | Inst::SpatialRebuildCsr { .. }
+                | Inst::SpatialCsrBegin { .. }
+                | Inst::SpatialCsrCount { .. }
+                | Inst::SpatialCsrPrefixSum { .. }
+                | Inst::SpatialCsrScatter { .. }
+                | Inst::SpatialQueryDisc { .. }
+                | Inst::SpatialQuerySegmentAt { .. }
+                | Inst::ShadowWrite { .. }
+                | Inst::ShadowCommit { .. }
+                | Inst::FsmDispatch { .. }
+                | Inst::TaskStep { .. } => return true,
+                Inst::Call { callee: nested, .. } if helper_is_par_unsafe(nested, ctx, visited) => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 pub(super) fn collect_chunk_loops(
     func: &MirFunction,
+    ctx: &NativeCtx<'_>,
     query_plans: &[QueryEmitPlan],
     up_plans: &[UpCascadePlan],
 ) -> Vec<ChunkLoopInfo> {
     let reachable = compute_reachable_blocks(func);
+    let mut chunk_hdr_else: HashMap<BlockId, BlockId> = HashMap::new();
+    for bb in &func.blocks {
+        if !reachable.contains(&bb.id) {
+            continue;
+        }
+        let has_next = bb
+            .stmts
+            .iter()
+            .any(|s| matches!(s.inst, Inst::IterNextChunk { .. }));
+        if has_next && let Terminator::Branch { else_bb, .. } = bb.terminator {
+            chunk_hdr_else.insert(bb.id, else_bb);
+        }
+    }
     let mut loops = Vec::new();
     for bb in &func.blocks {
         if !reachable.contains(&bb.id) {
@@ -785,9 +1217,19 @@ pub(super) fn collect_chunk_loops(
 
         let mut loop_blocks = HashSet::new();
         let mut queue = VecDeque::new();
+        let mut has_nested_loop = false;
         loop_blocks.insert(then_bb);
         queue.push_back(then_bb);
         while let Some(cur) = queue.pop_front() {
+            if cur != bb.id
+                && let Some(&inner_exit) = chunk_hdr_else.get(&cur)
+            {
+                has_nested_loop = true;
+                if inner_exit != bb.id && inner_exit != else_bb && loop_blocks.insert(inner_exit) {
+                    queue.push_back(inner_exit);
+                }
+                continue;
+            }
             for succ in terminator_succs(&func.blocks[cur.0 as usize].terminator) {
                 if succ != bb.id && succ != else_bb && loop_blocks.insert(succ) {
                     queue.push_back(succ);
@@ -795,13 +1237,27 @@ pub(super) fn collect_chunk_loops(
             }
         }
 
+        // Also compute full transitive sub-blocks for ParamSet / @par safety analysis.
+        let mut deep_blocks = HashSet::new();
+        let mut deep_q = VecDeque::new();
+        deep_blocks.insert(then_bb);
+        deep_q.push_back(then_bb);
+        while let Some(cur) = deep_q.pop_front() {
+            for succ in terminator_succs(&func.blocks[cur.0 as usize].terminator) {
+                if succ != bb.id && succ != else_bb && deep_blocks.insert(succ) {
+                    deep_q.push_back(succ);
+                }
+            }
+        }
+
         let plan = query_plans.iter().find(|p| p.query_idx == query_idx);
         let is_sparse = plan.is_some_and(|p| p.is_sparse);
-        let has_changed = plan.is_some_and(|p| !p.changed_filters.is_empty());
+        let has_changed =
+            plan.is_some_and(|p| !p.changed_filters.is_empty() || !p.added_filters.is_empty());
         let in_param_set = plan.is_some_and(|p| p.param_set_idx.is_some());
         let has_pset_up_cascade = !up_plans.is_empty()
             && up_plans.iter().any(|u| u.param_set_idx.is_some())
-            && loop_blocks.iter().any(|bid| {
+            && deep_blocks.iter().any(|bid| {
                 func.blocks[bid.0 as usize]
                     .stmts
                     .iter()
@@ -809,7 +1265,7 @@ pub(super) fn collect_chunk_loops(
             });
         let is_pset_snap = in_param_set
             && (has_pset_up_cascade
-                || loop_blocks.iter().any(|bid| {
+                || deep_blocks.iter().any(|bid| {
                     func.blocks[bid.0 as usize]
                         .stmts
                         .iter()
@@ -828,11 +1284,41 @@ pub(super) fn collect_chunk_loops(
                         })
                 }));
         let has_unsupported_par_write = has_non_reducible_outer_slot_write(func, &loop_blocks);
+        let has_unsafe_par_inst = has_nested_loop
+            || loop_blocks.iter().any(|bid| {
+                func.blocks[bid.0 as usize]
+                    .stmts
+                    .iter()
+                    .any(|s| match &s.inst {
+                        Inst::ResWrite { .. }
+                        | Inst::CmdCheckpoint
+                        | Inst::CmdRollback { .. }
+                        | Inst::CmdInsertRelation { .. }
+                        | Inst::CmdRemoveRelation { .. }
+                        | Inst::IterUpCascade { .. }
+                        | Inst::EntityGetMut { .. }
+                        | Inst::BindNamedObject { .. }
+                        | Inst::SpatialRebuildCsr { .. }
+                        | Inst::SpatialCsrBegin { .. }
+                        | Inst::SpatialCsrCount { .. }
+                        | Inst::SpatialCsrPrefixSum { .. }
+                        | Inst::SpatialCsrScatter { .. }
+                        | Inst::ShadowWrite { .. }
+                        | Inst::ShadowCommit { .. }
+                        | Inst::TaskStep { .. }
+                        | Inst::FsmDispatch { .. } => true,
+                        Inst::Call { callee, .. } => {
+                            helper_is_par_unsafe(callee, ctx, &mut HashSet::new())
+                        }
+                        _ => false,
+                    })
+            });
         let use_par = func.par_chunk.is_some()
             && !is_sparse
             && !has_changed
             && !in_param_set
-            && !has_unsupported_par_write;
+            && !has_unsupported_par_write
+            && !has_unsafe_par_inst;
 
         loops.push(ChunkLoopInfo {
             hdr_bb: bb.id,
@@ -920,13 +1406,67 @@ pub(super) struct SpawnBatchPlan {
     pub(super) only_chunk_loop: Option<usize>,
 }
 
+pub(super) fn is_child_of_relation(rel: &str) -> bool {
+    rel == "ChildOf" || rel.rsplit("::").next() == Some("ChildOf")
+}
+
+pub(super) fn resolve_custom_relation_name<'a>(ctx: &'a NativeCtx<'a>, raw: &'a str) -> &'a str {
+    let short = raw.rsplit("::").next().unwrap_or(raw);
+    ctx.mir
+        .relations
+        .iter()
+        .find(|r| r.name == raw || r.name.rsplit("::").next() == Some(short))
+        .map_or(raw, |r| r.name.as_str())
+}
+
+pub(super) fn collect_helper_implicit_res(
+    callee: &str,
+    ctx: &NativeCtx<'_>,
+    out: &mut BTreeMap<String, (String, bool, String)>,
+    visited: &mut HashSet<String>,
+) {
+    let Some(hf) = ctx.helpers_by_key.get(callee).copied().or_else(|| {
+        let short = callee.rsplit("::").next().unwrap_or(callee);
+        ctx.mir
+            .fns
+            .iter()
+            .find(|f| f.name == callee || f.name.rsplit("::").next() == Some(short))
+    }) else {
+        return;
+    };
+    if !visited.insert(hf.name.clone()) {
+        return;
+    }
+    for hbb in &hf.blocks {
+        for hs in &hbb.stmts {
+            match &hs.inst {
+                Inst::ResRead { resource } | Inst::ResWrite { resource } => {
+                    let is_mut = matches!(hs.inst, Inst::ResWrite { .. });
+                    if let Some(entry) = ctx.find_layout_entry(resource) {
+                        let vname = format!("res_{}", sanitize_ident(&entry.layout.canonical_name));
+                        out.entry(entry.layout.canonical_name.clone())
+                            .and_modify(|v| v.1 |= is_mut)
+                            .or_insert((vname, is_mut, entry.struct_name.clone()));
+                    }
+                }
+                Inst::Call { callee: nested, .. } => {
+                    collect_helper_implicit_res(nested, ctx, out, visited);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 pub(super) struct FnAnalysis {
     pub(super) val_tys: Vec<ValTy>,
     pub(super) slot_tys: HashMap<LocalId, ValTy>,
     pub(super) ptr_targets: HashMap<LocalId, PtrTarget>,
     pub(super) const_floats: HashMap<LocalId, f64>,
     pub(super) array_inits: HashMap<LocalId, Vec<LocalId>>,
+    pub(super) array_ptr_locals: HashSet<LocalId>,
     pub(super) res_map: BTreeMap<String, (String, bool, String)>, // canonical -> (var_name, mutable, struct_name)
+    pub(super) implicit_res_map: BTreeMap<String, (String, bool, String)>, // canonical -> (var_name, mutable, struct_name)
     pub(super) spatial_res_map: BTreeMap<String, (String, bool)>, // index_name -> (var_name, mutable)
     pub(super) relation_res_map: BTreeMap<String, (String, bool)>, // rel_name -> (var_name, mutable)
     pub(super) stream_writers: BTreeMap<String, String>,           // stream_name -> writer_var
@@ -942,7 +1482,8 @@ pub(super) struct FnAnalysis {
     pub(super) sp_lim_clamp: HashMap<LocalId, LocalId>, // sp_lim ConstInt(64) -> query_iter LocalId
     pub(super) up_cascade_locals: HashSet<LocalId>,
     pub(super) up_cascade_slots: HashSet<LocalId>,
-    pub(super) field_ptr_array_meta: HashMap<LocalId, (Ty, usize, usize)>,
+    pub(super) field_ptr_array_meta: HashMap<LocalId, (Ty, usize, usize, bool, usize)>,
+    pub(super) smallvec_ptr_meta: HashMap<LocalId, (Ty, usize, usize, usize)>,
     pub(super) spawn_batches: Vec<SpawnBatchPlan>,
     pub(super) batch_sources: HashMap<LocalId, BTreeSet<usize>>,
 }
@@ -973,6 +1514,8 @@ pub(super) fn analyze_function(
     }
     let mut const_floats: HashMap<LocalId, f64> = HashMap::new();
     let mut array_inits: HashMap<LocalId, Vec<LocalId>> = HashMap::new();
+    let mut const_string_locals: HashSet<LocalId> = HashSet::new();
+    let mut array_ptr_locals: HashSet<LocalId> = HashSet::new();
     for _ in 0..3 {
         for bb in &func.blocks {
             for st in &bb.stmts {
@@ -983,6 +1526,9 @@ pub(super) fn analyze_function(
                 match &st.inst {
                     Inst::ConstFloat { value } => {
                         const_floats.insert(d, *value);
+                    }
+                    Inst::ConstString { .. } => {
+                        const_string_locals.insert(d);
                     }
                     Inst::UnOp { op, val } if op == "-" => {
                         if let Some(&v) = const_floats.get(val) {
@@ -995,6 +1541,9 @@ pub(super) fn analyze_function(
                         }
                         if let Some(elems) = array_inits.get(val).cloned() {
                             array_inits.insert(d, elems);
+                        }
+                        if const_string_locals.contains(val) {
+                            const_string_locals.insert(d);
                         }
                     }
                     Inst::ArrayInit { elems } => {
@@ -1011,6 +1560,7 @@ pub(super) fn analyze_function(
 
     // Pre-populate resources, params, streams, commands.
     let mut res_map: BTreeMap<String, (String, bool, String)> = BTreeMap::new();
+    let mut implicit_res_map: BTreeMap<String, (String, bool, String)> = BTreeMap::new();
     let mut spatial_res_map: BTreeMap<String, (String, bool)> = BTreeMap::new();
     let mut relation_res_map: BTreeMap<String, (String, bool)> = BTreeMap::new();
     let mut stream_writers: BTreeMap<String, String> = BTreeMap::new();
@@ -1025,7 +1575,9 @@ pub(super) fn analyze_function(
     let mut has_checkpoint = false;
     let mut up_cascade_locals: HashSet<LocalId> = HashSet::new();
     let mut up_cascade_slots: HashSet<LocalId> = HashSet::new();
-    let mut field_ptr_array_meta: HashMap<LocalId, (Ty, usize, usize)> = HashMap::new();
+    let mut field_ptr_array_meta: HashMap<LocalId, (Ty, usize, usize, bool, usize)> =
+        HashMap::new();
+    let mut smallvec_ptr_meta: HashMap<LocalId, (Ty, usize, usize, usize)> = HashMap::new();
     let mut slot_row_targets: HashMap<LocalId, PtrTarget> = HashMap::new();
     let mut slot_up_targets: HashMap<LocalId, (String, String, bool)> = HashMap::new();
 
@@ -1045,18 +1597,35 @@ pub(super) fn analyze_function(
     }
 
     let mut stream_read_idx = 0usize;
-    for p in &func.params {
+    for (param_idx, p) in func.params.iter().enumerate() {
         if let Some(pl) = p.local {
             match p.kind {
                 HirParamKind::Ref | HirParamKind::RefMut => {
+                    let layout_key = p.layout_key.clone().unwrap_or_else(|| match &p.ty {
+                        MirType::Named(n) => n.clone(),
+                        _ => String::new(),
+                    });
+                    let projected = if let Some((comp_key, field_path)) = layout_key.split_once('.')
+                    {
+                        ctx.resolve_field_info(comp_key, field_path).map(|sf| {
+                            (
+                                comp_key.to_owned(),
+                                field_path.to_owned(),
+                                ValTy::from_solved_field(sf, ctx),
+                            )
+                        })
+                    } else if matches!(func.kind, MirFnKind::HelperFn) {
+                        infer_projected_helper_param_ty(func, param_idx, pl, &layout_key, ctx)
+                            .map(|fvt| (layout_key.clone(), "__proj".to_owned(), fvt))
+                    } else {
+                        None
+                    };
                     ptr_targets.insert(
                         pl,
                         PtrTarget::ParamPtr {
                             var_name: format!("arg_{}", sanitize_rust_ident(&p.name)),
-                            layout_key: p.layout_key.clone().unwrap_or_else(|| match &p.ty {
-                                MirType::Named(n) => n.clone(),
-                                _ => String::new(),
-                            }),
+                            layout_key,
+                            projected,
                         },
                     );
                 }
@@ -1088,6 +1657,7 @@ pub(super) fn analyze_function(
                         PtrTarget::ParamPtr {
                             var_name: arg_var,
                             layout_key,
+                            projected: None,
                         },
                     );
                 }
@@ -1101,6 +1671,7 @@ pub(super) fn analyze_function(
                                     MirType::Named(n) => n.clone(),
                                     _ => String::new(),
                                 },
+                                projected: None,
                             },
                         );
                     }
@@ -1140,9 +1711,30 @@ pub(super) fn analyze_function(
                             entry.layout.canonical_name.clone(),
                             (vname.clone(), prev || is_mut, entry.struct_name.clone()),
                         );
+                        let prev_imp = implicit_res_map
+                            .get(&entry.layout.canonical_name)
+                            .map(|v| v.1)
+                            .unwrap_or(false);
+                        implicit_res_map.insert(
+                            entry.layout.canonical_name.clone(),
+                            (vname.clone(), prev_imp || is_mut, entry.struct_name.clone()),
+                        );
                         if let Some(d) = st.dst {
                             ptr_targets.insert(d, PtrTarget::Resource { var_name: vname });
                         }
+                    }
+                }
+                Inst::Call { callee, .. } => {
+                    let mut hres = BTreeMap::new();
+                    collect_helper_implicit_res(callee, ctx, &mut hres, &mut HashSet::new());
+                    for (canon, (vname, is_mut, sname)) in hres {
+                        let prev = res_map.get(&canon).map(|v| v.1).unwrap_or(false);
+                        res_map.insert(
+                            canon.clone(),
+                            (vname.clone(), prev || is_mut, sname.clone()),
+                        );
+                        let prev_imp = implicit_res_map.get(&canon).map(|v| v.1).unwrap_or(false);
+                        implicit_res_map.insert(canon, (vname, prev_imp || is_mut, sname));
                     }
                 }
                 Inst::SpatialRebuildCsr { index_name, .. }
@@ -1166,8 +1758,13 @@ pub(super) fn analyze_function(
                 }
                 Inst::CmdInsertRelation { relation, .. }
                 | Inst::CmdRemoveRelation { relation, .. } => {
-                    let vname = format!("rel_res_{}", sanitize_ident(relation));
-                    relation_res_map.insert(relation.clone(), (vname, true));
+                    if is_child_of_relation(relation) {
+                        needs_commands = true;
+                    } else {
+                        let resolved = resolve_custom_relation_name(ctx, relation);
+                        let vname = format!("rel_res_{}", sanitize_ident(resolved));
+                        relation_res_map.insert(resolved.to_owned(), (vname, true));
+                    }
                 }
                 Inst::IterUpCascade {
                     query_idx,
@@ -1175,13 +1772,20 @@ pub(super) fn analyze_function(
                     term_idx,
                     ..
                 } => {
-                    if ctx.mir.relations.iter().any(|r| r.name == *relation) {
-                        let vname = format!("rel_res_{}", sanitize_ident(relation));
-                        relation_res_map
-                            .entry(relation.clone())
-                            .or_insert((vname, false));
-                    } else {
+                    if is_child_of_relation(relation) {
                         needs_child_of_query = true;
+                    } else {
+                        let short_rel = relation.rsplit("::").next().unwrap_or(relation.as_str());
+                        if let Some(rdef) = ctx.mir.relations.iter().find(|r| {
+                            r.name == *relation || r.name.rsplit("::").next() == Some(short_rel)
+                        }) {
+                            let vname = format!("rel_res_{}", sanitize_ident(&rdef.name));
+                            relation_res_map
+                                .entry(rdef.name.clone())
+                                .or_insert((vname, false));
+                        } else {
+                            needs_child_of_query = true;
+                        }
                     }
                     if let Some(d) = st.dst
                         && let Some(qb) = func
@@ -1312,12 +1916,23 @@ pub(super) fn analyze_function(
                 match &st.inst {
                     Inst::Copy { val } => {
                         if let Some(d) = st.dst {
-                            if matches!(val_tys[d.0 as usize], ValTy::Array(_, _))
-                                && array_inits.contains_key(val)
-                                && !matches!(val_tys[val.0 as usize], ValTy::Array(_, _))
+                            if matches!(
+                                val_tys[d.0 as usize],
+                                ValTy::Array(_, _) | ValTy::InlineStr(_) | ValTy::SmallVec { .. }
+                            ) && (array_inits.contains_key(val)
+                                || const_string_locals.contains(val))
+                                && !matches!(
+                                    val_tys[val.0 as usize],
+                                    ValTy::Array(_, _)
+                                        | ValTy::InlineStr(_)
+                                        | ValTy::SmallVec { .. }
+                                )
                             {
                                 val_tys[val.0 as usize] = val_tys[d.0 as usize].clone();
-                            } else {
+                            } else if !matches!(
+                                (ptr_targets.get(val), &val_tys[d.0 as usize]),
+                                (Some(PtrTarget::QueryEntityRow { .. }), ValTy::Entity)
+                            ) {
                                 val_tys[d.0 as usize] = val_tys[val.0 as usize].clone();
                             }
                             if let Some(pt) = ptr_targets.get(val).cloned() {
@@ -1325,6 +1940,9 @@ pub(super) fn analyze_function(
                             }
                             if let Some(m) = field_ptr_array_meta.get(val).cloned() {
                                 field_ptr_array_meta.insert(d, m);
+                            }
+                            if let Some(sm) = smallvec_ptr_meta.get(val).cloned() {
+                                smallvec_ptr_meta.insert(d, sm);
                             }
                             if let Some(srcs) = batch_sources.get(val).cloned() {
                                 batch_sources.entry(d).or_default().extend(srcs);
@@ -1346,17 +1964,29 @@ pub(super) fn analyze_function(
                             ValTy::TableRow(_)
                                 | ValTy::Struct(_)
                                 | ValTy::Array(_, _)
+                                | ValTy::SmallVec { .. }
                                 | ValTy::Tuple(_)
                                 | ValTy::BitSet(_)
                                 | ValTy::InputBuf(_)
                                 | ValTy::InlineStr(_)
                                 | ValTy::Entity
                                 | ValTy::Vec2
+                                | ValTy::Vec3
                                 | ValTy::Vec4
+                                | ValTy::IVec2
+                                | ValTy::IVec3
+                                | ValTy::UVec2
                         );
                         let cur = slot_tys.get(slot);
-                        let keep_existing_arr_or_struct =
-                            matches!(cur, Some(ValTy::Array(_, _) | ValTy::Struct(_)));
+                        let keep_existing_arr_or_struct = matches!(
+                            cur,
+                            Some(
+                                ValTy::Array(_, _)
+                                    | ValTy::Struct(_)
+                                    | ValTy::SmallVec { .. }
+                                    | ValTy::InlineStr(_)
+                            )
+                        );
                         let should_update = (matches!(
                             cur,
                             None | Some(ValTy::Unit | ValTy::PtrMarker | ValTy::U64 | ValTy::I64)
@@ -1367,8 +1997,9 @@ pub(super) fn analyze_function(
                         if should_update {
                             slot_tys.insert(*slot, vt.clone());
                         }
-                        if let Some(target_vt @ ValTy::Array(_, _)) = slot_tys.get(slot).cloned()
-                            && array_inits.contains_key(val)
+                        if let Some(target_vt @ (ValTy::Array(_, _) | ValTy::InlineStr(_))) =
+                            slot_tys.get(slot).cloned()
+                            && (array_inits.contains_key(val) || const_string_locals.contains(val))
                         {
                             val_tys[val.0 as usize] = target_vt;
                         }
@@ -1471,56 +2102,88 @@ pub(super) fn analyze_function(
                     } => {
                         if let Some(d) = st.dst
                             && let Some(qp) = query_plans.iter().find(|p| p.query_idx == *query_idx)
-                            && let Some(&sidx) = qp.term_to_slot.get(term_idx)
                         {
-                            let slot = &qp.slots[sidx];
-                            let projected =
-                                projected_field_for_term(func, *query_idx, *term_idx, ctx);
-                            ptr_targets.insert(
-                                d,
-                                PtrTarget::QueryCol {
-                                    query_idx: *query_idx,
-                                    slot_idx: sidx,
-                                    selective: slot.mode == TermAccessMode::SelectiveWrite
-                                        || (slot.mode == TermAccessMode::OptionalWrite
-                                            && slot.is_untracked)
-                                        || matches!(st.inst, Inst::IterColWriteUntracked { .. }),
-                                    optional: matches!(
-                                        slot.mode,
-                                        TermAccessMode::OptionalRead
-                                            | TermAccessMode::OptionalWrite
-                                    ),
-                                    is_sparse: qp.uses_row_iter(),
-                                    projected,
-                                },
-                            );
+                            if let Some(&sidx) = qp.term_to_slot.get(term_idx) {
+                                let slot = &qp.slots[sidx];
+                                let projected =
+                                    projected_field_for_term(func, *query_idx, *term_idx, ctx);
+                                ptr_targets.insert(
+                                    d,
+                                    PtrTarget::QueryCol {
+                                        query_idx: *query_idx,
+                                        slot_idx: sidx,
+                                        selective: slot.mode == TermAccessMode::SelectiveWrite
+                                            || (slot.mode == TermAccessMode::OptionalWrite
+                                                && slot.is_untracked)
+                                            || matches!(
+                                                st.inst,
+                                                Inst::IterColWriteUntracked { .. }
+                                            ),
+                                        optional: matches!(
+                                            slot.mode,
+                                            TermAccessMode::OptionalRead
+                                                | TermAccessMode::OptionalWrite
+                                        ),
+                                        is_sparse: qp.uses_row_iter(),
+                                        projected,
+                                    },
+                                );
+                            } else if let Some(qb) = func
+                                .query_bindings
+                                .iter()
+                                .find(|q| q.query_idx == *query_idx)
+                                && let Some(term) =
+                                    qb.terms.iter().find(|t| t.term_idx == *term_idx)
+                                && (term.canonical_component == "Entity"
+                                    || term.storage_key == "Entity"
+                                    || term.canonical_component.ends_with("::Entity"))
+                            {
+                                ptr_targets.insert(
+                                    d,
+                                    PtrTarget::QueryEntityCol {
+                                        query_idx: *query_idx,
+                                    },
+                                );
+                            }
                         }
                     }
                     Inst::RowPtr {
                         col_ptr, row_idx, ..
                     } => {
-                        if let Some(d) = st.dst
-                            && let Some(PtrTarget::QueryCol {
-                                query_idx,
-                                slot_idx,
-                                selective,
-                                optional,
-                                is_sparse,
-                                projected,
-                            }) = ptr_targets.get(col_ptr).cloned()
-                        {
-                            ptr_targets.insert(
-                                d,
-                                PtrTarget::QueryRow {
+                        if let Some(d) = st.dst {
+                            match ptr_targets.get(col_ptr).cloned() {
+                                Some(PtrTarget::QueryCol {
                                     query_idx,
                                     slot_idx,
-                                    row_idx_local: *row_idx,
                                     selective,
                                     optional,
                                     is_sparse,
                                     projected,
-                                },
-                            );
+                                }) => {
+                                    ptr_targets.insert(
+                                        d,
+                                        PtrTarget::QueryRow {
+                                            query_idx,
+                                            slot_idx,
+                                            row_idx_local: *row_idx,
+                                            selective,
+                                            optional,
+                                            is_sparse,
+                                            projected,
+                                        },
+                                    );
+                                }
+                                Some(PtrTarget::QueryEntityCol { query_idx }) => {
+                                    ptr_targets.insert(
+                                        d,
+                                        PtrTarget::QueryEntityRow {
+                                            query_idx,
+                                            row_idx_local: *row_idx,
+                                        },
+                                    );
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     Inst::EntityGet {
@@ -1572,6 +2235,7 @@ pub(super) fn analyze_function(
                                 PtrTarget::ParamPtr {
                                     var_name: "old_row".to_owned(),
                                     layout_key: layout_key.clone(),
+                                    projected: None,
                                 },
                             );
                         }
@@ -1583,6 +2247,7 @@ pub(super) fn analyze_function(
                                 PtrTarget::ParamPtr {
                                     var_name: "dst_row".to_owned(),
                                     layout_key: layout_key.clone(),
+                                    projected: None,
                                 },
                             );
                         }
@@ -1594,53 +2259,117 @@ pub(super) fn analyze_function(
                         ..
                     } => {
                         if let Some(d) = st.dst {
-                            let sf_opt = ctx.resolve_field_info(layout_key, field);
-                            if let Some(sf) = sf_opt
-                                && let Ty::Array { elem, len } = &sf.ty
-                            {
-                                let elem_sz = sf.size / (*len).max(1);
-                                let elem_align = if let Ty::Named(en_key) = elem.as_ref() {
-                                    ctx.find_layout_entry(en_key)
-                                        .map_or(sf.align, |e| e.layout.align)
-                                } else {
-                                    sf.align
-                                };
-                                field_ptr_array_meta
-                                    .insert(d, ((**elem).clone(), elem_sz, elem_align));
-                            }
-                            let blob_step = sf_opt.and_then(|sf| {
-                                if let Ty::Named(ref inner_key) = sf.ty
-                                    && let Some(inner_entry) = ctx.find_layout_entry(inner_key)
-                                    && inner_entry.layout.item_kind != SchemaItemKind::Enum
-                                    && inner_entry.layout.size > 0
-                                    && !inner_entry.layout.fields.is_empty()
-                                {
-                                    let blob_ty = rust_abi_type_for_field(sf, ctx.mir);
-                                    Some((
-                                        sanitize_rust_ident(field),
-                                        inner_entry.struct_name.clone(),
-                                        blob_unpack_method_for_blob_ty(&blob_ty),
-                                        blob_pack_method_for_blob_ty(&blob_ty),
-                                    ))
-                                } else {
-                                    None
-                                }
-                            });
-                            let base =
+                            let mut cur_target =
                                 ptr_targets
                                     .get(base_ptr)
                                     .cloned()
                                     .unwrap_or(PtrTarget::SlotRef {
                                         slot_local: *base_ptr,
                                     });
-                            ptr_targets.insert(
-                                d,
-                                PtrTarget::Field {
-                                    base: Box::new(base),
-                                    field: field.clone(),
-                                    blob_step,
-                                },
-                            );
+                            if layout_key == "SmallVec" && field == "data" {
+                                let sv_meta =
+                                    smallvec_ptr_meta.get(base_ptr).cloned().or_else(|| {
+                                        let sv_vt = match &cur_target {
+                                            PtrTarget::SlotRef { slot_local } => {
+                                                slot_tys.get(slot_local)
+                                            }
+                                            _ => Some(&val_tys[base_ptr.0 as usize]),
+                                        };
+                                        if let Some(ValTy::SmallVec {
+                                            elem,
+                                            cap,
+                                            elem_size,
+                                            elem_align,
+                                        }) = sv_vt
+                                        {
+                                            Some((
+                                                val_ty_to_sema_hint(elem),
+                                                *elem_size,
+                                                *elem_align,
+                                                *cap,
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                ptr_targets.insert(d, cur_target);
+                                if let Some((et, es, ea, cap)) = sv_meta {
+                                    field_ptr_array_meta.insert(d, (et, es, ea, true, cap));
+                                }
+                            } else {
+                                let eff_lk = if !layout_key.is_empty() {
+                                    layout_key.as_str()
+                                } else if let PtrTarget::ArrayElem {
+                                    elem_ty: Ty::Named(ref n),
+                                    ..
+                                } = cur_target
+                                {
+                                    n.as_str()
+                                } else {
+                                    ""
+                                };
+                                let mut cur_entry_opt = ctx.find_layout_entry(eff_lk);
+                                let mut leaf_sf_opt: Option<&SolvedField> = None;
+                                for part in field.split('.') {
+                                    let sf_opt = cur_entry_opt.as_ref().and_then(|e| {
+                                        e.layout.fields.iter().find(|f| f.name == part)
+                                    });
+                                    let mut next_entry_opt = None;
+                                    let blob_step = sf_opt.and_then(|sf| {
+                                        if let Ty::Named(ref inner_key) = sf.ty
+                                            && let Some(inner_entry) =
+                                                ctx.find_layout_entry(inner_key)
+                                            && inner_entry.layout.item_kind != SchemaItemKind::Enum
+                                            && inner_entry.layout.size > 0
+                                            && !inner_entry.layout.fields.is_empty()
+                                        {
+                                            next_entry_opt = Some(inner_entry);
+                                            let blob_ty = rust_abi_type_for_field(sf, ctx.mir);
+                                            Some((
+                                                sanitize_rust_ident(part),
+                                                inner_entry.struct_name.clone(),
+                                                blob_unpack_method_for_blob_ty(&blob_ty),
+                                                blob_pack_method_for_blob_ty(&blob_ty),
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    cur_target = PtrTarget::Field {
+                                        base: Box::new(cur_target),
+                                        field: part.to_owned(),
+                                        blob_step,
+                                    };
+                                    leaf_sf_opt = sf_opt;
+                                    cur_entry_opt = next_entry_opt;
+                                }
+                                if let Some(sf) = leaf_sf_opt {
+                                    match &sf.ty {
+                                        Ty::Array { elem, .. } => {
+                                            let (elem_sz, elem_align) =
+                                                sema_ty_size_align(elem, ctx);
+                                            field_ptr_array_meta.insert(
+                                                d,
+                                                ((**elem).clone(), elem_sz, elem_align, false, 0),
+                                            );
+                                        }
+                                        Ty::SmallVec { elem, cap } => {
+                                            let (elem_sz, elem_align) =
+                                                sema_ty_size_align(elem, ctx);
+                                            smallvec_ptr_meta.insert(
+                                                d,
+                                                ((**elem).clone(), elem_sz, elem_align, *cap),
+                                            );
+                                            field_ptr_array_meta.insert(
+                                                d,
+                                                ((**elem).clone(), elem_sz, elem_align, true, *cap),
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                ptr_targets.insert(d, cur_target);
+                            }
                         }
                     }
                     Inst::StructInit { type_name, fields } => {
@@ -1649,8 +2378,13 @@ pub(super) fn analyze_function(
                                 && let ValTy::Tuple(item_tys) = val_tys[d.0 as usize].clone()
                             {
                                 for (idx, (_, flocal)) in fields.iter().enumerate() {
-                                    if let Some(target_vt @ ValTy::Array(_, _)) = item_tys.get(idx)
-                                        && array_inits.contains_key(flocal)
+                                    if let Some(
+                                        target_vt @ (ValTy::Array(_, _)
+                                        | ValTy::InlineStr(_)
+                                        | ValTy::SmallVec { .. }),
+                                    ) = item_tys.get(idx)
+                                        && (array_inits.contains_key(flocal)
+                                            || const_string_locals.contains(flocal))
                                     {
                                         val_tys[flocal.0 as usize] = target_vt.clone();
                                     }
@@ -1662,8 +2396,13 @@ pub(super) fn analyze_function(
                                     entry.layout.fields.iter().find(|f| f.name == *fname)
                                 {
                                     let fvt = ValTy::from_solved_field(sf, ctx);
-                                    if matches!(fvt, ValTy::Array(_, _))
-                                        && array_inits.contains_key(flocal)
+                                    if matches!(
+                                        fvt,
+                                        ValTy::Array(_, _)
+                                            | ValTy::InlineStr(_)
+                                            | ValTy::SmallVec { .. }
+                                    ) && (array_inits.contains_key(flocal)
+                                        || const_string_locals.contains(flocal))
                                     {
                                         val_tys[flocal.0 as usize] = fvt;
                                     }
@@ -1672,22 +2411,146 @@ pub(super) fn analyze_function(
                         }
                     }
                     Inst::ArrayInit { elems } => {
-                        if let Some(d) = st.dst
-                            && let ValTy::Array(elem_vt, _) = val_tys[d.0 as usize].clone()
-                            && matches!(*elem_vt, ValTy::Array(_, _))
-                        {
-                            for el in elems {
-                                if array_inits.contains_key(el) {
-                                    val_tys[el.0 as usize] = (*elem_vt).clone();
+                        if let Some(d) = st.dst {
+                            let elem_vt_opt = match val_tys[d.0 as usize].clone() {
+                                ValTy::Array(ev, _) | ValTy::SmallVec { elem: ev, .. } => Some(ev),
+                                _ => None,
+                            };
+                            if let Some(elem_vt) = elem_vt_opt
+                                && matches!(
+                                    *elem_vt,
+                                    ValTy::Array(_, _)
+                                        | ValTy::InlineStr(_)
+                                        | ValTy::SmallVec { .. }
+                                )
+                            {
+                                for el in elems {
+                                    if array_inits.contains_key(el)
+                                        || const_string_locals.contains(el)
+                                    {
+                                        val_tys[el.0 as usize] = (*elem_vt).clone();
+                                    }
                                 }
                             }
                         }
                     }
                     Inst::ArrayIndex { base, .. } => {
-                        if let Some(d) = st.dst
-                            && let ValTy::Array(elem_vt, _) = &val_tys[base.0 as usize]
-                        {
-                            val_tys[d.0 as usize] = (**elem_vt).clone();
+                        if let Some(d) = st.dst {
+                            if matches!(
+                                func.locals[d.0 as usize].ty,
+                                MirType::Ptr | MirType::MutPtr
+                            ) {
+                                let base_target = ptr_targets
+                                    .get(base)
+                                    .cloned()
+                                    .unwrap_or(PtrTarget::SlotRef { slot_local: *base });
+                                let meta = field_ptr_array_meta
+                                    .get(base)
+                                    .cloned()
+                                    .or_else(|| {
+                                        smallvec_ptr_meta.get(base).map(|(et, es, ea, cap)| {
+                                            (et.clone(), *es, *ea, true, *cap)
+                                        })
+                                    })
+                                    .or_else(|| {
+                                        let base_vt = match &base_target {
+                                            PtrTarget::SlotRef { slot_local } => {
+                                                slot_tys.get(slot_local)
+                                            }
+                                            _ => Some(&val_tys[base.0 as usize]),
+                                        };
+                                        match base_vt {
+                                            Some(ValTy::Array(ev, _)) => {
+                                                let et = val_ty_to_sema_hint(ev);
+                                                let (es, ea) = sema_ty_size_align(&et, ctx);
+                                                Some((et, es, ea, false, 0))
+                                            }
+                                            Some(ValTy::SmallVec {
+                                                elem,
+                                                cap,
+                                                elem_size,
+                                                elem_align,
+                                            }) => Some((
+                                                val_ty_to_sema_hint(elem),
+                                                *elem_size,
+                                                *elem_align,
+                                                true,
+                                                *cap,
+                                            )),
+                                            _ => None,
+                                        }
+                                    });
+                                if let Some((elem_ty, es, ea, is_sv, sv_cap)) = meta {
+                                    let (elem_rust_ty, elem_needs_pod_unpack) = match &elem_ty {
+                                        Ty::Named(n) => {
+                                            let short = n.rsplit("::").next().unwrap_or(n);
+                                            if !ctx.enums_by_key.contains_key(n.as_str())
+                                                && !ctx.enums_by_key.contains_key(short)
+                                                && let Some(entry) = ctx.find_layout_entry(n)
+                                                && entry.layout.size > 0
+                                                && !entry.layout.fields.is_empty()
+                                            {
+                                                (entry.struct_name.clone(), true)
+                                            } else {
+                                                (rust_abi_type_for_ty(&elem_ty, es, ctx.mir), is_sv)
+                                            }
+                                        }
+                                        Ty::SmallVec { .. }
+                                        | Ty::Tuple(_)
+                                        | Ty::InputBuffer { .. } => {
+                                            (aligned_blob_type(es, ea), is_sv)
+                                        }
+                                        _ => (rust_abi_type_for_ty(&elem_ty, es, ctx.mir), is_sv),
+                                    };
+                                    array_ptr_locals.insert(d);
+                                    ptr_targets.insert(
+                                        d,
+                                        PtrTarget::ArrayElem {
+                                            base: Box::new(base_target),
+                                            ptr_local: d,
+                                            elem_ty: elem_ty.clone(),
+                                            elem_size: es,
+                                            elem_align: ea,
+                                            elem_rust_ty,
+                                            elem_needs_pod_unpack,
+                                            is_smallvec: is_sv,
+                                            sv_cap,
+                                        },
+                                    );
+                                    match &elem_ty {
+                                        Ty::Array { elem: ne, .. } => {
+                                            let (nes, nea) = sema_ty_size_align(ne, ctx);
+                                            field_ptr_array_meta
+                                                .insert(d, ((**ne).clone(), nes, nea, false, 0));
+                                        }
+                                        Ty::SmallVec {
+                                            elem: ne,
+                                            cap: ncap,
+                                        } => {
+                                            let (nes, nea) = sema_ty_size_align(ne, ctx);
+                                            smallvec_ptr_meta.insert(
+                                                d,
+                                                ((**ne).clone(), nes, nea.max(1), *ncap),
+                                            );
+                                            field_ptr_array_meta.insert(
+                                                d,
+                                                ((**ne).clone(), nes, nea.max(1), true, *ncap),
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            } else {
+                                match &val_tys[base.0 as usize] {
+                                    ValTy::Array(elem_vt, _) => {
+                                        val_tys[d.0 as usize] = (**elem_vt).clone();
+                                    }
+                                    ValTy::SmallVec { elem, .. } => {
+                                        val_tys[d.0 as usize] = (**elem).clone();
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                     }
                     Inst::FieldStore {
@@ -1698,7 +2561,12 @@ pub(super) fn analyze_function(
                     } => {
                         if let Some(sf) = ctx.resolve_field_info(layout_key, field) {
                             let fvt = ValTy::from_solved_field(sf, ctx);
-                            if matches!(fvt, ValTy::Array(_, _)) && array_inits.contains_key(val) {
+                            if matches!(
+                                fvt,
+                                ValTy::Array(_, _) | ValTy::InlineStr(_) | ValTy::SmallVec { .. }
+                            ) && (array_inits.contains_key(val)
+                                || const_string_locals.contains(val))
+                            {
                                 val_tys[val.0 as usize] = fvt;
                             }
                         }
@@ -1712,7 +2580,14 @@ pub(super) fn analyze_function(
                         if let Some(d) = st.dst {
                             if let Some(sf) = ctx.resolve_field_info(layout_key, field) {
                                 let fvt = ValTy::from_solved_field(sf, ctx);
-                                if matches!(fvt, ValTy::BitSet(_) | ValTy::InputBuf(_)) {
+                                if matches!(
+                                    fvt,
+                                    ValTy::BitSet(_)
+                                        | ValTy::InputBuf(_)
+                                        | ValTy::InlineStr(_)
+                                        | ValTy::SmallVec { .. }
+                                        | ValTy::Array(_, _)
+                                ) {
                                     val_tys[d.0 as usize] = fvt;
                                 }
                             } else if let Some(tb) =
@@ -1723,10 +2598,18 @@ pub(super) fn analyze_function(
                                         None
                                     }
                                 })
-                                && let Some((_, fty)) =
-                                    tb.fields.iter().find(|(fnm, _)| fnm == field)
                             {
-                                val_tys[d.0 as usize] = ValTy::from_sema_ty(fty, ctx);
+                                if let Some((_, fty)) =
+                                    tb.fields.iter().find(|(fnm, _)| fnm == field)
+                                {
+                                    val_tys[d.0 as usize] = ValTy::from_sema_ty(fty, ctx);
+                                } else if let Some((top, rest)) = field.split_once('.')
+                                    && let Some((_, Ty::Named(nested_key))) =
+                                        tb.fields.iter().find(|(fnm, _)| fnm == top)
+                                    && let Some(sf) = ctx.resolve_field_info(nested_key, rest)
+                                {
+                                    val_tys[d.0 as usize] = ValTy::from_solved_field(sf, ctx);
+                                }
                             }
                         }
                     }
@@ -1742,6 +2625,79 @@ pub(super) fn analyze_function(
                                 tb.fields.iter().find(|(fnm, _)| fnm == field)
                             {
                                 val_tys[d.0 as usize] = ValTy::from_sema_ty(fty, ctx);
+                            } else if let Some((top, rest)) = field.split_once('.')
+                                && let Some((_, Ty::Named(nested_key))) =
+                                    tb.fields.iter().find(|(fnm, _)| fnm == top)
+                                && let Some(sf) = ctx.resolve_field_info(nested_key, rest)
+                            {
+                                val_tys[d.0 as usize] = ValTy::from_solved_field(sf, ctx);
+                            }
+                        }
+                    }
+                    Inst::BinOp { op, lhs, rhs, .. } => {
+                        if let Some(d) = st.dst
+                            && !matches!(op.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=")
+                            && !op.starts_with("dot")
+                            && !op.starts_with("length")
+                            && !op.starts_with("distance")
+                        {
+                            let lt = val_tys[lhs.0 as usize].clone();
+                            let rt = val_tys[rhs.0 as usize].clone();
+                            if lt.is_ivec().is_some() && rt.is_vec().is_none() {
+                                val_tys[d.0 as usize] = lt;
+                            } else if rt.is_ivec().is_some() && lt.is_vec().is_none() {
+                                val_tys[d.0 as usize] = rt;
+                            } else if lt.is_vec().is_some() && rt.is_vec().is_none() {
+                                val_tys[d.0 as usize] = lt;
+                            } else if rt.is_vec().is_some() && lt.is_vec().is_none() {
+                                val_tys[d.0 as usize] = rt;
+                            }
+                        }
+                    }
+                    Inst::Call { callee, .. } => {
+                        if let Some(d) = st.dst {
+                            let short = callee.rsplit("::").next().unwrap_or(callee.as_str());
+                            let inferred = match short {
+                                "mat3" | "Mat3" => Some(ValTy::Array(Box::new(ValTy::F32), 9)),
+                                "mat4" | "Mat4" => Some(ValTy::Array(Box::new(ValTy::F32), 16)),
+                                "vec2" | "Vec2" => Some(ValTy::Vec2),
+                                "vec3" | "Vec3" => Some(ValTy::Vec3),
+                                "vec3a" | "Vec3a" | "vec4" | "Vec4" | "quat" | "Quat" | "rgba"
+                                | "Rgba" => Some(ValTy::Vec4),
+                                "ivec2" | "IVec2" => Some(ValTy::IVec2),
+                                "ivec3" | "IVec3" => Some(ValTy::IVec3),
+                                "uvec2" | "UVec2" => Some(ValTy::UVec2),
+                                _ if matches!(
+                                    val_tys[d.0 as usize],
+                                    ValTy::Unit | ValTy::PtrMarker
+                                ) =>
+                                {
+                                    ctx.helpers_by_key
+                                        .get(callee.as_str())
+                                        .copied()
+                                        .or_else(|| {
+                                            ctx.mir.fns.iter().find(|f| {
+                                                f.name == *callee
+                                                    || f.name.rsplit("::").next() == Some(short)
+                                            })
+                                        })
+                                        .filter(|hf| !matches!(hf.ret_ty, MirType::Unit))
+                                        .map(|hf| ValTy::from_mir(&hf.ret_ty, ctx))
+                                }
+                                _ => None,
+                            };
+                            if let Some(ivt) = inferred {
+                                val_tys[d.0 as usize] = ivt;
+                            }
+                        }
+                    }
+                    Inst::UnOp { op, val } => {
+                        if let Some(d) = st.dst
+                            && op == "-"
+                        {
+                            let vt = val_tys[val.0 as usize].clone();
+                            if vt.is_ivec().is_some() || vt.is_vec().is_some() {
+                                val_tys[d.0 as usize] = vt;
                             }
                         }
                     }
@@ -1817,7 +2773,9 @@ pub(super) fn analyze_function(
         ptr_targets,
         const_floats,
         array_inits,
+        array_ptr_locals,
         res_map,
+        implicit_res_map,
         spatial_res_map,
         relation_res_map,
         stream_writers,
@@ -1834,6 +2792,7 @@ pub(super) fn analyze_function(
         up_cascade_locals,
         up_cascade_slots,
         field_ptr_array_meta,
+        smallvec_ptr_meta,
         spawn_batches,
         batch_sources,
     }
@@ -2084,6 +3043,157 @@ pub(super) fn terminator_used_locals(term: &Terminator) -> Vec<LocalId> {
         Terminator::Switch { scrutinee, .. } => vec![*scrutinee],
         _ => Vec::new(),
     }
+}
+
+fn infer_projected_helper_param_ty(
+    func: &MirFunction,
+    param_idx: usize,
+    pl: LocalId,
+    layout_key: &str,
+    ctx: &NativeCtx<'_>,
+) -> Option<ValTy> {
+    let mut aliases: HashSet<LocalId> = HashSet::new();
+    aliases.insert(pl);
+    for _ in 0..3 {
+        for bb in &func.blocks {
+            for st in &bb.stmts {
+                if let Inst::Copy { val } = &st.inst
+                    && aliases.contains(val)
+                    && let Some(d) = st.dst
+                {
+                    aliases.insert(d);
+                }
+            }
+        }
+    }
+
+    // Whole-component / handle reference parameters index into fields or bit/grace/timeline APIs.
+    for bb in &func.blocks {
+        for st in &bb.stmts {
+            match &st.inst {
+                Inst::FieldLoad {
+                    base_ptr,
+                    layout_key: fk,
+                    field,
+                    ..
+                }
+                | Inst::FieldStore {
+                    base_ptr,
+                    layout_key: fk,
+                    field,
+                    ..
+                }
+                | Inst::FieldPtr {
+                    base_ptr,
+                    layout_key: fk,
+                    field,
+                    ..
+                } if aliases.contains(base_ptr) => {
+                    let eff_fk = if fk.is_empty() {
+                        layout_key
+                    } else {
+                        fk.as_str()
+                    };
+                    if ctx.resolve_field_info(eff_fk, field).is_some() {
+                        return None;
+                    }
+                }
+                Inst::GraceIsActive { ptr }
+                | Inst::GraceClear { ptr }
+                | Inst::GraceArm { ptr, .. }
+                | Inst::GraceTick { ptr, .. }
+                | Inst::TimelineInWindow { ptr, .. }
+                | Inst::TimelineAdvance {
+                    cursor_ptr: ptr, ..
+                }
+                | Inst::InputBufPush { ptr, .. }
+                | Inst::InputBufPeek { ptr, .. }
+                | Inst::InputBufTick { ptr, .. }
+                | Inst::InputBufConsume { ptr, .. }
+                | Inst::BitSetSet { ptr, .. }
+                | Inst::BitSetClear { ptr, .. }
+                | Inst::BitSetGet { ptr, .. }
+                    if aliases.contains(ptr) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Check call sites across the module first: projected scalar/vector args carry non-Ptr types.
+    let fn_short = func.name.rsplit("::").next().unwrap_or(func.name.as_str());
+    for caller in &ctx.mir.fns {
+        for bb in &caller.blocks {
+            for st in &bb.stmts {
+                if let Inst::Call { callee, args } = &st.inst {
+                    let matches_callee =
+                        callee == &func.name || callee.rsplit("::").next() == Some(fn_short);
+                    if matches_callee && let Some(&arg_id) = args.get(param_idx) {
+                        let aty = &caller.locals[arg_id.0 as usize].ty;
+                        if !matches!(aty, MirType::Ptr | MirType::MutPtr | MirType::Unit) {
+                            return Some(ValTy::from_mir(aty, ctx));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: inspect direct value uses inside the helper itself.
+    for bb in &func.blocks {
+        for st in &bb.stmts {
+            match &st.inst {
+                Inst::BinOp { op, lhs, rhs, .. } => {
+                    let other = if aliases.contains(lhs) && !aliases.contains(rhs) {
+                        Some(*rhs)
+                    } else if aliases.contains(rhs) && !aliases.contains(lhs) {
+                        Some(*lhs)
+                    } else {
+                        None
+                    };
+                    if let Some(o) = other {
+                        let oty = &func.locals[o.0 as usize].ty;
+                        if !matches!(oty, MirType::Ptr | MirType::MutPtr | MirType::Unit) {
+                            if op == "quat_mul_vec3" && aliases.contains(rhs) {
+                                return Some(ValTy::Vec3);
+                            }
+                            return Some(ValTy::from_mir(oty, ctx));
+                        }
+                    }
+                }
+                Inst::UnOp { op, val } if aliases.contains(val) && op == "!" => {
+                    return Some(ValTy::Bool);
+                }
+                Inst::FieldStore {
+                    layout_key: fk,
+                    field,
+                    val,
+                    ..
+                } if aliases.contains(val) => {
+                    if let Some(sf) = ctx.resolve_field_info(fk, field) {
+                        return Some(ValTy::from_solved_field(sf, ctx));
+                    }
+                }
+                Inst::ReduceAccum { acc, val, .. } if aliases.contains(val) => {
+                    let aty = &func.locals[acc.0 as usize].ty;
+                    if !matches!(aty, MirType::Ptr | MirType::MutPtr | MirType::Unit) {
+                        return Some(ValTy::from_mir(aty, ctx));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Terminator::Return(Some(rv)) = &bb.terminator
+            && aliases.contains(rv)
+            && !matches!(func.ret_ty, MirType::Unit | MirType::Ptr | MirType::MutPtr)
+        {
+            return Some(ValTy::from_mir(&func.ret_ty, ctx));
+        }
+    }
+
+    None
 }
 
 // =========================================================================

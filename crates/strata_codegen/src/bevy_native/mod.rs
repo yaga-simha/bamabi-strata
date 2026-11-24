@@ -8,7 +8,7 @@ use crate::net::{
 use crate::rust_guest::{
     aligned_blob_type, emit_read_field_from_bytes, emit_rust_wire_field_decode,
     emit_rust_wire_field_encode, emit_write_field_to_bytes, format_fix32_i32_lit,
-    format_fix64_i64_lit, rust_abi_type_for_field, rust_abi_type_for_mir_ty,
+    format_fix64_i64_lit, rust_abi_type_for_field, rust_abi_type_for_mir_ty, rust_abi_type_for_ty,
     rust_default_expr_for_field, sanitize_rust_ident, scale_float_fix32, scale_float_fix64,
     scale_int_fix32, scale_int_fix64,
 };
