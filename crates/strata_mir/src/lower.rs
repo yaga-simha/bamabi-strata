@@ -7931,14 +7931,14 @@ fn vec_path_constant(name: &str) -> Option<MirConstVal> {
         "vec3::UP" | "vec3::Y" | "ivec3::Y" => Some(MirConstVal::Vec3([0.0, 1.0, 0.0])),
         "vec3::X" | "ivec3::X" => Some(MirConstVal::Vec3([1.0, 0.0, 0.0])),
         "vec3::Z" | "ivec3::Z" => Some(MirConstVal::Vec3([0.0, 0.0, 1.0])),
-        "vec4::ZERO" => Some(MirConstVal::Vec4([0.0, 0.0, 0.0, 0.0])),
+        "vec4::ZERO" | "quat::ZERO" | "Quat::ZERO" => Some(MirConstVal::Vec4([0.0, 0.0, 0.0, 0.0])),
         "vec4::ONE" => Some(MirConstVal::Vec4([1.0, 1.0, 1.0, 1.0])),
         "vec4::X" => Some(MirConstVal::Vec4([1.0, 0.0, 0.0, 0.0])),
         "vec4::Y" => Some(MirConstVal::Vec4([0.0, 1.0, 0.0, 0.0])),
         "vec4::Z" => Some(MirConstVal::Vec4([0.0, 0.0, 1.0, 0.0])),
-        "vec4::W" => Some(MirConstVal::Vec4([0.0, 0.0, 0.0, 1.0])),
-        "quat::ZERO" | "Quat::ZERO" => Some(MirConstVal::Vec4([0.0, 0.0, 0.0, 0.0])),
-        "quat::IDENTITY" | "Quat::IDENTITY" => Some(MirConstVal::Vec4([0.0, 0.0, 0.0, 1.0])),
+        "vec4::W" | "quat::IDENTITY" | "Quat::IDENTITY" => {
+            Some(MirConstVal::Vec4([0.0, 0.0, 0.0, 1.0]))
+        }
         _ => None,
     }
 }

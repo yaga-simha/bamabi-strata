@@ -1880,7 +1880,7 @@ fn lower_task_stmts(b: &mut CfgBuilder<'_>, tctx: &mut TaskLowerCtx, stmts: &[Hi
                 let (after_pc, after_bb) = tctx.alloc_state(b, "task_race_after");
                 let race_timer_slot = b
                     .func
-                    .alloc_local(&format!("race_tmr_{race_pc}"), MirType::MutPtr);
+                    .alloc_local(format!("race_tmr_{race_pc}"), MirType::MutPtr);
                 b.func.blocks[tctx.alloc_bb.0 as usize].stmts.push(MirStmt {
                     dst: Some(race_timer_slot),
                     inst: Inst::SlotAlloc { ty: MirType::F32 },
