@@ -772,6 +772,9 @@ pub fn cmd_build_with_key(
                 cmd.arg("-fPIC");
             }
             cmd.arg("-I").arg(out).arg(&c_file).arg("-o").arg(&bin_path);
+            if !cfg!(target_os = "windows") {
+                cmd.arg("-lm");
+            }
             let output = match cmd.output() {
                 Ok(o) => o,
                 Err(e) => return (EXIT_COMPILE_ERROR, format!("failed running `{cc}`: {e}")),

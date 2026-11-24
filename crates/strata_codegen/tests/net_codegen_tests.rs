@@ -657,6 +657,7 @@ int main(void) {{
         .arg(&harness_path)
         .arg("-o")
         .arg(&exe_path)
+        .arg("-lm")
         .output()
         .expect("compile c99_net_harness");
     assert!(
@@ -1315,6 +1316,7 @@ int main(void) {{
         .arg(&h_path)
         .arg("-o")
         .arg(&exe)
+        .arg("-lm")
         .output()
         .expect("compile c99_reg_harness");
     assert!(
@@ -1417,6 +1419,7 @@ schedule FixedUpdate { use_extra_changed, use_multi_changed }
         .arg(&c_probe)
         .arg("-o")
         .arg(tmp.path().join("ping_probe"))
+        .arg("-lm")
         .output()
         .unwrap();
     assert!(
@@ -4024,6 +4027,7 @@ int main(void) {{
             .arg(&c_hpath)
             .arg("-o")
             .arg(&exe)
+            .arg("-lm")
             .output()
             .expect("compile c99 r6 harness");
         assert!(
@@ -4592,6 +4596,7 @@ int main(void) {{
         .arg(&h_path)
         .arg("-o")
         .arg(&exe)
+        .arg("-lm")
         .output()
         .unwrap();
     assert!(

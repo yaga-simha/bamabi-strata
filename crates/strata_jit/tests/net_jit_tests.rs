@@ -4548,6 +4548,7 @@ int main(void) {{
         .arg("-o")
         .arg(&exe)
         .arg("-ldl")
+        .arg("-lm")
         .output()
         .expect("compile jit_r6_harness");
     assert!(
@@ -4758,6 +4759,7 @@ int main(void) {{
         .arg("-o")
         .arg(&exe)
         .arg("-ldl")
+        .arg("-lm")
         .output()
         .expect("compile jit_130_harness");
     assert!(
