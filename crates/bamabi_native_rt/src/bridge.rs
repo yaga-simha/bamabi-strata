@@ -1,7 +1,8 @@
 //! Unified static/dynamic ECS registration bridge (`SharedBridgeAppExt`) for Tier 3 native
 //! plugins and `static-console` (`dlopen`-free) builds.
 
-use bamabi_sys::{ComponentUuid, ModComponent};
+use crate::net::StrataNetPacket;
+use bamabi_sys::{AbiPod, ComponentUuid, ModComponent};
 use bevy_app::App;
 use bevy_ecs::component::Component;
 use bevy_ecs::event::{EntityEvent, Event};
@@ -143,6 +144,15 @@ pub trait SharedBridgeAppExt {
         &mut self,
     ) -> Result<StrataBridgeHandle, StrataBridgeError>;
 
+    /// Registers a Strata POD buffered `stream` (`M: Message + ModComponent + AbiPod + Default`)
+    /// supporting ABI Slots 30–32 (`msg_read_batch`, `msg_send`, `msg_write_batch`).
+    fn register_strata_pod_stream<M: Message + ModComponent + AbiPod + Default>(
+        &mut self,
+    ) -> Result<StrataBridgeHandle, StrataBridgeError>;
+
+    /// Registers the canonical POD [`StrataNetPacket`] transport message stream.
+    fn register_strata_net_transport(&mut self) -> Result<StrataBridgeHandle, StrataBridgeError>;
+
     /// Registers a Strata triggerable global `event` (`E: Event + ModComponent + Copy`).
     fn register_strata_event<E>(&mut self) -> Result<StrataBridgeHandle, StrataBridgeError>
     where
@@ -245,6 +255,35 @@ impl SharedBridgeAppExt for App {
         };
 
         record_and_return::<M>(self, abi_component_raw)
+    }
+
+    fn register_strata_pod_stream<M: Message + ModComponent + AbiPod + Default>(
+        &mut self,
+    ) -> Result<StrataBridgeHandle, StrataBridgeError> {
+        ensure_catalog(self);
+
+        #[cfg(feature = "shared-bridge")]
+        let abi_component_raw = {
+            let handle =
+                self.register_mod_message::<M>()
+                    .map_err(|err| StrataBridgeError::Collision {
+                        canonical_name: M::CANONICAL_NAME,
+                        reason: err.to_string(),
+                    })?;
+            Some(handle.to_raw())
+        };
+
+        #[cfg(not(feature = "shared-bridge"))]
+        let abi_component_raw = {
+            self.add_message::<M>();
+            None
+        };
+
+        record_and_return::<M>(self, abi_component_raw)
+    }
+
+    fn register_strata_net_transport(&mut self) -> Result<StrataBridgeHandle, StrataBridgeError> {
+        self.register_strata_pod_stream::<StrataNetPacket>()
     }
 
     fn register_strata_event<E>(&mut self) -> Result<StrataBridgeHandle, StrataBridgeError>

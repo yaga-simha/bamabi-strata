@@ -24,6 +24,7 @@ bamabi_trust.workspace = true
 bevy_app = { workspace = true, optional = true }
 bevy_ecs = { workspace = true, optional = true }
 clap.workspace = true
+notify-debouncer-full = "0.7"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

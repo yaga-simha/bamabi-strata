@@ -54,6 +54,7 @@ pub enum SyntaxKind {
     KwAssertLayout,
     KwAssertPar,
     KwSimTest,
+    KwNetSimTest,
     KwLet,
     KwMut,
     KwIf,
@@ -73,6 +74,7 @@ pub enum SyntaxKind {
 
     // --- Contextual Keywords (mapped by parser when in keyword position) ---
     KwZone,
+    KwRpc,
     KwBy,
     KwOver,
     KwKey,
@@ -194,6 +196,7 @@ pub enum SyntaxKind {
     ResourceDecl,
     EventDecl,
     StreamDecl,
+    RpcDecl,
     RelationDecl,
     RelFlags,
     TableDecl,
@@ -237,6 +240,9 @@ pub enum SyntaxKind {
     AssertLayoutDecl,
     AssertParDecl,
     SimTestDecl,
+    NetSimTestDecl,
+    NetSimParamList,
+    NetSimParam,
 
     // --- Types ---
     TypeRef,
@@ -398,6 +404,7 @@ const SYNTAX_KIND_TABLE: [SyntaxKind; SyntaxKind::__Last as usize] = [
     SyntaxKind::KwAssertLayout,
     SyntaxKind::KwAssertPar,
     SyntaxKind::KwSimTest,
+    SyntaxKind::KwNetSimTest,
     SyntaxKind::KwLet,
     SyntaxKind::KwMut,
     SyntaxKind::KwIf,
@@ -415,6 +422,7 @@ const SYNTAX_KIND_TABLE: [SyntaxKind; SyntaxKind::__Last as usize] = [
     SyntaxKind::KwSelfLower,
     SyntaxKind::KwSelfUpper,
     SyntaxKind::KwZone,
+    SyntaxKind::KwRpc,
     SyntaxKind::KwBy,
     SyntaxKind::KwOver,
     SyntaxKind::KwKey,
@@ -532,6 +540,7 @@ const SYNTAX_KIND_TABLE: [SyntaxKind; SyntaxKind::__Last as usize] = [
     SyntaxKind::ResourceDecl,
     SyntaxKind::EventDecl,
     SyntaxKind::StreamDecl,
+    SyntaxKind::RpcDecl,
     SyntaxKind::RelationDecl,
     SyntaxKind::RelFlags,
     SyntaxKind::TableDecl,
@@ -575,6 +584,9 @@ const SYNTAX_KIND_TABLE: [SyntaxKind; SyntaxKind::__Last as usize] = [
     SyntaxKind::AssertLayoutDecl,
     SyntaxKind::AssertParDecl,
     SyntaxKind::SimTestDecl,
+    SyntaxKind::NetSimTestDecl,
+    SyntaxKind::NetSimParamList,
+    SyntaxKind::NetSimParam,
     SyntaxKind::TypeRef,
     SyntaxKind::ArrayType,
     SyntaxKind::RefType,
@@ -653,5 +665,11 @@ mod tests {
         assert!(SyntaxKind::BlockComment.is_trivia());
         assert!(!SyntaxKind::Ident.is_trivia());
         assert!(!SyntaxKind::Error.is_trivia());
+        assert!(SyntaxKind::KwRpc.is_token());
+        assert!(SyntaxKind::KwNetSimTest.is_token());
+        assert!(!SyntaxKind::RpcDecl.is_token());
+        assert!(!SyntaxKind::NetSimTestDecl.is_token());
+        assert!(!SyntaxKind::NetSimParamList.is_token());
+        assert!(!SyntaxKind::NetSimParam.is_token());
     }
 }

@@ -64,7 +64,7 @@ jobs:
         run: cargo xtask audit --skip-typos
 
   kani:
-    name: Kani Formal Verification (PO-S1..PO-S10)
+    name: Kani Formal Verification (PO-S1..PO-S12, PO-S14..PO-S16)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -82,7 +82,7 @@ jobs:
             --output-format terse
             -j
 
-      - name: Verify `bamabi_native_rt` proofs (`PO-S1`..`PO-S5`, `static-console`)
+      - name: Verify `bamabi_native_rt` proofs (`PO-S1`..`PO-S5`, `PO-S16`, `static-console`)
         run: cargo xtask kani --crate bamabi_native_rt --timeout 600
 
   benchmarks:

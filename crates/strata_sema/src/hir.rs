@@ -18,6 +18,158 @@ pub struct SemVerInfo {
     pub patch: u32,
 }
 
+/// Network authority ownership classification (`@authority(...)` / `@predicted`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum AuthorityKind {
+    /// No explicit authority annotation.
+    #[default]
+    Unspecified,
+    /// Server-authoritative (`@authority(server)`).
+    Server,
+    /// Client-authoritative (`@authority(client)`).
+    Client,
+    /// Client-predicted (`@authority(predicted)` or `@predicted`).
+    Predicted,
+    /// Shared authority (`@authority(shared)`).
+    Shared,
+}
+
+/// Packet delivery reliability mode for `@net(...)` and `@net_rpc(...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum NetReliability {
+    /// Reliable ordered delivery (`reliable`).
+    #[default]
+    Reliable,
+    /// Unreliable datagram delivery (`unreliable`).
+    Unreliable,
+}
+
+/// Direction of an RPC declaration (`@net_rpc(direction = ...)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum NetDirection {
+    /// Sent from client to server (`client_to_server`).
+    #[default]
+    ClientToServer,
+    /// Sent from server to client (`server_to_client`).
+    ServerToClient,
+    /// Sent in either direction (`bidirectional`).
+    Bidirectional,
+}
+
+/// Quantization specification parsed from `@quantize(min = ..., max = ..., bits = ..., step = ...)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HirQuantizeSpec {
+    /// Target field name on the component/RPC (or `"*"` if attached to the component itself).
+    pub field_name: String,
+    /// Minimum representable value (inclusive).
+    pub min: f64,
+    /// Maximum representable value (inclusive).
+    pub max: f64,
+    /// Bit width per scalar lane (`1..=32`).
+    pub bits: u8,
+    /// Optional explicit quantization step (`> 0.0`).
+    pub step: Option<f64>,
+}
+
+/// Network replication configuration parsed from `@net(...)`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct HirNetConfig {
+    /// Delivery reliability (`reliable` / `unreliable`).
+    pub reliability: NetReliability,
+    /// Optional send rate in Hz (`rate = 20Hz`).
+    pub rate_hz: Option<f64>,
+    /// Optional tick interval (`interval = 2`).
+    pub interval_ticks: Option<u32>,
+    /// Transport channel index (`0..=255`).
+    pub channel: u8,
+}
+
+/// Metadata parsed from `@net_rpc(...)` on an `rpc` or `sys`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct HirNetRpcMeta {
+    /// RPC direction (`client_to_server`, `server_to_client`, `bidirectional`).
+    pub direction: NetDirection,
+    /// Delivery reliability (`reliable`, `unreliable`).
+    pub reliability: NetReliability,
+    /// Transport channel index (`0..=255`).
+    pub channel: u8,
+}
+
+/// Network replication, authority, and quantization metadata for one component or resource.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct NetComponentMeta {
+    /// Canonical namespaced item name (`"mod::Comp"`).
+    pub canonical_name: String,
+    /// Short item name (`"Comp"`).
+    pub short_name: String,
+    /// `true` for singleton `resource`, `false` for `component`.
+    pub is_resource: bool,
+    /// `true` if `@net(...)` was attached.
+    pub is_replicated: bool,
+    /// `@net(...)` configuration when replicated.
+    pub net_config: Option<HirNetConfig>,
+    /// Explicit `@authority(...)` / `@predicted` classification.
+    pub authority: AuthorityKind,
+    /// `true` when `@predicted` (or `@authority(predicted)`) is active.
+    pub is_predicted: bool,
+    /// `@quantize(...)` specs attached to this component or its fields.
+    pub quantized_fields: Vec<HirQuantizeSpec>,
+}
+
+/// Analyzed `rpc` declaration with solved ABI payload layout and wire identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HirRpc {
+    /// Canonical namespaced RPC name (`"mod::MoveInput"`).
+    pub canonical_name: String,
+    /// Short RPC name (`"MoveInput"`).
+    pub name: String,
+    /// RPC direction (`client_to_server`, `server_to_client`, `bidirectional`).
+    pub direction: NetDirection,
+    /// Delivery reliability (`reliable`, `unreliable`).
+    pub reliability: NetReliability,
+    /// Transport channel index (`0..=255`).
+    pub channel: u8,
+    /// Explicit authority annotation if present.
+    pub authority: AuthorityKind,
+    /// Optional `@node_group("...")` label.
+    pub node_group: Option<String>,
+    /// `true` for marker RPCs (`rpc Ping;`).
+    pub is_marker: bool,
+    /// Ordered payload fields `(name, ty)`.
+    pub fields: Vec<(String, Ty)>,
+    /// `@quantize(...)` specs attached to RPC fields.
+    pub quantized_fields: Vec<HirQuantizeSpec>,
+    /// Solved `#[repr(C)]` ABI layout and schema fingerprint for the RPC payload.
+    pub payload_layout: SolvedLayout,
+    /// Deterministic 64-bit FNV-1a RPC identifier.
+    pub rpc_id: u64,
+}
+
+/// Analyzed `net_sim_test` headless virtual-network test block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HirNetSimTest {
+    /// Test case name.
+    pub name: String,
+    /// Simulated one-way latency in milliseconds (`>= 0.0`).
+    pub latency_ms: f64,
+    /// Simulated jitter in milliseconds (`>= 0.0`).
+    pub jitter_ms: f64,
+    /// Packet drop probability in `0.0..=1.0`.
+    pub loss: f64,
+    /// Deterministic PRNG seed.
+    pub seed: u64,
+    /// Number of simulated clients (`>= 1`).
+    pub clients: u32,
+    /// Optional `@node_group("...")` label.
+    pub node_group: Option<String>,
+    /// Lowered parameter expressions `(key, expr)`.
+    pub params: Vec<(String, HirExpr)>,
+    /// Lowered test body statements.
+    pub body: Vec<HirStmt>,
+    /// Raw test body source text.
+    pub body_source: String,
+}
+
 /// Binary arithmetic, bitwise, comparison, logical, or range operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HirBinOp {
@@ -171,6 +323,9 @@ pub struct HirQuery {
     pub allow_filters: Vec<String>,
     /// `.has<T>()` presence indicators.
     pub has_filters: Vec<String>,
+    /// `.changed()` / `.changed<T>()` change-detection filters.
+    #[serde(default)]
+    pub changed_filters: Vec<String>,
     /// Optional `.where(predicate)` row filter expression.
     pub where_pred: Option<Box<HirExpr>>,
     /// Optional `.on(target)` entity/object expression for `query_one(...)`.
@@ -258,15 +413,20 @@ pub enum HirLValue {
         /// Element type.
         ty: Ty,
     },
-    /// Direct singleton resource access expression (`res_mut<PadInput>()`).
+    /// Direct singleton resource access expression (`res_mut<PadInput>()`, `client_res<R>(id)`).
     ResourceAccess {
         /// Resource name.
         resource: String,
-        /// `true` for `res_mut<R>()`, `false` for `res<R>()`.
+        /// `true` for `res_mut<R>()`, `server_res<R>()`, `client_res<R>(id)`; `false` for `res<R>()`.
         is_mut: bool,
+        /// Optional client world index expression for `client_res<R>(id)`.
+        #[serde(default)]
+        client_id: Option<Box<HirExpr>>,
         /// Resolved resource type.
         ty: Ty,
     },
+    /// Arbitrary expression evaluated as an assignment target base (e.g., `{ let x = arr[0]; x }.h.hp = 0.0`).
+    Expr(Box<HirExpr>),
 }
 
 impl HirLValue {
@@ -278,6 +438,40 @@ impl HirLValue {
             | Self::Field { ty, .. }
             | Self::Index { ty, .. }
             | Self::ResourceAccess { ty, .. } => ty,
+            Self::Expr(e) => match e.as_ref() {
+                HirExpr::IntLit { ty, .. }
+                | HirExpr::FloatLit { ty, .. }
+                | HirExpr::Path { ty, .. }
+                | HirExpr::Unary { ty, .. }
+                | HirExpr::Binary { ty, .. }
+                | HirExpr::Field { ty, .. }
+                | HirExpr::Index { ty, .. }
+                | HirExpr::StructLit { ty, .. }
+                | HirExpr::RecordLit { ty, .. }
+                | HirExpr::ArrayLit { ty, .. }
+                | HirExpr::Tuple { ty, .. }
+                | HirExpr::Block { ty, .. }
+                | HirExpr::If { ty, .. } => ty,
+                HirExpr::BoolLit(_) => &Ty::Bool,
+                HirExpr::StringLit(_) => &Ty::InlineStr(64),
+                HirExpr::CharLit(_) => &Ty::U8,
+                HirExpr::Cast { target_ty, .. } => target_ty,
+                HirExpr::Call(c) => &c.ty,
+                HirExpr::Match(m) => &m.ty,
+                HirExpr::For(f) => &f.ty,
+                HirExpr::Query(q) => {
+                    if q.is_count {
+                        &Ty::U32
+                    } else {
+                        &Ty::Unknown
+                    }
+                }
+                HirExpr::Spawn(_)
+                | HirExpr::BundleLit { .. }
+                | HirExpr::DespawnAll { .. }
+                | HirExpr::Insert { .. }
+                | HirExpr::Remove { .. } => &Ty::Unit,
+            },
         }
     }
 }
@@ -606,7 +800,28 @@ impl HirExpr {
                 if q.is_count {
                     Ty::U32
                 } else {
-                    Ty::Unknown
+                    let terms = q
+                        .terms
+                        .iter()
+                        .map(|t| crate::types::QueryRowTerm {
+                            alias: t.alias.clone(),
+                            storage_key: t.storage_key.clone(),
+                            canonical_component: t.canonical_component.clone(),
+                            field_name: t.field_name.clone(),
+                            mode: t.mode,
+                            ty: if t.storage_key == "Entity" && t.field_name.is_none() {
+                                Ty::Ref("Entity".to_owned())
+                            } else {
+                                Ty::Named(t.storage_key.clone())
+                            },
+                        })
+                        .collect();
+                    let row = Ty::QueryRow(terms);
+                    if q.is_point_lookup && !q.is_unwrap {
+                        Ty::Option(Box::new(row))
+                    } else {
+                        row
+                    }
                 }
             }
             Self::Spawn(_)
@@ -685,10 +900,10 @@ pub enum HirStmt {
     },
     /// `require_true(cond);` assertion inside `atomic`.
     RequireTrue(HirExpr),
-    /// `trigger(target, event)` (`Slots 37/42`).
+    /// `trigger(event)` or `trigger(target, event)` (`Slots 37/42`).
     Trigger {
-        /// Target entity or `self`.
-        target: Box<HirExpr>,
+        /// Optional target entity or `self` (`None` for global event triggers).
+        target: Option<Box<HirExpr>>,
         /// Event payload struct literal or expression.
         event: Box<HirExpr>,
         /// Propagation flag (`Slot 42`).
@@ -774,8 +989,32 @@ pub struct HirRelation {
     pub payload_layout: Option<SolvedLayout>,
 }
 
+fn default_spatial_cell_size() -> f32 {
+    4.0
+}
+
+fn default_spatial_bounds_min() -> [f32; 2] {
+    [-128.0, -128.0]
+}
+
+fn default_spatial_bounds_max() -> [f32; 2] {
+    [128.0, 128.0]
+}
+
+fn default_spatial_capacity() -> u32 {
+    512
+}
+
+fn default_spatial_dim() -> u32 {
+    64
+}
+
+fn default_spatial_plane_axes() -> [u8; 2] {
+    [0, 1]
+}
+
 /// Analyzed `spatial_grid` or `spatial_history` declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HirSpatialIndex {
     /// Index identifier.
     pub name: String,
@@ -791,6 +1030,27 @@ pub struct HirSpatialIndex {
     pub cached_components: Vec<String>,
     /// Synthesized backing resource layout.
     pub resource_layout: SolvedLayout,
+    /// Grid cell width in meters (`default = 4.0`).
+    #[serde(default = "default_spatial_cell_size")]
+    pub cell_size: f32,
+    /// Minimum 2D grid bounds `[min_x, min_y]` (`default = [-128.0, -128.0]`).
+    #[serde(default = "default_spatial_bounds_min")]
+    pub bounds_min: [f32; 2],
+    /// Maximum 2D grid bounds `[max_x, max_y]` (`default = [128.0, 128.0]`).
+    #[serde(default = "default_spatial_bounds_max")]
+    pub bounds_max: [f32; 2],
+    /// Maximum tracked entities per frame (`default = 512`).
+    #[serde(default = "default_spatial_capacity")]
+    pub capacity: u32,
+    /// Derived CSR grid column count (`1..=256`).
+    #[serde(default = "default_spatial_dim")]
+    pub cols: u32,
+    /// Derived CSR grid row count (`1..=256`).
+    #[serde(default = "default_spatial_dim")]
+    pub rows: u32,
+    /// Component position axes projected onto the 2D grid (`[0, 1]` for XY, `[0, 2]` for XZ).
+    #[serde(default = "default_spatial_plane_axes")]
+    pub plane_axes: [u8; 2],
 }
 
 /// Analyzed `timeline` window interval and event trigger edge.
@@ -944,6 +1204,18 @@ pub struct HirCallable {
     pub body_source: String,
     /// Raw CST byte range `(start, end)` of the callable.
     pub byte_range: (u32, u32),
+    /// Explicit `@authority(...)` / `@predicted` classification.
+    #[serde(default)]
+    pub authority: AuthorityKind,
+    /// `true` when `@predicted` (or `@authority(predicted)`) is present.
+    #[serde(default)]
+    pub is_predicted: bool,
+    /// Optional `@node_group("...")` label.
+    #[serde(default)]
+    pub node_group: Option<String>,
+    /// Optional `@net_rpc(...)` metadata.
+    #[serde(default)]
+    pub net_rpc: Option<HirNetRpcMeta>,
 }
 
 /// Analyzed top-level `fn` helper function.
@@ -963,6 +1235,12 @@ pub struct HirFn {
     pub tail: Option<HirExpr>,
     /// Raw CST byte range `(start, end)`.
     pub byte_range: (u32, u32),
+    /// `true` when `@node_pure` is attached.
+    #[serde(default)]
+    pub is_node_pure: bool,
+    /// Optional `@node_group("...")` label.
+    #[serde(default)]
+    pub node_group: Option<String>,
 }
 
 /// Analyzed `schedule` tree node.
@@ -1087,6 +1365,27 @@ pub struct AnalyzedModule {
     pub concurrency_graph: ConcurrencyGraph,
     /// All semantic errors and warnings accumulated across every pass.
     pub diagnostics: Vec<Diagnostic>,
+    /// Declared `rpc` items.
+    #[serde(default)]
+    pub rpcs: Vec<HirRpc>,
+    /// Declared `net_sim_test` blocks.
+    #[serde(default)]
+    pub net_sim_tests: Vec<HirNetSimTest>,
+    /// Network replication, authority, and quantization metadata per component/resource.
+    #[serde(default)]
+    pub net_components: Vec<NetComponentMeta>,
+    /// Deterministic module-level network schema fingerprint (invariant to `@node_group` & bodies).
+    #[serde(default)]
+    pub net_schema_fingerprint: u64,
+    /// Visual node group labels keyed by canonical symbol path (`"mod::Sym"`).
+    #[serde(default)]
+    pub node_groups: IndexMap<String, String>,
+    /// Names of `@node_pure` functions.
+    #[serde(default)]
+    pub pure_fns: Vec<String>,
+    /// Authority classifications keyed by canonical or short item name.
+    #[serde(default)]
+    pub authorities: IndexMap<String, AuthorityKind>,
 }
 
 impl AnalyzedModule {

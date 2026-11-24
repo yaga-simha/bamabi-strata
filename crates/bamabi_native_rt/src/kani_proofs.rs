@@ -193,3 +193,60 @@ fn po_s5_dirty_run_coalescer_exact_oracle_parity() {
     assert_eq!(coalescer.pending_run(), None);
     assert_eq!(flushed_mask, oracle_mask);
 }
+
+/// PO-S16: `Fixed64` Q32.32 `i128` preshifted division is total (zero divisor returns `Fixed64(0)`),
+/// handles `i64::MIN` / negative operands without overflow, and matches portable 96-by-64 unsigned
+/// restoring division bit-for-bit.
+#[kani::proof]
+#[kani::unwind(66)]
+fn po_s16_fixed64_preshifted_division_parity_and_totality() {
+    // 1. Unconstrained 64-bit totality & exact boundary invariants (including b == 0 and MIN/-1).
+    let a: i64 = kani::any();
+    let b: i64 = kani::any();
+    let q_total = Fixed64(a) / Fixed64(b);
+    if b == 0 {
+        assert_eq!(q_total, Fixed64(0));
+    }
+    if a == 0 {
+        assert_eq!(q_total, Fixed64(0));
+    }
+    if b == (1i64 << 32) {
+        assert_eq!(q_total, Fixed64(a));
+    }
+    if b == -(1i64 << 32) {
+        assert_eq!(q_total, Fixed64(a.wrapping_neg()));
+    }
+
+    // 2. Symbolic negative/positive parity between `i128` preshifted `/` and `div_restoring`.
+    let sa: i8 = kani::any();
+    let sb: i8 = kani::any();
+    let fa = Fixed64(i64::from(sa) << 28);
+    let fb = Fixed64(i64::from(sb) << 26);
+    assert_eq!(fa / fb, fa.div_restoring(fb));
+
+    // 3. Exact `i64::MIN` / `i64::MAX` / `-1` / zero-divisor edge-case parity.
+    assert_eq!(
+        Fixed64(i64::MIN) / Fixed64(-1),
+        const { Fixed64(i64::MIN).div_restoring(Fixed64(-1)) }
+    );
+    assert_eq!(
+        Fixed64(i64::MIN) / Fixed64(i64::MIN),
+        const { Fixed64(i64::MIN).div_restoring(Fixed64(i64::MIN)) }
+    );
+    assert_eq!(
+        Fixed64(i64::MIN) / Fixed64(2),
+        const { Fixed64(i64::MIN).div_restoring(Fixed64(2)) }
+    );
+    assert_eq!(
+        Fixed64(i64::MIN) / Fixed64(0),
+        const { Fixed64(i64::MIN).div_restoring(Fixed64(0)) }
+    );
+    assert_eq!(
+        Fixed64(i64::MAX) / Fixed64(-3),
+        const { Fixed64(i64::MAX).div_restoring(Fixed64(-3)) }
+    );
+    assert_eq!(
+        Fixed64(-1) / Fixed64(-1),
+        const { Fixed64(-1).div_restoring(Fixed64(-1)) }
+    );
+}

@@ -40,6 +40,46 @@ fn lex_block_comment(lex: &mut logos::Lexer<'_, RawToken>) -> bool {
     false
 }
 
+fn lex_prefixed_int_lit(lex: &mut logos::Lexer<'_, RawToken>) {
+    let slice = lex.slice().as_bytes();
+    let is_digit: fn(u8) -> bool = if slice.starts_with(b"0x") {
+        |b| b.is_ascii_hexdigit()
+    } else if slice.starts_with(b"0b") {
+        |b| matches!(b, b'0' | b'1')
+    } else {
+        |b| matches!(b, b'0'..=b'7')
+    };
+
+    let rem = lex.remainder().as_bytes();
+    let mut i = 0usize;
+    while i < rem.len() {
+        if is_digit(rem[i]) || (rem[i] == b'_' && i + 1 < rem.len() && is_digit(rem[i + 1])) {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+
+    for suffix in [
+        &b"_u16"[..],
+        b"_u32",
+        b"_u64",
+        b"_i16",
+        b"_i32",
+        b"_i64",
+        b"_f32",
+        b"_f64",
+        b"_u8",
+        b"_i8",
+    ] {
+        if rem[i..].starts_with(suffix) {
+            i += suffix.len();
+            break;
+        }
+    }
+    lex.bump(i);
+}
+
 #[derive(Logos, Debug, Clone, Copy, PartialEq, Eq)]
 enum RawToken {
     #[regex(r"[ \t\r\n]+")]
@@ -117,6 +157,8 @@ enum RawToken {
     KwAssertPar,
     #[token("sim_test")]
     KwSimTest,
+    #[token("net_sim_test")]
+    KwNetSimTest,
     #[token("let")]
     KwLet,
     #[token("mut")]
@@ -151,13 +193,14 @@ enum RawToken {
     KwSelfUpper,
 
     // --- Literals ---
-    #[regex(r#"([0-9][0-9_]*(\.[0-9][0-9_]*)?([eE][+-]?[0-9][0-9_]*)?)_(sec|ms|hz|frames|rad|deg|meters|mps2|mps|s|m|f)"#)]
+    #[regex(r#"([0-9][0-9_]*(\.[0-9][0-9_]*)?([eE][+-]?[0-9][0-9_]*)?)_?(sec|ms|hz|Hz|frames|rad|deg|meters|mps2|mps|s|m|f)"#)]
     UnitLit,
 
     #[regex(r#"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?(_(f32|f64))?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*(_(f32|f64))?"#)]
     FloatLit,
 
-    #[regex(r#"(0x[0-9a-fA-F][0-9a-fA-F_]*|0b[01][01_]*|0o[0-7][0-7_]*|[0-9][0-9_]*)(_(u8|u16|u32|u64|i8|i16|i32|i64|f32|f64))?"#)]
+    #[regex(r#"0x[0-9a-fA-F]|0b[01]|0o[0-7]"#, lex_prefixed_int_lit)]
+    #[regex(r#"[0-9][0-9_]*(_(u8|u16|u32|u64|i8|i16|i32|i64|f32|f64))?"#)]
     IntLit,
 
     #[regex(r#""([^"\\]|\\.)*""#)]
@@ -307,6 +350,7 @@ impl From<RawToken> for SyntaxKind {
             RawToken::KwAssertLayout => Self::KwAssertLayout,
             RawToken::KwAssertPar => Self::KwAssertPar,
             RawToken::KwSimTest => Self::KwSimTest,
+            RawToken::KwNetSimTest => Self::KwNetSimTest,
             RawToken::KwLet => Self::KwLet,
             RawToken::KwMut => Self::KwMut,
             RawToken::KwIf => Self::KwIf,
@@ -443,6 +487,59 @@ mod tests {
                 (SyntaxKind::Minus, "-"),
                 (SyntaxKind::UnitLit, "9.81_mps2"),
                 (SyntaxKind::FloatLit, "2.5"),
+            ]
+        );
+    }
+
+    /// Verifies underscore-less unit literals, `net_sim_test`, contextual `rpc`, and numeric suffixes.
+    #[test]
+    fn lex_networking_units_and_keywords() {
+        let kinds: Vec<_> = lex("net_sim_test rpc 50ms 10_ms 60Hz 1.5s 42_f32 0x1f 0.05 42")
+            .into_iter()
+            .filter(|t| !t.kind.is_trivia())
+            .map(|t| (t.kind, t.text))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (SyntaxKind::KwNetSimTest, "net_sim_test"),
+                (SyntaxKind::Ident, "rpc"),
+                (SyntaxKind::UnitLit, "50ms"),
+                (SyntaxKind::UnitLit, "10_ms"),
+                (SyntaxKind::UnitLit, "60Hz"),
+                (SyntaxKind::UnitLit, "1.5s"),
+                (SyntaxKind::IntLit, "42_f32"),
+                (SyntaxKind::IntLit, "0x1f"),
+                (SyntaxKind::FloatLit, "0.05"),
+                (SyntaxKind::IntLit, "42"),
+            ]
+        );
+    }
+
+    /// Verifies hex, binary, and octal integer literals keep `_u*`/`_i*`/`_f*` type suffixes attached.
+    #[test]
+    fn lex_non_decimal_integer_suffixes() {
+        let kinds: Vec<_> = lex(
+            "0x2a_u32 0x2A_u64 0b1010_u8 0o77_u16 0x2a_f32 0x10_i64 0b1010_0101_i16 0x1f 42_u32 1_000 1_000ms",
+        )
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .map(|t| (t.kind, t.text))
+        .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (SyntaxKind::IntLit, "0x2a_u32"),
+                (SyntaxKind::IntLit, "0x2A_u64"),
+                (SyntaxKind::IntLit, "0b1010_u8"),
+                (SyntaxKind::IntLit, "0o77_u16"),
+                (SyntaxKind::IntLit, "0x2a_f32"),
+                (SyntaxKind::IntLit, "0x10_i64"),
+                (SyntaxKind::IntLit, "0b1010_0101_i16"),
+                (SyntaxKind::IntLit, "0x1f"),
+                (SyntaxKind::IntLit, "42_u32"),
+                (SyntaxKind::IntLit, "1_000"),
+                (SyntaxKind::UnitLit, "1_000ms"),
             ]
         );
     }

@@ -11,6 +11,7 @@ members = [
     "crates/stratac",
     "crates/strata_docs",
     "benches/strata_bench",
+    "benches/strata_profile",
     "xtask",
 ]
 
@@ -31,7 +32,8 @@ unreachable_pub = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [workspace.lints.clippy]
-undocumented_unsafe_blocks = "warn"
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
 ptr_as_ptr = "warn"
 cast_ptr_alignment = "warn"
 transmute_ptr_to_ptr = "warn"
@@ -78,3 +80,9 @@ serde_json = "1"
 thiserror = "2"
 indexmap = { version = "2", features = ["serde"] }
 stats_alloc = "0.1"
+criterion = "0.8"
+hotpath = { version = "0.32", features = ["criterion-0-8"] }
+
+[profile.profiling]
+inherits = "release"
+debug = true

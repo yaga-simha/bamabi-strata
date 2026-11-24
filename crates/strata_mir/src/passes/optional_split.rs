@@ -33,7 +33,7 @@ pub fn run(func: &mut MirFunction) {
     }
 
     for (qi, ti, storage_key, is_mut) in optional_terms {
-        if split_chunk_loop_if_present(func, qi, &storage_key) {
+        if split_chunk_loop_if_present(func, qi, ti, &storage_key) {
             continue;
         }
         // Fallback for compact single-block CFGs where optional column borrow is synthesized at entry
@@ -41,22 +41,54 @@ pub fn run(func: &mut MirFunction) {
     }
 }
 
-fn split_chunk_loop_if_present(func: &mut MirFunction, qi: u32, storage_key: &str) -> bool {
-    let chunk_label = format!("q{qi}_chunk_body");
-    let row_hdr_label = format!("q{qi}_row_hdr");
-    let chunk_hdr_label = format!("q{qi}_chunk_hdr");
-
-    let Some(chunk_bb_idx) = func.blocks.iter().position(|b| b.label == chunk_label) else {
-        return false;
-    };
-    let Some(row_hdr_idx) = func.blocks.iter().position(|b| b.label == row_hdr_label) else {
-        return false;
-    };
-    let Some(chunk_hdr_idx) = func.blocks.iter().position(|b| b.label == chunk_hdr_label) else {
-        return false;
-    };
-
-    let Some(cond_local) = func.blocks[chunk_bb_idx].stmts.iter().find_map(|s| {
+fn find_chunk_cond_local(
+    stmts: &[MirStmt],
+    qi: u32,
+    ti: u32,
+    storage_key: &str,
+) -> Option<LocalId> {
+    let col_ptr = stmts.iter().find_map(|s| match s.inst {
+        Inst::IterColRead {
+            query_idx,
+            term_idx,
+            ..
+        }
+        | Inst::IterColWrite {
+            query_idx,
+            term_idx,
+            ..
+        }
+        | Inst::IterColWriteUntracked {
+            query_idx,
+            term_idx,
+            ..
+        }
+        | Inst::IterColRowsRead {
+            query_idx,
+            term_idx,
+            ..
+        }
+        | Inst::IterColRowsWrite {
+            query_idx,
+            term_idx,
+            ..
+        } if query_idx == qi && term_idx == ti => s.dst,
+        _ => None,
+    });
+    if let Some(cp) = col_ptr
+        && let Some(cond) = stmts.iter().find_map(|s| {
+            if let Inst::OptionalChunkIsPresent { slice_ptr, .. } = s.inst
+                && slice_ptr == cp
+            {
+                s.dst
+            } else {
+                None
+            }
+        })
+    {
+        return Some(cond);
+    }
+    stmts.iter().find_map(|s| {
         if let Inst::OptionalChunkIsPresent {
             storage_key: ref sk,
             ..
@@ -67,14 +99,55 @@ fn split_chunk_loop_if_present(func: &mut MirFunction, qi: u32, storage_key: &st
         } else {
             None
         }
-    }) else {
+    })
+}
+
+fn split_chunk_loop_if_present(
+    func: &mut MirFunction,
+    qi: u32,
+    ti: u32,
+    storage_key: &str,
+) -> bool {
+    let chunk_label = format!("q{qi}_chunk_body");
+    let chunk_hdr_label = format!("q{qi}_chunk_hdr");
+
+    let Some(chunk_bb_idx) = func.blocks.iter().position(|b| b.label == chunk_label) else {
+        return false;
+    };
+    let Some(chunk_hdr_idx) = func.blocks.iter().position(|b| b.label == chunk_hdr_label) else {
         return false;
     };
 
-    // Collect every block belonging to this query's inner row loop (excluding chunk_hdr & outside)
-    let row_hdr_id = func.blocks[row_hdr_idx].id;
+    let Some(cond_local) =
+        find_chunk_cond_local(&func.blocks[chunk_bb_idx].stmts, qi, ti, storage_key)
+    else {
+        return false;
+    };
+
     let chunk_hdr_id = func.blocks[chunk_hdr_idx].id;
-    let loop_blocks = collect_reachable_until(func, row_hdr_id, chunk_hdr_id);
+    let chunk_exit_id = match func.blocks[chunk_hdr_idx].terminator {
+        Terminator::Branch { else_bb, .. } => Some(else_bb),
+        _ => None,
+    };
+
+    let old_term = func.blocks[chunk_bb_idx].terminator.clone();
+    let (entry_id, present_entry_label) = match old_term {
+        Terminator::Goto(target) if target != chunk_hdr_id && Some(target) != chunk_exit_id => {
+            (target, format!("opt_present_entry_{storage_key}"))
+        }
+        Terminator::Goto(_) | Terminator::Return(_) => return false,
+        other_term => {
+            let dispatch_bb =
+                func.alloc_block(format!("opt_dispatch_t{ti}_{storage_key}"), other_term);
+            (
+                dispatch_bb,
+                format!("opt_present_entry_t{ti}_{storage_key}"),
+            )
+        }
+    };
+
+    // Collect every block belonging to this query's inner row loop (excluding chunk_hdr & chunk_exit)
+    let loop_blocks = collect_reachable_until(func, entry_id, chunk_hdr_id, chunk_exit_id);
     if loop_blocks.is_empty() {
         return false;
     }
@@ -85,52 +158,45 @@ fn split_chunk_loop_if_present(func: &mut MirFunction, qi: u32, storage_key: &st
         let lbl = &mut func.blocks[bid.0 as usize].label;
         *lbl = format!("opt_present_{lbl}");
     }
-    let present_pre = func.alloc_block(
-        format!("opt_present_entry_{storage_key}"),
-        Terminator::Goto(row_hdr_id),
-    );
+    let present_pre = func.alloc_block(present_entry_label, Terminator::Goto(entry_id));
     func.blocks[present_pre.0 as usize].stmts.push(MirStmt {
         dst: Some(cond_local),
         inst: Inst::ConstBool { value: true },
     });
 
-    let old_term = func.blocks[chunk_bb_idx].terminator.clone();
     // Point `chunk_body` terminator to branch on `cond_local`
-    if let Terminator::Goto(_) = old_term {
-        func.blocks[chunk_bb_idx].terminator = Terminator::Branch {
-            cond: cond_local,
-            then_bb: present_pre,
-            else_bb: absent_entry,
-        };
-    } else {
-        let dispatch_bb = func.alloc_block(
-            format!("opt_dispatch_{storage_key}"),
-            Terminator::Branch {
-                cond: cond_local,
-                then_bb: present_pre,
-                else_bb: absent_entry,
-            },
-        );
-        func.blocks[chunk_bb_idx].terminator = Terminator::Goto(dispatch_bb);
-    }
+    func.blocks[chunk_bb_idx].terminator = Terminator::Branch {
+        cond: cond_local,
+        then_bb: present_pre,
+        else_bb: absent_entry,
+    };
     true
 }
 
-fn collect_reachable_until(func: &MirFunction, start: BlockId, stop: BlockId) -> Vec<BlockId> {
+fn collect_reachable_until(
+    func: &MirFunction,
+    start: BlockId,
+    stop: BlockId,
+    stop_alt: Option<BlockId>,
+) -> Vec<BlockId> {
     let mut visited = HashSet::new();
     let mut order = Vec::new();
     let mut queue = VecDeque::new();
+    let is_stop = |b: BlockId| b == stop || stop_alt == Some(b);
+    if is_stop(start) {
+        return order;
+    }
     visited.insert(start);
     queue.push_back(start);
 
     while let Some(bid) = queue.pop_front() {
-        if bid == stop {
+        if is_stop(bid) {
             continue;
         }
         order.push(bid);
         let term = &func.blocks[bid.0 as usize].terminator;
         for succ in terminator_successors(term) {
-            if succ != stop && visited.insert(succ) {
+            if !is_stop(succ) && visited.insert(succ) {
                 queue.push_back(succ);
             }
         }
@@ -326,5 +392,118 @@ mod tests {
             func.blocks[0].terminator,
             Terminator::Branch { .. }
         ));
+    }
+
+    /// Verifies chunk loops with 2+ optional terms split cleanly inside the chunk loop without
+    /// falling back to `split_single_block_optional` on entry block `0`.
+    #[test]
+    fn optional_split_multi_term_chunk_loop_keeps_entry_clean() {
+        let mut func = MirFunction::new("multi_opt_sys", MirFnKind::System);
+        let has_chunk = func.alloc_local("has_chunk", MirType::Bool);
+        let col0 = func.alloc_local("col_a", MirType::Ptr);
+        let pres0 = func.alloc_local("opt_a", MirType::Bool);
+        let col1 = func.alloc_local("col_b", MirType::MutPtr);
+        let pres1 = func.alloc_local("opt_b", MirType::Bool);
+        let row_cond = func.alloc_local("row_cond", MirType::Bool);
+
+        let entry = func.alloc_block("entry", Terminator::Goto(BlockId(1)));
+        let chunk_hdr = func.alloc_block(
+            "q0_chunk_hdr",
+            Terminator::Branch {
+                cond: has_chunk,
+                then_bb: BlockId(2),
+                else_bb: BlockId(5),
+            },
+        );
+        let chunk_body = func.alloc_block("q0_chunk_body", Terminator::Goto(BlockId(3)));
+        let row_hdr = func.alloc_block(
+            "q0_row_hdr",
+            Terminator::Branch {
+                cond: row_cond,
+                then_bb: BlockId(4),
+                else_bb: chunk_hdr,
+            },
+        );
+        let row_body = func.alloc_block("q0_row_body", Terminator::Goto(row_hdr));
+        let _chunk_exit = func.alloc_block("q0_chunk_exit", Terminator::Return(None));
+
+        func.blocks[chunk_hdr.0 as usize].stmts.push(MirStmt {
+            dst: Some(has_chunk),
+            inst: Inst::IterNextChunk { query_idx: 0 },
+        });
+        func.blocks[chunk_body.0 as usize].stmts.extend([
+            MirStmt {
+                dst: Some(col0),
+                inst: Inst::IterColRead {
+                    query_idx: 0,
+                    term_idx: 0,
+                    storage_key: "OptRO".to_owned(),
+                },
+            },
+            MirStmt {
+                dst: Some(pres0),
+                inst: Inst::OptionalChunkIsPresent {
+                    storage_key: "OptRO".to_owned(),
+                    slice_ptr: col0,
+                },
+            },
+            MirStmt {
+                dst: Some(col1),
+                inst: Inst::IterColWrite {
+                    query_idx: 0,
+                    term_idx: 1,
+                    storage_key: "OptRW".to_owned(),
+                },
+            },
+            MirStmt {
+                dst: Some(pres1),
+                inst: Inst::OptionalChunkIsPresent {
+                    storage_key: "OptRW".to_owned(),
+                    slice_ptr: col1,
+                },
+            },
+        ]);
+        func.blocks[row_hdr.0 as usize].stmts.push(MirStmt {
+            dst: Some(row_cond),
+            inst: Inst::ConstBool { value: true },
+        });
+        let _ = (entry, row_body);
+
+        func.queries.push(QueryAccessDesc {
+            terms: vec![
+                QueryTerm {
+                    storage_key: "OptRO".to_owned(),
+                    field_name: None,
+                    mode: TermAccessMode::OptionalRead,
+                    byte_start: 0,
+                    byte_end: 0,
+                },
+                QueryTerm {
+                    storage_key: "OptRW".to_owned(),
+                    field_name: None,
+                    mode: TermAccessMode::OptionalWrite,
+                    byte_start: 0,
+                    byte_end: 0,
+                },
+            ],
+            ..Default::default()
+        });
+
+        run(&mut func);
+
+        // Entry block 0 must remain untouched (no fallback IterCol*/OptionalChunkIsPresent in block 0).
+        assert!(func.blocks[0].stmts.is_empty());
+        assert!(matches!(func.blocks[0].terminator, Terminator::Goto(_)));
+        // q0_chunk_body must branch on `pres1`, with 4 specialized `row_hdr` leaves total.
+        assert!(matches!(
+            func.blocks[chunk_body.0 as usize].terminator,
+            Terminator::Branch { cond, .. } if cond == pres1
+        ));
+        let row_hdr_count = func
+            .blocks
+            .iter()
+            .filter(|b| b.label.ends_with("q0_row_hdr"))
+            .count();
+        assert_eq!(row_hdr_count, 4, "expected 4 specialized row_hdr copies");
     }
 }

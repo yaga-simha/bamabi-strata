@@ -3,14 +3,15 @@
 
 use bamabi_sys::{
     ABI_VERSION, BAM_COMPONENT_KNOWN_FLAGS, BAM_HOST_API_SLOT_COUNT, BAM_OBSERVER_FLAG_PROPAGATE,
-    BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_CLEANUP_REMOVE,
-    BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK,
-    BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK, BAM_SCHEDULE_SET_FLAG_PARALLEL,
-    BAM_SCHEDULE_SET_FLAG_SEQUENCE, BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK,
-    BAM_TRIGGER_FLAG_PROPAGATE, BamComponent, BamEventKind, BamFieldDesc, BamHostApi,
-    BamLayoutInfo, BamManifest, BamObserverDesc, BamQueryDesc, BamRelationDesc, BamScheduleSetDesc,
-    BamSymbol, BamSystem, BamSystemDesc, BamSystemSet, BamTermDesc, BamTriggerDesc, ComponentDesc,
-    FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, StrView, offsets,
+    BAM_QUERY_FLAG_PARAM_SET, BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DESPAWN,
+    BAM_RELATION_FLAG_CLEANUP_REMOVE, BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC,
+    BAM_SCHEDULE_SET_FLAG_AFTER_WEAK, BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK,
+    BAM_SCHEDULE_SET_FLAG_PARALLEL, BAM_SCHEDULE_SET_FLAG_SEQUENCE,
+    BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BAM_TRIGGER_FLAG_PROPAGATE, BamChangeTicks, BamComponent,
+    BamEventKind, BamFieldDesc, BamHostApi, BamLayoutInfo, BamManifest, BamObserverDesc,
+    BamQueryDesc, BamRelationDesc, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemDesc,
+    BamSystemSet, BamTermDesc, BamTriggerDesc, ComponentDesc, FfiEntity, FfiResult, FfiSlice,
+    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, StrView, offsets,
 };
 use core::mem::{offset_of, size_of};
 
@@ -53,6 +54,9 @@ pub const BAM_SYSTEM_SET_INVALID: u32 = BamSystemSet::INVALID.to_raw();
 /// Canonical null `FfiEntity` wire sentinel (`0`).
 pub const FFI_ENTITY_NULL: u64 = FfiEntity::NULL.to_bits();
 
+/// Wire `AccessMode::CHANGED` discriminant (`6`) used for `Changed<T>` query filters with `BamTermDesc::flags = 0`.
+pub const ACCESS_MODE_CHANGED: u32 = bamabi_sys::AccessMode::CHANGED.0;
+
 /// Custom user-defined event kind discriminant (`BamEventKind::CUSTOM`).
 pub const BAM_EVENT_KIND_CUSTOM: u32 = BamEventKind::CUSTOM.0;
 
@@ -79,6 +83,9 @@ pub const OBSERVER_FLAG_PROPAGATE: u32 = BAM_OBSERVER_FLAG_PROPAGATE;
 
 /// Trigger relation-propagation flag (`BAM_TRIGGER_FLAG_PROPAGATE`).
 pub const TRIGGER_FLAG_PROPAGATE: u32 = BAM_TRIGGER_FLAG_PROPAGATE;
+
+/// Query descriptor flag marking membership in a mutually exclusive `ParamSet` group (`BAM_QUERY_FLAG_PARAM_SET`).
+pub const QUERY_FLAG_PARAM_SET: u32 = BAM_QUERY_FLAG_PARAM_SET;
 
 /// Supported component descriptor bitmask (`BAM_COMPONENT_KNOWN_FLAGS`).
 pub const COMPONENT_KNOWN_FLAGS: u32 = BAM_COMPONENT_KNOWN_FLAGS;
@@ -117,6 +124,10 @@ pub const SCHEDULE_SET_FLAG_AFTER_WEAK: u32 = BAM_SCHEDULE_SET_FLAG_AFTER_WEAK;
 pub mod api_slots {
     use super::offsets;
 
+    /// Byte offset of `BamHostApi::get_proc_address` (Slot 0).
+    pub const GET_PROC_ADDRESS: usize = offsets::GET_PROC_ADDRESS;
+    /// Byte offset of `BamHostApi::last_error` (Slot 1).
+    pub const LAST_ERROR: usize = offsets::LAST_ERROR;
     /// Byte offset of `BamHostApi::load_host_ctx` (Slot 2).
     pub const LOAD_HOST_CTX: usize = offsets::LOAD_HOST_CTX;
     /// Byte offset of `BamHostApi::register_component` (Slot 3).
@@ -149,6 +160,8 @@ pub mod api_slots {
     pub const ITER_COLUMN_ROWS_READONLY: usize = offsets::ITER_COLUMN_ROWS_READONLY;
     /// Byte offset of `BamHostApi::iter_column_rows_mutable` (Slot 17).
     pub const ITER_COLUMN_ROWS_MUTABLE: usize = offsets::ITER_COLUMN_ROWS_MUTABLE;
+    /// Byte offset of `BamHostApi::iter_column_info` (Slot 18).
+    pub const ITER_COLUMN_INFO: usize = offsets::ITER_COLUMN_INFO;
     /// Byte offset of `BamHostApi::res_ptr` (Slot 19).
     pub const RES_PTR: usize = offsets::RES_PTR;
     /// Byte offset of `BamHostApi::res_mut_ptr` (Slot 20).
@@ -171,8 +184,14 @@ pub mod api_slots {
     pub const SYS_ENTITY_GET: usize = offsets::SYS_ENTITY_GET;
     /// Byte offset of `BamHostApi::sys_entity_get_mut` (Slot 29).
     pub const SYS_ENTITY_GET_MUT: usize = offsets::SYS_ENTITY_GET_MUT;
+    /// Byte offset of `BamHostApi::msg_read_batch` (Slot 30).
+    pub const MSG_READ_BATCH: usize = offsets::MSG_READ_BATCH;
     /// Byte offset of `BamHostApi::msg_send` (Slot 31).
     pub const MSG_SEND: usize = offsets::MSG_SEND;
+    /// Byte offset of `BamHostApi::msg_write_batch` (Slot 32).
+    pub const MSG_WRITE_BATCH: usize = offsets::MSG_WRITE_BATCH;
+    /// Byte offset of `BamHostApi::res_ticks` (Slot 33).
+    pub const RES_TICKS: usize = offsets::RES_TICKS;
     /// Byte offset of `BamHostApi::sys_res_ptr` (Slot 34).
     pub const SYS_RES_PTR: usize = offsets::SYS_RES_PTR;
     /// Byte offset of `BamHostApi::sys_res_mut_ptr` (Slot 35).
@@ -191,6 +210,24 @@ pub mod api_slots {
     pub const CMD_INSERT_IF_NEW: usize = offsets::CMD_INSERT_IF_NEW;
     /// Byte offset of `BamHostApi::cmd_trigger_ex` (Slot 42).
     pub const CMD_TRIGGER_EX: usize = offsets::CMD_TRIGGER_EX;
+    /// Byte offset of `BamHostApi::cmd_observe` (Slot 43).
+    pub const CMD_OBSERVE: usize = offsets::CMD_OBSERVE;
+    /// Byte offset of `BamHostApi::iter_read_removed` (Slot 44).
+    pub const ITER_READ_REMOVED: usize = offsets::ITER_READ_REMOVED;
+    /// Byte offset of `BamHostApi::sys_entity_children` (Slot 45).
+    pub const SYS_ENTITY_CHILDREN: usize = offsets::SYS_ENTITY_CHILDREN;
+    /// Byte offset of `BamHostApi::asset_load` (Slot 46).
+    pub const ASSET_LOAD: usize = offsets::ASSET_LOAD;
+    /// Byte offset of `BamHostApi::asset_get_load_state` (Slot 47).
+    pub const ASSET_GET_LOAD_STATE: usize = offsets::ASSET_GET_LOAD_STATE;
+    /// Byte offset of `BamHostApi::asset_release` (Slot 48).
+    pub const ASSET_RELEASE: usize = offsets::ASSET_RELEASE;
+    /// Byte offset of `BamHostApi::cmd_spawn_scene` (Slot 49).
+    pub const CMD_SPAWN_SCENE: usize = offsets::CMD_SPAWN_SCENE;
+    /// Byte offset of `BamHostApi::log_diagnostic` (Slot 50).
+    pub const LOG_DIAGNOSTIC: usize = offsets::LOG_DIAGNOSTIC;
+    /// Byte offset of `BamHostApi::report_guest_fault` (Slot 51).
+    pub const REPORT_GUEST_FAULT: usize = offsets::REPORT_GUEST_FAULT;
     /// Byte offset of `BamHostApi::resolve_component_by_uuid` (Slot 52).
     pub const RESOLVE_COMPONENT_BY_UUID: usize = offsets::RESOLVE_COMPONENT_BY_UUID;
     /// Byte offset of `BamHostApi::component_layout_info` (Slot 53).
@@ -223,6 +260,16 @@ pub mod api_slots {
     pub const CMD_REMOVE_RELATION: usize = offsets::CMD_REMOVE_RELATION;
     /// Byte offset of `BamHostApi::migrate_component_column` (Slot 67).
     pub const MIGRATE_COMPONENT_COLUMN: usize = offsets::MIGRATE_COMPONENT_COLUMN;
+    /// Byte offset of `BamHostApi::iter_next_chunk_batch` (Slot 68).
+    pub const ITER_NEXT_CHUNK_BATCH: usize = offsets::ITER_NEXT_CHUNK_BATCH;
+    /// Byte offset of `BamHostApi::iter_column_ticks` (Slot 69).
+    pub const ITER_COLUMN_TICKS: usize = offsets::ITER_COLUMN_TICKS;
+    /// Byte offset of `BamHostApi::cmd_clone_entity` (Slot 70).
+    pub const CMD_CLONE_ENTITY: usize = offsets::CMD_CLONE_ENTITY;
+    /// Byte offset of `BamHostApi::cmd_insert_resource` (Slot 71).
+    pub const CMD_INSERT_RESOURCE: usize = offsets::CMD_INSERT_RESOURCE;
+    /// Byte offset of `BamHostApi::cmd_remove_resource` (Slot 72).
+    pub const CMD_REMOVE_RESOURCE: usize = offsets::CMD_REMOVE_RESOURCE;
 }
 
 /// Programmatic `core::mem::{size_of, offset_of}` descriptor layouts matching `bamabi_sys`.
@@ -323,6 +370,10 @@ pub mod structs {
     pub const QUERY_TERMS: usize = offset_of!(BamQueryDesc, terms);
     /// Field offset of `BamQueryDesc::term_count`.
     pub const QUERY_TERM_COUNT: usize = offset_of!(BamQueryDesc, term_count);
+    /// Field offset of `BamQueryDesc::param_set_group`.
+    pub const QUERY_PARAM_SET_GROUP: usize = offset_of!(BamQueryDesc, param_set_group);
+    /// Field offset of `BamQueryDesc::reserved0`.
+    pub const QUERY_RESERVED0: usize = offset_of!(BamQueryDesc, reserved0);
 
     /// Total byte size of `BamSystemDesc`.
     pub const SYSTEM_DESC_SIZE: usize = size_of::<BamSystemDesc>();
@@ -405,6 +456,12 @@ pub mod structs {
         offset_of!(BamObserverDesc, propagate_relationship);
     /// Field offset of `BamObserverDesc::reserved2`.
     pub const OBS_RESERVED2: usize = offset_of!(BamObserverDesc, reserved2);
+    /// Field offset of `BamObserverDesc::ctx_callback`.
+    pub const OBS_CTX_CALLBACK: usize = offset_of!(BamObserverDesc, ctx_callback);
+    /// Field offset of `BamObserverDesc::queries`.
+    pub const OBS_QUERIES: usize = offset_of!(BamObserverDesc, queries);
+    /// Field offset of `BamObserverDesc::query_count`.
+    pub const OBS_QUERY_COUNT: usize = offset_of!(BamObserverDesc, query_count);
 
     /// Total byte size of `BamTriggerDesc`.
     pub const TRIGGER_DESC_SIZE: usize = size_of::<BamTriggerDesc>();
@@ -494,6 +551,17 @@ pub mod structs {
     /// Field offset of `BamLayoutInfo::field_count`.
     pub const LINFO_FIELD_COUNT: usize = offset_of!(BamLayoutInfo, field_count);
 
+    /// Total byte size of `BamChangeTicks` (`16`).
+    pub const CHANGE_TICKS_SIZE: usize = size_of::<BamChangeTicks>();
+    /// Field offset of `BamChangeTicks::added`.
+    pub const CHANGE_TICKS_ADDED: usize = offset_of!(BamChangeTicks, added);
+    /// Field offset of `BamChangeTicks::changed`.
+    pub const CHANGE_TICKS_CHANGED: usize = offset_of!(BamChangeTicks, changed);
+    /// Field offset of `BamChangeTicks::last_run`.
+    pub const CHANGE_TICKS_LAST_RUN: usize = offset_of!(BamChangeTicks, last_run);
+    /// Field offset of `BamChangeTicks::this_run`.
+    pub const CHANGE_TICKS_THIS_RUN: usize = offset_of!(BamChangeTicks, this_run);
+
     /// Byte size of an opaque `BamComponent` handle (`4`).
     pub const BAM_COMPONENT_SIZE: usize = size_of::<BamComponent>();
     /// Byte size of an opaque `BamSystem` handle (`4`).
@@ -510,6 +578,8 @@ pub mod structs {
 #[must_use]
 pub const fn all_exposed_api_slots() -> &'static [usize] {
     &[
+        api_slots::GET_PROC_ADDRESS,
+        api_slots::LAST_ERROR,
         api_slots::LOAD_HOST_CTX,
         api_slots::REGISTER_COMPONENT,
         api_slots::RESOLVE_COMPONENT,
@@ -526,6 +596,7 @@ pub const fn all_exposed_api_slots() -> &'static [usize] {
         api_slots::ITER_MARK_CHANGED_RANGE,
         api_slots::ITER_COLUMN_ROWS_READONLY,
         api_slots::ITER_COLUMN_ROWS_MUTABLE,
+        api_slots::ITER_COLUMN_INFO,
         api_slots::RES_PTR,
         api_slots::RES_MUT_PTR,
         api_slots::CMD_SPAWN_EMPTY,
@@ -537,7 +608,10 @@ pub const fn all_exposed_api_slots() -> &'static [usize] {
         api_slots::PAR_FOR_EACH_CHUNK,
         api_slots::SYS_ENTITY_GET,
         api_slots::SYS_ENTITY_GET_MUT,
+        api_slots::MSG_READ_BATCH,
         api_slots::MSG_SEND,
+        api_slots::MSG_WRITE_BATCH,
+        api_slots::RES_TICKS,
         api_slots::SYS_RES_PTR,
         api_slots::SYS_RES_MUT_PTR,
         api_slots::REGISTER_OBSERVER,
@@ -547,6 +621,15 @@ pub const fn all_exposed_api_slots() -> &'static [usize] {
         api_slots::CMD_DESPAWN_ALL,
         api_slots::CMD_INSERT_IF_NEW,
         api_slots::CMD_TRIGGER_EX,
+        api_slots::CMD_OBSERVE,
+        api_slots::ITER_READ_REMOVED,
+        api_slots::SYS_ENTITY_CHILDREN,
+        api_slots::ASSET_LOAD,
+        api_slots::ASSET_GET_LOAD_STATE,
+        api_slots::ASSET_RELEASE,
+        api_slots::CMD_SPAWN_SCENE,
+        api_slots::LOG_DIAGNOSTIC,
+        api_slots::REPORT_GUEST_FAULT,
         api_slots::RESOLVE_COMPONENT_BY_UUID,
         api_slots::COMPONENT_LAYOUT_INFO,
         api_slots::REGISTER_RELATION,
@@ -563,6 +646,11 @@ pub const fn all_exposed_api_slots() -> &'static [usize] {
         api_slots::CMD_INSERT_RELATION,
         api_slots::CMD_REMOVE_RELATION,
         api_slots::MIGRATE_COMPONENT_COLUMN,
+        api_slots::ITER_NEXT_CHUNK_BATCH,
+        api_slots::ITER_COLUMN_TICKS,
+        api_slots::CMD_CLONE_ENTITY,
+        api_slots::CMD_INSERT_RESOURCE,
+        api_slots::CMD_REMOVE_RESOURCE,
     ]
 }
 
@@ -575,7 +663,45 @@ mod tests {
     fn host_api_slot_offsets_are_aligned_and_in_bounds() {
         let ptr_sz = size_of::<usize>();
         let slots = all_exposed_api_slots();
-        assert!(slots.len() <= HOST_API_SLOTS);
+        assert_eq!(HOST_API_SLOTS, BAM_HOST_API_SLOT_COUNT);
+        const {
+            assert!(HOST_API_SLOTS == 73);
+        }
+        assert_eq!(slots.len(), HOST_API_SLOTS);
+        assert_eq!(api_slots::GET_PROC_ADDRESS, offsets::GET_PROC_ADDRESS);
+        assert_eq!(api_slots::LAST_ERROR, offsets::LAST_ERROR);
+        assert_eq!(api_slots::ITER_COLUMN_INFO, offsets::ITER_COLUMN_INFO);
+        assert_eq!(api_slots::RES_TICKS, offsets::RES_TICKS);
+        assert_eq!(api_slots::CMD_OBSERVE, offsets::CMD_OBSERVE);
+        assert_eq!(api_slots::ITER_READ_REMOVED, offsets::ITER_READ_REMOVED);
+        assert_eq!(api_slots::SYS_ENTITY_CHILDREN, offsets::SYS_ENTITY_CHILDREN);
+        assert_eq!(api_slots::ASSET_LOAD, offsets::ASSET_LOAD);
+        assert_eq!(
+            api_slots::ASSET_GET_LOAD_STATE,
+            offsets::ASSET_GET_LOAD_STATE
+        );
+        assert_eq!(api_slots::ASSET_RELEASE, offsets::ASSET_RELEASE);
+        assert_eq!(api_slots::CMD_SPAWN_SCENE, offsets::CMD_SPAWN_SCENE);
+        assert_eq!(api_slots::LOG_DIAGNOSTIC, offsets::LOG_DIAGNOSTIC);
+        assert_eq!(api_slots::REPORT_GUEST_FAULT, offsets::REPORT_GUEST_FAULT);
+        assert_eq!(api_slots::ITER_UP_CASCADE, offsets::ITER_UP_CASCADE);
+        assert_eq!(api_slots::CMD_CHECKPOINT, offsets::CMD_CHECKPOINT);
+        assert_eq!(api_slots::CMD_ROLLBACK, offsets::CMD_ROLLBACK);
+        assert_eq!(
+            api_slots::ITER_NEXT_CHUNK_BATCH,
+            offsets::ITER_NEXT_CHUNK_BATCH
+        );
+        assert_eq!(api_slots::ITER_COLUMN_TICKS, offsets::ITER_COLUMN_TICKS);
+        assert_eq!(api_slots::CMD_CLONE_ENTITY, offsets::CMD_CLONE_ENTITY);
+        assert_eq!(api_slots::CMD_INSERT_RESOURCE, offsets::CMD_INSERT_RESOURCE);
+        assert_eq!(api_slots::CMD_REMOVE_RESOURCE, offsets::CMD_REMOVE_RESOURCE);
+        assert!(slots.contains(&api_slots::MSG_READ_BATCH));
+        assert!(slots.contains(&api_slots::MSG_SEND));
+        assert!(slots.contains(&api_slots::MSG_WRITE_BATCH));
+        assert_eq!(api_slots::MSG_READ_BATCH, offsets::MSG_READ_BATCH);
+        assert_eq!(api_slots::MSG_WRITE_BATCH, offsets::MSG_WRITE_BATCH);
+        assert_eq!(ACCESS_MODE_CHANGED, bamabi_sys::AccessMode::CHANGED.0);
+        assert_eq!(QUERY_FLAG_PARAM_SET, bamabi_sys::BAM_QUERY_FLAG_PARAM_SET);
         for (i, &off) in slots.iter().enumerate() {
             assert_eq!(
                 off % ptr_sz,
@@ -613,6 +739,7 @@ mod tests {
             size_of::<BamScheduleSetDesc>()
         );
         assert_eq!(structs::LAYOUT_INFO_SIZE, size_of::<BamLayoutInfo>());
+        assert_eq!(structs::CHANGE_TICKS_SIZE, size_of::<BamChangeTicks>());
         assert_eq!(structs::STRVIEW_SIZE, size_of::<StrView>());
         assert_eq!(structs::FFI_SLICE_SIZE, size_of::<FfiSlice<u8>>());
         assert_eq!(structs::FFI_ENTITY_SIZE, size_of::<FfiEntity>());
@@ -625,8 +752,9 @@ mod tests {
         );
         assert!(structs::TERM_RESERVED0 + size_of::<u8>() <= structs::TERM_DESC_SIZE);
         assert!(structs::QUERY_TERM_COUNT + size_of::<usize>() <= structs::QUERY_DESC_SIZE);
+        assert!(structs::QUERY_PARAM_SET_GROUP + size_of::<u32>() <= structs::QUERY_DESC_SIZE);
         assert!(structs::SYS_BEFORE_WEAK_COUNT + size_of::<usize>() <= structs::SYSTEM_DESC_SIZE);
-        assert!(structs::OBS_RESERVED2 + size_of::<u32>() <= structs::OBSERVER_DESC_SIZE);
+        assert!(structs::OBS_QUERY_COUNT + size_of::<usize>() <= structs::OBSERVER_DESC_SIZE);
         assert!(structs::TRG_RESERVED0 + size_of::<u32>() <= structs::TRIGGER_DESC_SIZE);
         assert!(structs::REL_RESERVED0 + size_of::<u32>() <= structs::RELATION_DESC_SIZE);
         assert!(
@@ -634,5 +762,6 @@ mod tests {
                 <= structs::SCHEDULE_SET_DESC_SIZE
         );
         assert!(structs::LINFO_FIELD_COUNT + size_of::<usize>() <= structs::LAYOUT_INFO_SIZE);
+        assert!(structs::CHANGE_TICKS_THIS_RUN + size_of::<u32>() <= structs::CHANGE_TICKS_SIZE);
     }
 }

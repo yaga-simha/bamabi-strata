@@ -167,6 +167,13 @@ pub fn run(module: &mut MirModule) {
                 row_idx: ridx,
             },
         );
+        b.vars.insert(
+            "self".to_owned(),
+            VarSlot::Imm {
+                local: row_ent,
+                ty: MirType::Entity,
+            },
+        );
         let rptr = b.alloc_and_emit(
             "cursor_ptr",
             MirType::MutPtr,
@@ -349,6 +356,8 @@ pub fn run(module: &mut MirModule) {
     // 2. Stackless `task` -> `__pc` switch state machine + lowered `abort_if` / `wait` / `race`.
     let tasks = module.tasks.clone();
     for task in &tasks {
+        let state_is_sparse = task.is_sparse
+            || (task.state_layout.component_flags & bamabi_sys::BAM_COMPONENT_FLAG_SPARSE_SET) != 0;
         let mut func = MirFunction::new(&task.name, MirFnKind::SynthesizedTask);
         func.is_deterministic = module.is_deterministic;
         func.source_body = task.body_source.clone();
@@ -415,7 +424,7 @@ pub fn run(module: &mut MirModule) {
             canonical_component: task.state_layout.canonical_name.clone(),
             field_name: None,
             mode: TermAccessMode::Write,
-            is_sparse: true,
+            is_sparse: state_is_sparse,
         });
         b.func.queries.push(QueryAccessDesc {
             terms: q_terms,
@@ -507,12 +516,24 @@ pub fn run(module: &mut MirModule) {
             on_cols.push((ti, ot.clone(), cptr));
         }
         let rows_local = b.alloc_and_emit(
-            "task_rows",
+            if state_is_sparse {
+                "task_rows"
+            } else {
+                "task_col"
+            },
             MirType::MutPtr,
-            Inst::IterColRowsWrite {
-                query_idx: 0,
-                term_idx: state_term_idx,
-                storage_key: task.name.clone(),
+            if state_is_sparse {
+                Inst::IterColRowsWrite {
+                    query_idx: 0,
+                    term_idx: state_term_idx,
+                    storage_key: task.name.clone(),
+                }
+            } else {
+                Inst::IterColWrite {
+                    query_idx: 0,
+                    term_idx: state_term_idx,
+                    storage_key: task.name.clone(),
+                }
             },
         );
         let rslot = b.alloc_and_emit(
@@ -554,6 +575,13 @@ pub fn run(module: &mut MirModule) {
                 row_idx: ridx,
             },
         );
+        b.vars.insert(
+            "self".to_owned(),
+            VarSlot::Imm {
+                local: row_ent,
+                ty: MirType::Entity,
+            },
+        );
         for (_ti, ot, cptr) in &on_cols {
             let stride = ctx
                 .find_layout(&ot.canonical_component)
@@ -582,6 +610,7 @@ pub fn run(module: &mut MirModule) {
                         col_ptr: *cptr,
                         row_ptr: Some(rptr),
                         present_local: None,
+                        is_up_cascade: false,
                     },
                 },
             );
@@ -594,7 +623,7 @@ pub fn run(module: &mut MirModule) {
                 col_ptr: rows_local,
                 row_idx: ridx,
                 stride_bytes: task.state_layout.size as u32,
-                is_sparse: true,
+                is_sparse: state_is_sparse,
             },
         );
         // Bind persisted task parameters and live variables from task state struct
@@ -1296,10 +1325,13 @@ fn evaluate_race_branch_trigger(
 mod tests {
     use super::run;
     use crate::ir::*;
+    use crate::verify::verify_mir;
     use indexmap::IndexMap;
     use strata_sema::access::FilteredAccessSet;
-    use strata_sema::hir::{HirExpr, HirFsm, HirFsmState, HirFsmTransition};
-    use strata_sema::layout::{LayoutEnv, SchemaItemKind, solve_pod_layout};
+    use strata_sema::hir::{HirExpr, HirFsm, HirFsmState, HirFsmTransition, HirStmt, HirTask};
+    use strata_sema::layout::{
+        LayoutEnv, SchemaItemKind, solve_pod_layout, solve_task_state_layout,
+    };
 
     /// Verifies FSM synthesis orders transitions by descending explicit priority.
     #[test]
@@ -1394,6 +1426,11 @@ mod tests {
             schedules: Vec::new(),
             sim_tests: Vec::new(),
             field_defaults: IndexMap::new(),
+            rpcs: Vec::new(),
+            net_components: Vec::new(),
+            net_sim_tests: Vec::new(),
+            net_handshake: crate::ir::MirNetHandshake::default(),
+            net_stream_ops: Vec::new(),
         };
         run(&mut module);
         let disp = module.functions[0]
@@ -1407,5 +1444,159 @@ mod tests {
             .expect("FsmDispatch synthesized");
         assert_eq!(disp[0].3, 10);
         assert_eq!(disp[1].3, 1);
+    }
+
+    /// Verifies `task` synthesis uses dense `IterColWrite` + `RowPtr { is_sparse: false }` when
+    /// `@sparse` is absent and `IterColRowsWrite` + `RowPtr { is_sparse: true }` when `@sparse`.
+    #[test]
+    fn task_synthesis_respects_dense_vs_sparse_state_storage() {
+        let env = LayoutEnv::default();
+        let dense_layout = solve_task_state_layout("task_m::DenseTask", &[], false, &env).unwrap();
+        let sparse_layout = solve_task_state_layout("task_m::SparseTask", &[], true, &env).unwrap();
+        assert_eq!(
+            dense_layout.component_flags & bamabi_sys::BAM_COMPONENT_FLAG_SPARSE_SET,
+            0
+        );
+        assert_ne!(
+            sparse_layout.component_flags & bamabi_sys::BAM_COMPONENT_FLAG_SPARSE_SET,
+            0
+        );
+
+        let mut module = MirModule {
+            module_path: "task_m".to_owned(),
+            is_deterministic: false,
+            layouts: vec![dense_layout.clone(), sparse_layout.clone()],
+            enums: Vec::new(),
+            consts: Vec::new(),
+            tables: Vec::new(),
+            curves: Vec::new(),
+            relations: Vec::new(),
+            spatial_indices: Vec::new(),
+            timelines: Vec::new(),
+            tasks: vec![
+                HirTask {
+                    name: "DenseTask".to_owned(),
+                    is_sparse: false,
+                    params: Vec::new(),
+                    typed_params: Vec::new(),
+                    on_terms: Vec::new(),
+                    typed_on_terms: Vec::new(),
+                    using_params: Vec::new(),
+                    typed_using_params: Vec::new(),
+                    live_across_wait: Vec::new(),
+                    state_layout: dense_layout,
+                    access: FilteredAccessSet::default(),
+                    body_source: "yield_tick;".to_owned(),
+                    body: vec![HirStmt::YieldTick],
+                },
+                HirTask {
+                    name: "SparseTask".to_owned(),
+                    is_sparse: true,
+                    params: Vec::new(),
+                    typed_params: Vec::new(),
+                    on_terms: Vec::new(),
+                    typed_on_terms: Vec::new(),
+                    using_params: Vec::new(),
+                    typed_using_params: Vec::new(),
+                    live_across_wait: Vec::new(),
+                    state_layout: sparse_layout,
+                    access: FilteredAccessSet::default(),
+                    body_source: "yield_tick;".to_owned(),
+                    body: vec![HirStmt::YieldTick],
+                },
+            ],
+            fsms: Vec::new(),
+            objects: Vec::new(),
+            migrations: Vec::new(),
+            fns: Vec::new(),
+            functions: Vec::new(),
+            schedules: Vec::new(),
+            sim_tests: Vec::new(),
+            field_defaults: IndexMap::new(),
+            rpcs: Vec::new(),
+            net_components: Vec::new(),
+            net_sim_tests: Vec::new(),
+            net_handshake: crate::ir::MirNetHandshake::default(),
+            net_stream_ops: Vec::new(),
+        };
+
+        run(&mut module);
+        verify_mir(&module).expect("synthesized dense and sparse tasks must verify");
+
+        let dense_fn = module
+            .functions
+            .iter()
+            .find(|f| f.name == "DenseTask")
+            .expect("DenseTask function");
+        assert!(
+            !dense_fn.query_bindings[0].terms[0].is_sparse,
+            "non-@sparse task state binding must have is_sparse == false"
+        );
+        let dense_col_stmt = dense_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .find(|s| matches!(s.inst, Inst::IterColWrite { term_idx: 0, .. }))
+            .expect("non-@sparse task must emit IterColWrite for task state");
+        assert!(
+            !dense_fn
+                .blocks
+                .iter()
+                .flat_map(|b| &b.stmts)
+                .any(|s| matches!(s.inst, Inst::IterColRowsWrite { .. })),
+            "non-@sparse task must not emit IterColRowsWrite"
+        );
+        let dense_col_local = dense_col_stmt.dst.expect("IterColWrite dst");
+        assert!(
+            dense_fn.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+                matches!(
+                    s.inst,
+                    Inst::RowPtr {
+                        col_ptr,
+                        is_sparse: false,
+                        ..
+                    } if col_ptr == dense_col_local
+                )
+            }),
+            "non-@sparse task RowPtr must have is_sparse == false"
+        );
+
+        let sparse_fn = module
+            .functions
+            .iter()
+            .find(|f| f.name == "SparseTask")
+            .expect("SparseTask function");
+        assert!(
+            sparse_fn.query_bindings[0].terms[0].is_sparse,
+            "@sparse task state binding must have is_sparse == true"
+        );
+        let sparse_col_stmt = sparse_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .find(|s| matches!(s.inst, Inst::IterColRowsWrite { term_idx: 0, .. }))
+            .expect("@sparse task must emit IterColRowsWrite for task state");
+        assert!(
+            !sparse_fn
+                .blocks
+                .iter()
+                .flat_map(|b| &b.stmts)
+                .any(|s| matches!(s.inst, Inst::IterColWrite { .. })),
+            "@sparse task must not emit dense IterColWrite"
+        );
+        let sparse_col_local = sparse_col_stmt.dst.expect("IterColRowsWrite dst");
+        assert!(
+            sparse_fn.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+                matches!(
+                    s.inst,
+                    Inst::RowPtr {
+                        col_ptr,
+                        is_sparse: true,
+                        ..
+                    } if col_ptr == sparse_col_local
+                )
+            }),
+            "@sparse task RowPtr must have is_sparse == true"
+        );
     }
 }

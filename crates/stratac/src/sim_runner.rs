@@ -14,6 +14,7 @@ use bamabi_sys::{
 };
 use bevy_app::{App, FixedUpdate, Last, PostStartup, PostUpdate, PreUpdate, Startup, Update};
 use bevy_ecs::entity::Entity;
+use bevy_ecs::schedule::SingleThreadedExecutor;
 use bevy_ecs::world::World;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,7 +40,7 @@ use tempfile::TempDir;
 #[global_allocator]
 static SIM_GLOBAL_ALLOC: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
-static SIM_EXEC_MUTEX: Mutex<()> = Mutex::new(());
+pub(crate) static SIM_EXEC_MUTEX: Mutex<()> = Mutex::new(());
 
 const SIM_CTRL_SHORT_NAME: &str = "__StrataSimCtrl";
 const DISPATCH_RESOURCES_PER_SYS: usize = 8;
@@ -114,7 +115,9 @@ fn is_hashable_entity_pod(entry: &RegisteredComponent) -> bool {
         | BAM_STORAGE_FLAG_MESSAGE
         | BAM_STORAGE_FLAG_EVENT
         | BAM_STORAGE_FLAG_ENTITY_EVENT;
-    entry.is_abi_pod && (entry.storage_flags & non_entity_mask) == 0
+    entry.is_abi_pod
+        && (entry.storage_flags & non_entity_mask) == 0
+        && !entry.name.starts_with("bevy_ecs::")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -238,7 +241,7 @@ pub fn hash_world_pod_state(world: &World) -> WorldPodDigest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DispatchSchedule {
+pub(crate) enum DispatchSchedule {
     PostUpdate,
     PreUpdate,
     Last,
@@ -246,7 +249,7 @@ enum DispatchSchedule {
 }
 
 impl DispatchSchedule {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::PostUpdate => "PostUpdate",
             Self::PreUpdate => "PreUpdate",
@@ -255,7 +258,7 @@ impl DispatchSchedule {
         }
     }
 
-    fn init_on_app(self, app: &mut App) {
+    pub(crate) fn init_on_app(self, app: &mut App) {
         match self {
             Self::PostUpdate => {
                 app.init_schedule(PostUpdate);
@@ -272,7 +275,7 @@ impl DispatchSchedule {
         }
     }
 
-    fn run_on_world(self, world: &mut World) {
+    pub(crate) fn run_on_world(self, world: &mut World) {
         match self {
             Self::PostUpdate => world.run_schedule(PostUpdate),
             Self::PreUpdate => world.run_schedule(PreUpdate),
@@ -283,29 +286,36 @@ impl DispatchSchedule {
 }
 
 #[derive(Debug, Clone)]
-struct ResFieldDispatch {
-    read_op: u32,
-    write_op: u32,
-    mir_ty: MirType,
-    ty: Ty,
+pub(crate) struct ResFieldDispatch {
+    pub(crate) read_op: u32,
+    pub(crate) write_op: u32,
+    pub(crate) mir_ty: MirType,
+    pub(crate) ty: Ty,
 }
 
 #[derive(Debug, Clone)]
-struct DispatchMetadata {
-    schedule: DispatchSchedule,
-    ctrl_layout: Option<SolvedLayout>,
-    res_ops: HashMap<(String, String), ResFieldDispatch>,
-    obj_ops: HashMap<String, u32>,
+pub(crate) struct DispatchMetadata {
+    pub(crate) schedule: DispatchSchedule,
+    pub(crate) ctrl_layout: Option<SolvedLayout>,
+    pub(crate) res_ops: HashMap<(String, String), ResFieldDispatch>,
+    pub(crate) obj_ops: HashMap<String, u32>,
 }
 
 impl DispatchMetadata {
-    fn ctrl_offsets(&self) -> Option<(usize, usize, usize, usize)> {
+    pub(crate) fn ctrl_offsets(&self) -> Option<(usize, usize, usize, usize)> {
         let l = self.ctrl_layout.as_ref()?;
         let op_off = l.fields.iter().find(|f| f.name == "op")?.offset;
         let i64_off = l.fields.iter().find(|f| f.name == "val_i64")?.offset;
         let f64_off = l.fields.iter().find(|f| f.name == "val_f64")?.offset;
         let vec_off = l.fields.iter().find(|f| f.name == "val_vec")?.offset;
         Some((op_off, i64_off, f64_off, vec_off))
+    }
+
+    pub(crate) fn ctrl_int_vec_offsets(&self) -> Option<(usize, usize)> {
+        let l = self.ctrl_layout.as_ref()?;
+        let ivec_off = l.fields.iter().find(|f| f.name == "val_ivec")?.offset;
+        let uvec_off = l.fields.iter().find(|f| f.name == "val_uvec")?.offset;
+        Some((ivec_off, uvec_off))
     }
 }
 
@@ -324,8 +334,11 @@ fn mir_type_for_ty(ty: &Ty, enums: &[EnumDef], module_path: &str) -> Option<MirT
         Ty::F64 => Some(MirType::F64),
         Ty::Fix32 => Some(MirType::Fix32),
         Ty::Fix64 => Some(MirType::Fix64),
-        Ty::Vec2 | Ty::UVec2 | Ty::IVec2 => Some(MirType::Vec2),
-        Ty::Vec3 | Ty::IVec3 => Some(MirType::Vec3),
+        Ty::Vec2 => Some(MirType::Vec2),
+        Ty::UVec2 => Some(MirType::UVec2),
+        Ty::IVec2 => Some(MirType::IVec2),
+        Ty::Vec3 => Some(MirType::Vec3),
+        Ty::IVec3 => Some(MirType::IVec3),
         Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => Some(MirType::Vec4),
         Ty::Ref(n) if n == "Entity" => Some(MirType::Entity),
         Ty::Named(name) => {
@@ -333,9 +346,10 @@ fn mir_type_for_ty(ty: &Ty, enums: &[EnumDef], module_path: &str) -> Option<MirT
             let ed = enums
                 .iter()
                 .find(|e| e.canonical_name == *name || e.canonical_name == qualified)?;
-            match ed.repr_bytes {
-                1 => Some(MirType::U8),
-                2 => Some(MirType::U16),
+            match (ed.repr_bytes, ed.is_signed) {
+                (1, _) => Some(MirType::U8),
+                (2, _) => Some(MirType::U16),
+                (_, true) => Some(MirType::I32),
                 _ => Some(MirType::U32),
             }
         }
@@ -343,7 +357,7 @@ fn mir_type_for_ty(ty: &Ty, enums: &[EnumDef], module_path: &str) -> Option<MirT
     }
 }
 
-fn find_layout_in_slice<'a>(
+pub(crate) fn find_layout_in_slice<'a>(
     layouts: &'a [SolvedLayout],
     module_path: &str,
     key: &str,
@@ -419,6 +433,7 @@ struct ResOpPlan {
     field_path: String,
     byte_offset: u32,
     mir_ty: MirType,
+    ty: Ty,
     read_op: u32,
     write_op: u32,
 }
@@ -449,8 +464,8 @@ fn is_float_like_mir_ty(ty: &MirType) -> bool {
 
 fn vec_dims_for_mir_ty(ty: &MirType) -> Option<u8> {
     match ty {
-        MirType::Vec2 => Some(2),
-        MirType::Vec3 => Some(3),
+        MirType::Vec2 | MirType::IVec2 | MirType::UVec2 => Some(2),
+        MirType::Vec3 | MirType::IVec3 => Some(3),
         MirType::Vec4 => Some(4),
         _ => None,
     }
@@ -658,10 +673,10 @@ fn build_res_dispatch_function(
     name: String,
     is_deterministic: bool,
     ctrl_layout: &SolvedLayout,
-    offsets: (u32, u32, u32, u32),
+    offsets: (u32, u32, u32, u32, u32, u32),
     res_ops: &[ResOpPlan],
 ) -> MirFunction {
-    let (op_off, i64_off, f64_off, vec_off) = offsets;
+    let (op_off, i64_off, f64_off, vec_off, ivec_off, uvec_off) = offsets;
     let mut func = MirFunction::new(name, MirFnKind::System);
     func.is_deterministic = is_deterministic;
     append_ctrl_query_binding(&mut func, ctrl_layout);
@@ -769,8 +784,13 @@ fn build_res_dispatch_function(
                 },
             ]);
         } else if let Some(dims) = vec_dims_for_mir_ty(&plan.mir_ty) {
+            let (ctrl_prefix, ctrl_base_off, lane_ty) = match plan.ty {
+                Ty::IVec2 | Ty::IVec3 => ("val_ivec", ivec_off, MirType::I32),
+                Ty::UVec2 => ("val_uvec", uvec_off, MirType::U32),
+                _ => ("val_vec", vec_off, MirType::F32),
+            };
             for lane in 0..u32::from(dims) {
-                let lv = func.alloc_local(format!("r_lane_{lane}"), MirType::F32);
+                let lv = func.alloc_local(format!("r_lane_{lane}"), lane_ty.clone());
                 func.blocks[read_bb.0 as usize].stmts.extend([
                     MirStmt {
                         dst: Some(lv),
@@ -779,7 +799,7 @@ fn build_res_dispatch_function(
                             layout_key: plan.res_canonical.clone(),
                             field: format!("{}.{lane}", plan.field_path),
                             offset_bytes: plan.byte_offset + lane * 4,
-                            field_ty: MirType::F32,
+                            field_ty: lane_ty.clone(),
                         },
                     },
                     MirStmt {
@@ -787,8 +807,8 @@ fn build_res_dispatch_function(
                         inst: Inst::FieldStore {
                             base_ptr: ctrl_ptr,
                             layout_key: ctrl_canon.clone(),
-                            field: format!("val_vec.{lane}"),
-                            offset_bytes: vec_off + lane * 4,
+                            field: format!("{ctrl_prefix}.{lane}"),
+                            offset_bytes: ctrl_base_off + lane * 4,
                             val: lv,
                         },
                     },
@@ -907,17 +927,22 @@ fn build_res_dispatch_function(
                 },
             ]);
         } else if let Some(dims) = vec_dims_for_mir_ty(&plan.mir_ty) {
+            let (ctrl_prefix, ctrl_base_off, lane_ty) = match plan.ty {
+                Ty::IVec2 | Ty::IVec3 => ("val_ivec", ivec_off, MirType::I32),
+                Ty::UVec2 => ("val_uvec", uvec_off, MirType::U32),
+                _ => ("val_vec", vec_off, MirType::F32),
+            };
             for lane in 0..u32::from(dims) {
-                let lv = func.alloc_local(format!("w_lane_{lane}"), MirType::F32);
+                let lv = func.alloc_local(format!("w_lane_{lane}"), lane_ty.clone());
                 func.blocks[write_bb.0 as usize].stmts.extend([
                     MirStmt {
                         dst: Some(lv),
                         inst: Inst::FieldLoad {
                             base_ptr: ctrl_ptr,
                             layout_key: ctrl_canon.clone(),
-                            field: format!("val_vec.{lane}"),
-                            offset_bytes: vec_off + lane * 4,
-                            field_ty: MirType::F32,
+                            field: format!("{ctrl_prefix}.{lane}"),
+                            offset_bytes: ctrl_base_off + lane * 4,
+                            field_ty: lane_ty.clone(),
                         },
                     },
                     MirStmt {
@@ -1004,7 +1029,9 @@ fn build_obj_dispatch_function(
     func
 }
 
-fn augment_mir_for_sim_tests(mir: &MirModule) -> Result<(MirModule, DispatchMetadata), String> {
+pub(crate) fn augment_mir_for_sim_tests(
+    mir: &MirModule,
+) -> Result<(MirModule, DispatchMetadata), String> {
     let schedule = pick_dispatch_schedule(mir);
 
     let mut by_resource: BTreeMap<String, Vec<ResOpPlan>> = BTreeMap::new();
@@ -1032,7 +1059,7 @@ fn augment_mir_for_sim_tests(mir: &MirModule) -> Result<(MirModule, DispatchMeta
                 read_op,
                 write_op,
                 mir_ty: mir_ty.clone(),
-                ty,
+                ty: ty.clone(),
             };
             res_ops_map.insert(
                 (rl.canonical_name.clone(), field_path.clone()),
@@ -1048,6 +1075,7 @@ fn augment_mir_for_sim_tests(mir: &MirModule) -> Result<(MirModule, DispatchMeta
                     field_path,
                     byte_offset,
                     mir_ty,
+                    ty,
                     read_op,
                     write_op,
                 });
@@ -1088,6 +1116,8 @@ fn augment_mir_for_sim_tests(mir: &MirModule) -> Result<(MirModule, DispatchMeta
             ("val_i64".to_owned(), Ty::I64),
             ("val_f64".to_owned(), Ty::F64),
             ("val_vec".to_owned(), Ty::Vec4),
+            ("val_ivec".to_owned(), Ty::IVec3),
+            ("val_uvec".to_owned(), Ty::UVec2),
         ],
         0,
         Vec::new(),
@@ -1118,7 +1148,20 @@ fn augment_mir_for_sim_tests(mir: &MirModule) -> Result<(MirModule, DispatchMeta
         .find(|f| f.name == "val_vec")
         .map(|f| f.offset as u32)
         .unwrap_or(24);
+    let ivec_off = ctrl_layout
+        .fields
+        .iter()
+        .find(|f| f.name == "val_ivec")
+        .map(|f| f.offset as u32)
+        .unwrap_or(40);
+    let uvec_off = ctrl_layout
+        .fields
+        .iter()
+        .find(|f| f.name == "val_uvec")
+        .map(|f| f.offset as u32)
+        .unwrap_or(52);
     let offsets = (op_off, i64_off, f64_off, vec_off);
+    let res_offsets = (op_off, i64_off, f64_off, vec_off, ivec_off, uvec_off);
 
     let mut augmented = mir.clone();
     augmented.layouts.push(ctrl_layout.clone());
@@ -1137,7 +1180,7 @@ fn augment_mir_for_sim_tests(mir: &MirModule) -> Result<(MirModule, DispatchMeta
             sys_name.clone(),
             mir.is_deterministic,
             &ctrl_layout,
-            offsets,
+            res_offsets,
             &ops,
         );
         augmented.functions.push(func);
@@ -1205,6 +1248,7 @@ pub fn run_headless_sim_tests(mir: &MirModule, source_stem: &str) -> Vec<SimTest
     if mir.sim_tests.is_empty() {
         return Vec::new();
     }
+    let _guard = SIM_EXEC_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     let make_err = |msg: String| -> Vec<SimTestCaseResult> {
         mir.sim_tests
@@ -1254,7 +1298,7 @@ pub fn run_headless_sim_tests(mir: &MirModule, source_stem: &str) -> Vec<SimTest
     results
 }
 
-fn find_registry_component(
+pub(crate) fn find_registry_component(
     world: &World,
     module_path: &str,
     key: &str,
@@ -1293,12 +1337,13 @@ fn run_single_sim_test(
     dylib_path: &Path,
     st: &HirSimTest,
 ) -> SimTestCaseResult {
-    let _guard = SIM_EXEC_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
     let mut app = App::new();
     app.init_schedule(Startup);
     app.init_schedule(PostStartup);
     app.init_schedule(FixedUpdate);
+    app.edit_schedule(FixedUpdate, |s| {
+        s.set_executor(SingleThreadedExecutor::new());
+    });
     dispatch.schedule.init_on_app(&mut app);
     app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
 
@@ -1410,12 +1455,14 @@ fn run_single_sim_test(
 }
 
 #[derive(Debug, Clone)]
-enum SimVal {
+pub(crate) enum SimVal {
     Unit,
     Bool(bool),
     Int(i64),
     Float(f64),
     Vec([f32; 4], u8),
+    IVec([i32; 4], u8),
+    UVec([u32; 4], u8),
     String(String),
     Entity(Option<Entity>),
     QueryHit {
@@ -1440,28 +1487,28 @@ enum SimVal {
     },
 }
 
-enum Flow {
+pub(crate) enum Flow {
     Normal,
     Return(SimVal),
     Break,
     Continue,
 }
 
-struct SimRunner<'a> {
-    app: &'a mut App,
-    mir: &'a MirModule,
-    dispatch: &'a DispatchMetadata,
-    mod_id: ModId,
-    ctrl_entity: Option<Entity>,
-    ctrl_handle: Option<bamabi_sys::BamComponent>,
-    named_entities: HashMap<String, Entity>,
-    frames_simulated: u64,
-    steady_state_allocs: usize,
-    scopes: Vec<HashMap<String, SimVal>>,
+pub(crate) struct SimRunner<'a> {
+    pub(crate) app: &'a mut App,
+    pub(crate) mir: &'a MirModule,
+    pub(crate) dispatch: &'a DispatchMetadata,
+    pub(crate) mod_id: ModId,
+    pub(crate) ctrl_entity: Option<Entity>,
+    pub(crate) ctrl_handle: Option<bamabi_sys::BamComponent>,
+    pub(crate) named_entities: HashMap<String, Entity>,
+    pub(crate) frames_simulated: u64,
+    pub(crate) steady_state_allocs: usize,
+    pub(crate) scopes: Vec<HashMap<String, SimVal>>,
 }
 
 impl<'a> SimRunner<'a> {
-    fn peak_cmd_bytes(&self) -> usize {
+    pub(crate) fn peak_cmd_bytes(&self) -> usize {
         self.app
             .world()
             .get_resource::<ModBudgetTelemetry>()
@@ -1475,7 +1522,7 @@ impl<'a> SimRunner<'a> {
             .unwrap_or(0)
     }
 
-    fn check_mod_faults(&self) -> Result<(), String> {
+    pub(crate) fn check_mod_faults(&self) -> Result<(), String> {
         if let Some(telemetry) = self.app.world().get_resource::<ModBudgetTelemetry>() {
             for snap in telemetry.mod_snapshots(self.mod_id) {
                 if snap.quarantined {
@@ -1489,23 +1536,23 @@ impl<'a> SimRunner<'a> {
         Ok(())
     }
 
-    fn push_scope(&mut self) {
+    pub(crate) fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
 
-    fn pop_scope(&mut self) {
+    pub(crate) fn pop_scope(&mut self) {
         if self.scopes.len() > 1 {
             self.scopes.pop();
         }
     }
 
-    fn bind_var(&mut self, name: &str, val: SimVal) {
+    pub(crate) fn bind_var(&mut self, name: &str, val: SimVal) {
         if let Some(top) = self.scopes.last_mut() {
             top.insert(name.to_owned(), val);
         }
     }
 
-    fn update_var(&mut self, name: &str, val: SimVal) -> bool {
+    pub(crate) fn update_var(&mut self, name: &str, val: SimVal) -> bool {
         for frame in self.scopes.iter_mut().rev() {
             if frame.contains_key(name) {
                 frame.insert(name.to_owned(), val);
@@ -1515,7 +1562,7 @@ impl<'a> SimRunner<'a> {
         false
     }
 
-    fn get_var(&self, name: &str) -> Option<&SimVal> {
+    pub(crate) fn get_var(&self, name: &str) -> Option<&SimVal> {
         for frame in self.scopes.iter().rev() {
             if let Some(v) = frame.get(name) {
                 return Some(v);
@@ -1524,7 +1571,7 @@ impl<'a> SimRunner<'a> {
         None
     }
 
-    fn preresolve_objects(&mut self) -> Result<(), String> {
+    pub(crate) fn preresolve_objects(&mut self) -> Result<(), String> {
         let names: Vec<String> = self.mir.objects.iter().map(|o| o.name.clone()).collect();
         for name in names {
             if let Some(ent) = self.resolve_named_object_via_dispatch(&name)? {
@@ -1534,7 +1581,10 @@ impl<'a> SimRunner<'a> {
         Ok(())
     }
 
-    fn resolve_named_object_via_dispatch(&mut self, name: &str) -> Result<Option<Entity>, String> {
+    pub(crate) fn resolve_named_object_via_dispatch(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<Entity>, String> {
         if let Some(&ent) = self.named_entities.get(name)
             && self.app.world().entities().contains(ent)
         {
@@ -1860,6 +1910,29 @@ impl<'a> SimRunner<'a> {
                 }
             }
             HirExpr::For(hf) => self.eval_for(hf),
+            HirExpr::Match(m) => {
+                let scrut = self.eval_expr(&m.scrutinee)?;
+                for arm in &m.arms {
+                    self.push_scope();
+                    let matched = self.try_bind_pattern(&arm.pattern, &scrut);
+                    let guard_ok = if matched {
+                        if let Some(ref g) = arm.guard {
+                            as_bool(&self.eval_expr(g)?)?
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    };
+                    if matched && guard_ok {
+                        let res = self.eval_expr(&arm.body);
+                        self.pop_scope();
+                        return res;
+                    }
+                    self.pop_scope();
+                }
+                Err("non-exhaustive match in sim_test".to_owned())
+            }
             other => Err(format!(
                 "unsupported expression in sim_test body: `{other:?}`"
             )),
@@ -1906,13 +1979,46 @@ impl<'a> SimRunner<'a> {
             }
             HirForIter::Query(q) => {
                 let entities = self.collect_matching_entities(q)?;
+                let single_proj = if q.terms.len() == 1
+                    && let Some(ref proj) = q.terms[0].field_name
+                    && !matches!(
+                        q.terms[0].mode,
+                        TermAccessMode::OptionalRead | TermAccessMode::OptionalWrite
+                    )
+                    && matches!(
+                        &hf.binding,
+                        HirPattern::Binding { name, .. } if name == &q.terms[0].alias
+                    ) {
+                    Some((&q.terms[0], proj.clone()))
+                } else {
+                    None
+                };
                 for ent in entities {
-                    let hit = SimVal::QueryHit {
-                        entity: ent,
-                        terms: q.terms.clone(),
+                    let bound = if let Some((term, proj)) = &single_proj {
+                        if matches!(
+                            term.mode,
+                            TermAccessMode::Write | TermAccessMode::SelectiveWrite
+                        ) {
+                            SimVal::ComponentRef {
+                                entity: ent,
+                                layout_key: term.canonical_component.clone(),
+                                sub_path: vec![proj.clone()],
+                            }
+                        } else {
+                            self.read_component_field(
+                                ent,
+                                &term.canonical_component,
+                                std::slice::from_ref(proj),
+                            )?
+                        }
+                    } else {
+                        SimVal::QueryHit {
+                            entity: ent,
+                            terms: q.terms.clone(),
+                        }
                     };
                     self.push_scope();
-                    self.try_bind_pattern(&hf.binding, &hit);
+                    self.try_bind_pattern(&hf.binding, &bound);
                     let flow = self.exec_stmts(&hf.body)?;
                     self.pop_scope();
                     match flow {
@@ -1930,19 +2036,54 @@ impl<'a> SimRunner<'a> {
     }
 
     fn eval_path(&mut self, name: &str) -> Result<SimVal, String> {
-        if let Some(v) = self.get_var(name) {
-            return Ok(v.clone());
+        if let Some(v) = self.get_var(name).cloned() {
+            if let SimVal::ComponentRef {
+                entity,
+                layout_key,
+                sub_path,
+            } = v
+            {
+                if sub_path.is_empty() {
+                    return Ok(SimVal::ComponentRef {
+                        entity,
+                        layout_key,
+                        sub_path,
+                    });
+                }
+                return self.read_component_or_subref(entity, &layout_key, sub_path);
+            }
+            return Ok(v);
         }
         match name {
             "vec2::ZERO" => return Ok(SimVal::Vec([0.0, 0.0, 0.0, 0.0], 2)),
+            "vec2::ONE" => return Ok(SimVal::Vec([1.0, 1.0, 0.0, 0.0], 2)),
             "vec2::X" => return Ok(SimVal::Vec([1.0, 0.0, 0.0, 0.0], 2)),
             "vec2::Y" => return Ok(SimVal::Vec([0.0, 1.0, 0.0, 0.0], 2)),
             "vec3::ZERO" => return Ok(SimVal::Vec([0.0, 0.0, 0.0, 0.0], 3)),
+            "vec3::ONE" => return Ok(SimVal::Vec([1.0, 1.0, 1.0, 0.0], 3)),
             "vec3::X" => return Ok(SimVal::Vec([1.0, 0.0, 0.0, 0.0], 3)),
-            "vec3::Y" => return Ok(SimVal::Vec([0.0, 1.0, 0.0, 0.0], 3)),
+            "vec3::Y" | "vec3::UP" => return Ok(SimVal::Vec([0.0, 1.0, 0.0, 0.0], 3)),
             "vec3::Z" => return Ok(SimVal::Vec([0.0, 0.0, 1.0, 0.0], 3)),
             "vec4::ZERO" => return Ok(SimVal::Vec([0.0, 0.0, 0.0, 0.0], 4)),
-            "None" => return Ok(SimVal::OptionHit(None)),
+            "vec4::ONE" => return Ok(SimVal::Vec([1.0, 1.0, 1.0, 1.0], 4)),
+            "vec4::X" => return Ok(SimVal::Vec([1.0, 0.0, 0.0, 0.0], 4)),
+            "vec4::Y" => return Ok(SimVal::Vec([0.0, 1.0, 0.0, 0.0], 4)),
+            "vec4::Z" => return Ok(SimVal::Vec([0.0, 0.0, 1.0, 0.0], 4)),
+            "vec4::W" => return Ok(SimVal::Vec([0.0, 0.0, 0.0, 1.0], 4)),
+            "ivec2::ZERO" => return Ok(SimVal::IVec([0, 0, 0, 0], 2)),
+            "ivec2::ONE" => return Ok(SimVal::IVec([1, 1, 0, 0], 2)),
+            "ivec2::X" => return Ok(SimVal::IVec([1, 0, 0, 0], 2)),
+            "ivec2::Y" => return Ok(SimVal::IVec([0, 1, 0, 0], 2)),
+            "ivec3::ZERO" => return Ok(SimVal::IVec([0, 0, 0, 0], 3)),
+            "ivec3::ONE" => return Ok(SimVal::IVec([1, 1, 1, 0], 3)),
+            "ivec3::X" => return Ok(SimVal::IVec([1, 0, 0, 0], 3)),
+            "ivec3::Y" => return Ok(SimVal::IVec([0, 1, 0, 0], 3)),
+            "ivec3::Z" => return Ok(SimVal::IVec([0, 0, 1, 0], 3)),
+            "uvec2::ZERO" => return Ok(SimVal::UVec([0, 0, 0, 0], 2)),
+            "uvec2::ONE" => return Ok(SimVal::UVec([1, 1, 0, 0], 2)),
+            "uvec2::X" => return Ok(SimVal::UVec([1, 0, 0, 0], 2)),
+            "uvec2::Y" => return Ok(SimVal::UVec([0, 1, 0, 0], 2)),
+            "None" | "Option::None" => return Ok(SimVal::OptionHit(None)),
             _ => {}
         }
         if let Some((ename, vname)) = name.rsplit_once("::") {
@@ -1997,14 +2138,15 @@ impl<'a> SimRunner<'a> {
         if let Some(ref recv_expr) = call.receiver {
             let recv = self.eval_expr(recv_expr)?;
             match call.callee.as_str() {
-                "unwrap" => {
+                "unwrap" | "expect" => {
                     return match recv {
                         SimVal::OptionHit(Some(inner)) => Ok(*inner),
-                        SimVal::OptionHit(None) => {
-                            Err("called `unwrap()` on empty `query_one` result".to_owned())
-                        }
+                        SimVal::OptionHit(None) => Err(format!(
+                            "called `{}()` on empty `query_one` result",
+                            call.callee
+                        )),
                         SimVal::QueryHit { .. } => Ok(recv),
-                        other => Err(format!("cannot call `.unwrap()` on `{other:?}`")),
+                        other => Err(format!("cannot call `.{}()` on `{other:?}`", call.callee)),
                     };
                 }
                 "is_some" => {
@@ -2040,6 +2182,22 @@ impl<'a> SimRunner<'a> {
                             let mut sum = 0.0f64;
                             for lane in v.iter().take(usize::from(dims)) {
                                 sum += f64::from(*lane) * f64::from(*lane);
+                            }
+                            Ok(SimVal::Float(sum.sqrt()))
+                        }
+                        SimVal::IVec(v, dims) => {
+                            let mut sum = 0.0f64;
+                            for lane in v.iter().take(usize::from(dims)) {
+                                let f = f64::from(*lane);
+                                sum += f * f;
+                            }
+                            Ok(SimVal::Float(sum.sqrt()))
+                        }
+                        SimVal::UVec(v, dims) => {
+                            let mut sum = 0.0f64;
+                            for lane in v.iter().take(usize::from(dims)) {
+                                let f = f64::from(*lane);
+                                sum += f * f;
                             }
                             Ok(SimVal::Float(sum.sqrt()))
                         }
@@ -2145,6 +2303,33 @@ impl<'a> SimRunner<'a> {
                 let w = as_float(&self.eval_expr(call.args.get(3).ok_or("vec4 needs w")?)?)?;
                 Ok(SimVal::Vec([x as f32, y as f32, z as f32, w as f32], 4))
             }
+            "vec3a" | "Vec3a" => {
+                let x = as_float(&self.eval_expr(call.args.first().ok_or("vec3a needs x")?)?)?;
+                let y = as_float(&self.eval_expr(call.args.get(1).ok_or("vec3a needs y")?)?)?;
+                let z = as_float(&self.eval_expr(call.args.get(2).ok_or("vec3a needs z")?)?)?;
+                Ok(SimVal::Vec([x as f32, y as f32, z as f32, 0.0], 4))
+            }
+            "Some" | "Option::Some" => {
+                let v =
+                    self.eval_expr(call.args.first().ok_or("Some(...) requires 1 argument")?)?;
+                Ok(SimVal::OptionHit(Some(Box::new(v))))
+            }
+            "ivec2" => {
+                let x = as_int(&self.eval_expr(call.args.first().ok_or("ivec2 needs x")?)?)?;
+                let y = as_int(&self.eval_expr(call.args.get(1).ok_or("ivec2 needs y")?)?)?;
+                Ok(SimVal::IVec([x as i32, y as i32, 0, 0], 2))
+            }
+            "ivec3" => {
+                let x = as_int(&self.eval_expr(call.args.first().ok_or("ivec3 needs x")?)?)?;
+                let y = as_int(&self.eval_expr(call.args.get(1).ok_or("ivec3 needs y")?)?)?;
+                let z = as_int(&self.eval_expr(call.args.get(2).ok_or("ivec3 needs z")?)?)?;
+                Ok(SimVal::IVec([x as i32, y as i32, z as i32, 0], 3))
+            }
+            "uvec2" => {
+                let x = as_int(&self.eval_expr(call.args.first().ok_or("uvec2 needs x")?)?)?;
+                let y = as_int(&self.eval_expr(call.args.get(1).ok_or("uvec2 needs y")?)?)?;
+                Ok(SimVal::UVec([x as u32, y as u32, 0, 0], 2))
+            }
             "abs" | "floor" | "ceil" | "round" | "sqrt" | "sin" | "cos" | "min" | "max"
             | "clamp" | "lerp" | "powf" | "dot" => {
                 let mut vals = Vec::with_capacity(call.args.len());
@@ -2157,7 +2342,7 @@ impl<'a> SimRunner<'a> {
         }
     }
 
-    fn entity_matches_query(&self, ent: Entity, q: &HirQuery) -> Result<bool, String> {
+    pub(crate) fn entity_matches_query(&self, ent: Entity, q: &HirQuery) -> Result<bool, String> {
         let Ok(ent_ref) = self.app.world().get_entity(ent) else {
             return Ok(false);
         };
@@ -2201,7 +2386,7 @@ impl<'a> SimRunner<'a> {
         Ok(true)
     }
 
-    fn collect_matching_entities(&self, q: &HirQuery) -> Result<Vec<Entity>, String> {
+    pub(crate) fn collect_matching_entities(&self, q: &HirQuery) -> Result<Vec<Entity>, String> {
         let mut required_ids = Vec::new();
         for term in &q.terms {
             if matches!(
@@ -2291,7 +2476,11 @@ impl<'a> SimRunner<'a> {
         Err("standalone `query(...)` outside `for` or `.count()` in sim_test".to_owned())
     }
 
-    fn read_field_on_val(&mut self, base: SimVal, field: &str) -> Result<SimVal, String> {
+    pub(crate) fn read_field_on_val(
+        &mut self,
+        base: SimVal,
+        field: &str,
+    ) -> Result<SimVal, String> {
         match base {
             SimVal::QueryHit { entity, terms } => {
                 if field == "id" {
@@ -2302,6 +2491,39 @@ impl<'a> SimRunner<'a> {
                     .find(|t| t.alias == field || t.storage_key == field)
                     .ok_or_else(|| format!("query row has no term `{field}`"))?;
                 let comp_key = term.canonical_component.clone();
+                if matches!(
+                    term.mode,
+                    TermAccessMode::OptionalRead | TermAccessMode::OptionalWrite
+                ) {
+                    let has_comp =
+                        find_registry_component(self.app.world(), &self.mir.module_path, &comp_key)
+                            .or_else(|| {
+                                find_registry_component(
+                                    self.app.world(),
+                                    &self.mir.module_path,
+                                    &term.storage_key,
+                                )
+                            })
+                            .is_some_and(|reg| {
+                                self.app
+                                    .world()
+                                    .get_entity(entity)
+                                    .is_ok_and(|er| er.contains_id(reg.component_id))
+                            });
+                    if !has_comp {
+                        return Ok(SimVal::OptionHit(None));
+                    }
+                    let inner = if let Some(ref proj) = term.field_name {
+                        self.read_component_field(entity, &comp_key, std::slice::from_ref(proj))?
+                    } else {
+                        SimVal::ComponentRef {
+                            entity,
+                            layout_key: comp_key,
+                            sub_path: Vec::new(),
+                        }
+                    };
+                    return Ok(SimVal::OptionHit(Some(Box::new(inner))));
+                }
                 if let Some(ref proj) = term.field_name {
                     self.read_component_field(entity, &comp_key, std::slice::from_ref(proj))
                 } else {
@@ -2328,6 +2550,8 @@ impl<'a> SimRunner<'a> {
                 self.read_resource_field(&resource, &sub_path)
             }
             SimVal::Vec(v, dims) => eval_vec_field(v, dims, field),
+            SimVal::IVec(v, dims) => eval_ivec_field(v, dims, field),
+            SimVal::UVec(v, dims) => eval_uvec_field(v, dims, field),
             SimVal::Struct { fields, .. } => fields
                 .into_iter()
                 .find(|(n, _)| n == field)
@@ -2337,7 +2561,7 @@ impl<'a> SimRunner<'a> {
         }
     }
 
-    fn resolve_field_chain(
+    pub(crate) fn resolve_field_chain(
         &self,
         layout_key: &str,
         segments: &[String],
@@ -2385,7 +2609,7 @@ impl<'a> SimRunner<'a> {
         Ok((base_layout, offset, cur_ty, None))
     }
 
-    fn read_component_or_subref(
+    pub(crate) fn read_component_or_subref(
         &self,
         entity: Entity,
         layout_key: &str,
@@ -2405,7 +2629,7 @@ impl<'a> SimRunner<'a> {
         self.read_component_at_offset(entity, &base_layout, &segments, offset, &cur_ty, lane_opt)
     }
 
-    fn read_component_field(
+    pub(crate) fn read_component_field(
         &self,
         entity: Entity,
         layout_key: &str,
@@ -2416,7 +2640,7 @@ impl<'a> SimRunner<'a> {
         self.read_component_at_offset(entity, &base_layout, segments, offset, &cur_ty, lane_opt)
     }
 
-    fn read_component_at_offset(
+    pub(crate) fn read_component_at_offset(
         &self,
         entity: Entity,
         base_layout: &SolvedLayout,
@@ -2480,7 +2704,7 @@ impl<'a> SimRunner<'a> {
         }
     }
 
-    fn write_component_field(
+    pub(crate) fn write_component_field(
         &mut self,
         entity: Entity,
         layout_key: &str,
@@ -2502,7 +2726,11 @@ impl<'a> SimRunner<'a> {
             )
         })?;
 
-        let effective_ty = if lane_opt.is_some() { Ty::F32 } else { cur_ty };
+        let effective_ty = if lane_opt.is_some() {
+            vec_lane_scalar_ty(&cur_ty)
+        } else {
+            cur_ty
+        };
         let effective_off = offset + lane_opt.map_or(0, |l| usize::from(l) * 4);
 
         if reg.is_abi_pod {
@@ -2612,7 +2840,7 @@ impl<'a> SimRunner<'a> {
         ))
     }
 
-    fn read_resource_field(
+    pub(crate) fn read_resource_field(
         &mut self,
         resource: &str,
         segments: &[String],
@@ -2667,7 +2895,7 @@ impl<'a> SimRunner<'a> {
         }
     }
 
-    fn write_resource_field(
+    pub(crate) fn write_resource_field(
         &mut self,
         resource: &str,
         segments: &[String],
@@ -2700,7 +2928,11 @@ impl<'a> SimRunner<'a> {
                 .ok_or_else(|| format!("host resource `{resource}` has no field `{fname}`"))?;
             let mut fbytes = rec.bytes.clone();
             let rel_off = lane_opt.map_or(0, |l| usize::from(l) * 4);
-            let eff_ty = if lane_opt.is_some() { Ty::F32 } else { cur_ty };
+            let eff_ty = if lane_opt.is_some() {
+                vec_lane_scalar_ty(&cur_ty)
+            } else {
+                cur_ty
+            };
             let new_val = if op == HirAssignOp::Set {
                 rhs
             } else {
@@ -2736,18 +2968,40 @@ impl<'a> SimRunner<'a> {
         let final_val = match (lane_opt, op) {
             (Some(lane), _) => {
                 let cur = self.dispatch_read_mod_resource(&field_path, &disp)?;
-                let SimVal::Vec(mut v, dims) = cur else {
-                    return Err(format!("expected vector field for `{field_path}`"));
-                };
                 let idx = usize::from(lane);
-                let updated_lane = if op == HirAssignOp::Set {
-                    as_float(&rhs)?
-                } else {
-                    let old_lane = SimVal::Float(f64::from(v[idx]));
-                    as_float(&apply_assign_op(op, old_lane, rhs)?)?
-                };
-                v[idx] = updated_lane as f32;
-                SimVal::Vec(v, dims)
+                match cur {
+                    SimVal::Vec(mut v, dims) => {
+                        let updated_lane = if op == HirAssignOp::Set {
+                            as_float(&rhs)?
+                        } else {
+                            let old_lane = SimVal::Float(f64::from(v[idx]));
+                            as_float(&apply_assign_op(op, old_lane, rhs)?)?
+                        };
+                        v[idx] = updated_lane as f32;
+                        SimVal::Vec(v, dims)
+                    }
+                    SimVal::IVec(mut v, dims) => {
+                        let updated_lane = if op == HirAssignOp::Set {
+                            as_int(&rhs)?
+                        } else {
+                            let old_lane = SimVal::Int(i64::from(v[idx]));
+                            as_int(&apply_assign_op(op, old_lane, rhs)?)?
+                        };
+                        v[idx] = updated_lane as i32;
+                        SimVal::IVec(v, dims)
+                    }
+                    SimVal::UVec(mut v, dims) => {
+                        let updated_lane = if op == HirAssignOp::Set {
+                            as_int(&rhs)?
+                        } else {
+                            let old_lane = SimVal::Int(i64::from(v[idx]));
+                            as_int(&apply_assign_op(op, old_lane, rhs)?)?
+                        };
+                        v[idx] = updated_lane as u32;
+                        SimVal::UVec(v, dims)
+                    }
+                    _ => return Err(format!("expected vector field for `{field_path}`")),
+                }
             }
             (None, HirAssignOp::Set) => rhs,
             (None, _) => {
@@ -2807,12 +3061,36 @@ impl<'a> SimRunner<'a> {
             let v = f64::from_le_bytes(out[f64_off..f64_off + 8].try_into().unwrap_or([0; 8]));
             Ok(SimVal::Float(v))
         } else if let Some(dims) = vec_dims_for_mir_ty(&disp.mir_ty) {
-            let mut vec = [0.0f32; 4];
-            for (i, slot) in vec.iter_mut().enumerate().take(usize::from(dims)) {
-                let s = vec_off + i * 4;
-                *slot = f32::from_le_bytes(out[s..s + 4].try_into().unwrap_or([0; 4]));
+            let (ivec_off, uvec_off) = self
+                .dispatch
+                .ctrl_int_vec_offsets()
+                .ok_or_else(|| "missing __StrataSimCtrl int vec offsets".to_owned())?;
+            match disp.ty {
+                Ty::IVec2 | Ty::IVec3 => {
+                    let mut vec = [0i32; 4];
+                    for (i, slot) in vec.iter_mut().enumerate().take(usize::from(dims)) {
+                        let s = ivec_off + i * 4;
+                        *slot = i32::from_le_bytes(out[s..s + 4].try_into().unwrap_or([0; 4]));
+                    }
+                    Ok(SimVal::IVec(vec, dims))
+                }
+                Ty::UVec2 => {
+                    let mut vec = [0u32; 4];
+                    for (i, slot) in vec.iter_mut().enumerate().take(usize::from(dims)) {
+                        let s = uvec_off + i * 4;
+                        *slot = u32::from_le_bytes(out[s..s + 4].try_into().unwrap_or([0; 4]));
+                    }
+                    Ok(SimVal::UVec(vec, dims))
+                }
+                _ => {
+                    let mut vec = [0.0f32; 4];
+                    for (i, slot) in vec.iter_mut().enumerate().take(usize::from(dims)) {
+                        let s = vec_off + i * 4;
+                        *slot = f32::from_le_bytes(out[s..s + 4].try_into().unwrap_or([0; 4]));
+                    }
+                    Ok(SimVal::Vec(vec, dims))
+                }
             }
-            Ok(SimVal::Vec(vec, dims))
         } else {
             Err(format!(
                 "unsupported MIR resource field type `{:?}`",
@@ -2857,14 +3135,46 @@ impl<'a> SimRunner<'a> {
             let f = as_float(&val)?;
             bytes[f64_off..f64_off + 8].copy_from_slice(&f.to_le_bytes());
         } else if let Some(dims) = vec_dims_for_mir_ty(&disp.mir_ty) {
-            let SimVal::Vec(v, _) = val else {
-                return Err(format!(
-                    "expected vector value for resource field `{field_path}`, got `{val:?}`"
-                ));
-            };
-            for (i, &lane) in v.iter().take(usize::from(dims)).enumerate() {
-                let s = vec_off + i * 4;
-                bytes[s..s + 4].copy_from_slice(&lane.to_le_bytes());
+            let (ivec_off, uvec_off) = self
+                .dispatch
+                .ctrl_int_vec_offsets()
+                .ok_or_else(|| "missing __StrataSimCtrl int vec offsets".to_owned())?;
+            match (&disp.ty, val) {
+                (Ty::IVec2 | Ty::IVec3, SimVal::IVec(v, _)) => {
+                    for (i, &lane) in v.iter().take(usize::from(dims)).enumerate() {
+                        let s = ivec_off + i * 4;
+                        bytes[s..s + 4].copy_from_slice(&lane.to_le_bytes());
+                    }
+                }
+                (Ty::IVec2 | Ty::IVec3, SimVal::Vec(v, _)) => {
+                    for (i, &lane) in v.iter().take(usize::from(dims)).enumerate() {
+                        let s = ivec_off + i * 4;
+                        bytes[s..s + 4].copy_from_slice(&(lane as i32).to_le_bytes());
+                    }
+                }
+                (Ty::UVec2, SimVal::UVec(v, _)) => {
+                    for (i, &lane) in v.iter().take(usize::from(dims)).enumerate() {
+                        let s = uvec_off + i * 4;
+                        bytes[s..s + 4].copy_from_slice(&lane.to_le_bytes());
+                    }
+                }
+                (Ty::UVec2, SimVal::Vec(v, _)) => {
+                    for (i, &lane) in v.iter().take(usize::from(dims)).enumerate() {
+                        let s = uvec_off + i * 4;
+                        bytes[s..s + 4].copy_from_slice(&(lane as u32).to_le_bytes());
+                    }
+                }
+                (_, SimVal::Vec(v, _)) => {
+                    for (i, &lane) in v.iter().take(usize::from(dims)).enumerate() {
+                        let s = vec_off + i * 4;
+                        bytes[s..s + 4].copy_from_slice(&lane.to_le_bytes());
+                    }
+                }
+                (_, other) => {
+                    return Err(format!(
+                        "expected vector value for resource field `{field_path}`, got `{other:?}`"
+                    ));
+                }
             }
         } else {
             return Err(format!(
@@ -2919,6 +3229,15 @@ impl<'a> SimRunner<'a> {
                     .cloned()
                     .ok_or_else(|| format!("unknown variable `{name}` in assignment"))?;
                 if fields.is_empty() {
+                    if let SimVal::ComponentRef {
+                        entity,
+                        ref layout_key,
+                        ref sub_path,
+                    } = base_val
+                        && !sub_path.is_empty()
+                    {
+                        return self.write_component_field(entity, layout_key, sub_path, op, rhs);
+                    }
                     let final_val = if op == HirAssignOp::Set {
                         rhs
                     } else {
@@ -2987,18 +3306,137 @@ impl<'a> SimRunner<'a> {
                         self.update_var(name, SimVal::Vec(v, dims));
                         Ok(())
                     }
+                    SimVal::IVec(mut v, dims) if fields.len() == 1 => {
+                        let lane = vec_lane_index(&fields[0])
+                            .ok_or_else(|| format!("invalid vector lane `{}`", fields[0]))?;
+                        let idx = usize::from(lane);
+                        let updated = if op == HirAssignOp::Set {
+                            as_int(&rhs)?
+                        } else {
+                            let old = SimVal::Int(i64::from(v[idx]));
+                            as_int(&apply_assign_op(op, old, rhs)?)?
+                        };
+                        v[idx] = updated as i32;
+                        self.update_var(name, SimVal::IVec(v, dims));
+                        Ok(())
+                    }
+                    SimVal::UVec(mut v, dims) if fields.len() == 1 => {
+                        let lane = vec_lane_index(&fields[0])
+                            .ok_or_else(|| format!("invalid vector lane `{}`", fields[0]))?;
+                        let idx = usize::from(lane);
+                        let updated = if op == HirAssignOp::Set {
+                            as_int(&rhs)?
+                        } else {
+                            let old = SimVal::Int(i64::from(v[idx]));
+                            as_int(&apply_assign_op(op, old, rhs)?)?
+                        };
+                        v[idx] = updated as u32;
+                        self.update_var(name, SimVal::UVec(v, dims));
+                        Ok(())
+                    }
                     other => Err(format!(
                         "cannot assign to field path `{}` on `{other:?}`",
                         fields.join(".")
                     )),
                 }
             }
+            HirLValue::Expr(_) => Err(format!("unsupported assignment target `{cur:?}`")),
             other => Err(format!("unsupported assignment target `{other:?}`")),
         }
     }
+    pub(crate) fn spawn_entity_with_components(
+        &mut self,
+        comps: &[(String, Vec<(String, SimVal)>)],
+    ) -> Result<Entity, String> {
+        let ent = self.app.world_mut().spawn_empty().id();
+        for (comp_name, explicit_fields) in comps {
+            let layout = find_layout_in_slice(&self.mir.layouts, &self.mir.module_path, comp_name)
+                .ok_or_else(|| format!("unknown component layout `{comp_name}` in spawn"))?
+                .clone();
+            let reg = find_registry_component(
+                self.app.world(),
+                &self.mir.module_path,
+                &layout.canonical_name,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "component `{}` not registered in ModRegistry",
+                    layout.canonical_name
+                )
+            })?;
+
+            let mut bytes = vec![0u8; layout.size];
+            // Populate defaults from `mir.field_defaults` first.
+            if let Some(defs) = self.mir.field_defaults.get(&layout.canonical_name) {
+                for (fname, dval) in defs {
+                    if let Some(sf) = layout.fields.iter().find(|f| f.name == *fname)
+                        && let Some(sv) = mir_const_to_sim_val(dval)
+                    {
+                        let _ = encode_ty_to_bytes(
+                            &mut bytes,
+                            sf.offset,
+                            &sf.ty,
+                            &sv,
+                            &self.mir.enums,
+                            &self.mir.module_path,
+                        );
+                    }
+                }
+            }
+            // Apply explicit overrides from struct/component literal.
+            for (fname, fval) in explicit_fields {
+                let sf = layout
+                    .fields
+                    .iter()
+                    .find(|f| f.name == *fname)
+                    .ok_or_else(|| {
+                        format!(
+                            "component `{}` has no field `{fname}`",
+                            layout.canonical_name
+                        )
+                    })?;
+                encode_ty_to_bytes(
+                    &mut bytes,
+                    sf.offset,
+                    &sf.ty,
+                    fval,
+                    &self.mir.enums,
+                    &self.mir.module_path,
+                )?;
+            }
+            write_entity_pod_bytes(self.app.world_mut(), ent, reg.handle, &bytes).map_err(|e| {
+                format!(
+                    "failed inserting component `{}` on spawned entity: {e:?}",
+                    layout.canonical_name
+                )
+            })?;
+        }
+        Ok(ent)
+    }
 }
 
-fn is_vec_ty(ty: &Ty) -> bool {
+pub(crate) fn mir_const_to_sim_val(val: &strata_mir::MirConstVal) -> Option<SimVal> {
+    match val {
+        strata_mir::MirConstVal::Unit => Some(SimVal::Unit),
+        strata_mir::MirConstVal::Bool(b) => Some(SimVal::Bool(*b)),
+        strata_mir::MirConstVal::Int(i) => Some(SimVal::Int(*i)),
+        strata_mir::MirConstVal::Float(f) => Some(SimVal::Float(*f)),
+        strata_mir::MirConstVal::Vec2(v) => {
+            Some(SimVal::Vec([v[0] as f32, v[1] as f32, 0.0, 0.0], 2))
+        }
+        strata_mir::MirConstVal::Vec3(v) => {
+            Some(SimVal::Vec([v[0] as f32, v[1] as f32, v[2] as f32, 0.0], 3))
+        }
+        strata_mir::MirConstVal::Vec4(v) => Some(SimVal::Vec(
+            [v[0] as f32, v[1] as f32, v[2] as f32, v[3] as f32],
+            4,
+        )),
+        strata_mir::MirConstVal::String(s) => Some(SimVal::String(s.clone())),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_vec_ty(ty: &Ty) -> bool {
     matches!(
         ty,
         Ty::Vec2
@@ -3013,7 +3451,7 @@ fn is_vec_ty(ty: &Ty) -> bool {
     )
 }
 
-fn vec_lane_index(field: &str) -> Option<u8> {
+pub(crate) fn vec_lane_index(field: &str) -> Option<u8> {
     match field {
         "x" | "r" => Some(0),
         "y" | "g" => Some(1),
@@ -3023,7 +3461,15 @@ fn vec_lane_index(field: &str) -> Option<u8> {
     }
 }
 
-fn eval_vec_field(v: [f32; 4], dims: u8, field: &str) -> Result<SimVal, String> {
+pub(crate) fn vec_lane_scalar_ty(ty: &Ty) -> Ty {
+    match ty {
+        Ty::IVec2 | Ty::IVec3 => Ty::I32,
+        Ty::UVec2 => Ty::U32,
+        _ => Ty::F32,
+    }
+}
+
+pub(crate) fn eval_vec_field(v: [f32; 4], dims: u8, field: &str) -> Result<SimVal, String> {
     if let Some(lane) = vec_lane_index(field) {
         if lane >= dims {
             return Err(format!("lane `{field}` out of range for vec{dims}"));
@@ -3050,7 +3496,61 @@ fn eval_vec_field(v: [f32; 4], dims: u8, field: &str) -> Result<SimVal, String> 
     Err(format!("unknown field `{field}` on vec{dims}"))
 }
 
-fn extract_vec_lane_val(val: SimVal, lane: u8) -> Result<SimVal, String> {
+pub(crate) fn eval_ivec_field(v: [i32; 4], dims: u8, field: &str) -> Result<SimVal, String> {
+    if let Some(lane) = vec_lane_index(field) {
+        if lane >= dims {
+            return Err(format!("lane `{field}` out of range for ivec{dims}"));
+        }
+        return Ok(SimVal::Int(i64::from(v[usize::from(lane)])));
+    }
+    let lanes: Vec<u8> = field
+        .chars()
+        .filter_map(|c| {
+            let mut buf = [0u8; 4];
+            vec_lane_index(c.encode_utf8(&mut buf))
+        })
+        .collect();
+    if lanes.len() == field.len() && (2..=4).contains(&lanes.len()) {
+        let mut out = [0i32; 4];
+        for (i, &l) in lanes.iter().enumerate() {
+            if l >= dims {
+                return Err(format!("swizzle `{field}` out of range for ivec{dims}"));
+            }
+            out[i] = v[usize::from(l)];
+        }
+        return Ok(SimVal::IVec(out, lanes.len() as u8));
+    }
+    Err(format!("unknown field `{field}` on ivec{dims}"))
+}
+
+pub(crate) fn eval_uvec_field(v: [u32; 4], dims: u8, field: &str) -> Result<SimVal, String> {
+    if let Some(lane) = vec_lane_index(field) {
+        if lane >= dims {
+            return Err(format!("lane `{field}` out of range for uvec{dims}"));
+        }
+        return Ok(SimVal::Int(i64::from(v[usize::from(lane)])));
+    }
+    let lanes: Vec<u8> = field
+        .chars()
+        .filter_map(|c| {
+            let mut buf = [0u8; 4];
+            vec_lane_index(c.encode_utf8(&mut buf))
+        })
+        .collect();
+    if lanes.len() == field.len() && (2..=4).contains(&lanes.len()) {
+        let mut out = [0u32; 4];
+        for (i, &l) in lanes.iter().enumerate() {
+            if l >= dims {
+                return Err(format!("swizzle `{field}` out of range for uvec{dims}"));
+            }
+            out[i] = v[usize::from(l)];
+        }
+        return Ok(SimVal::UVec(out, lanes.len() as u8));
+    }
+    Err(format!("unknown field `{field}` on uvec{dims}"))
+}
+
+pub(crate) fn extract_vec_lane_val(val: SimVal, lane: u8) -> Result<SimVal, String> {
     match val {
         SimVal::Vec(v, dims) => {
             if lane >= dims {
@@ -3058,11 +3558,23 @@ fn extract_vec_lane_val(val: SimVal, lane: u8) -> Result<SimVal, String> {
             }
             Ok(SimVal::Float(f64::from(v[usize::from(lane)])))
         }
+        SimVal::IVec(v, dims) => {
+            if lane >= dims {
+                return Err(format!("lane {lane} out of range for ivec{dims}"));
+            }
+            Ok(SimVal::Int(i64::from(v[usize::from(lane)])))
+        }
+        SimVal::UVec(v, dims) => {
+            if lane >= dims {
+                return Err(format!("lane {lane} out of range for uvec{dims}"));
+            }
+            Ok(SimVal::Int(i64::from(v[usize::from(lane)])))
+        }
         other => Err(format!("cannot extract vector lane from `{other:?}`")),
     }
 }
 
-fn field_byte_size(ty: &Ty, enums: &[EnumDef], module_path: &str) -> usize {
+pub(crate) fn field_byte_size(ty: &Ty, enums: &[EnumDef], module_path: &str) -> usize {
     match ty {
         Ty::Bool | Ty::U8 | Ty::I8 => 1,
         Ty::U16 | Ty::I16 => 2,
@@ -3082,7 +3594,7 @@ fn field_byte_size(ty: &Ty, enums: &[EnumDef], module_path: &str) -> usize {
     }
 }
 
-fn decode_ty_from_bytes(
+pub(crate) fn decode_ty_from_bytes(
     bytes: &[u8],
     offset: usize,
     ty: &Ty,
@@ -3129,16 +3641,32 @@ fn decode_ty_from_bytes(
             f32::from_le_bytes(slice.try_into().unwrap()),
         ))),
         Ty::F64 => Ok(SimVal::Float(f64::from_le_bytes(slice.try_into().unwrap()))),
-        Ty::Vec2 | Ty::UVec2 | Ty::IVec2 => {
+        Ty::Vec2 => {
             let x = f32::from_le_bytes(slice[0..4].try_into().unwrap());
             let y = f32::from_le_bytes(slice[4..8].try_into().unwrap());
             Ok(SimVal::Vec([x, y, 0.0, 0.0], 2))
         }
-        Ty::Vec3 | Ty::IVec3 => {
+        Ty::IVec2 => {
+            let x = i32::from_le_bytes(slice[0..4].try_into().unwrap());
+            let y = i32::from_le_bytes(slice[4..8].try_into().unwrap());
+            Ok(SimVal::IVec([x, y, 0, 0], 2))
+        }
+        Ty::UVec2 => {
+            let x = u32::from_le_bytes(slice[0..4].try_into().unwrap());
+            let y = u32::from_le_bytes(slice[4..8].try_into().unwrap());
+            Ok(SimVal::UVec([x, y, 0, 0], 2))
+        }
+        Ty::Vec3 => {
             let x = f32::from_le_bytes(slice[0..4].try_into().unwrap());
             let y = f32::from_le_bytes(slice[4..8].try_into().unwrap());
             let z = f32::from_le_bytes(slice[8..12].try_into().unwrap());
             Ok(SimVal::Vec([x, y, z, 0.0], 3))
+        }
+        Ty::IVec3 => {
+            let x = i32::from_le_bytes(slice[0..4].try_into().unwrap());
+            let y = i32::from_le_bytes(slice[4..8].try_into().unwrap());
+            let z = i32::from_le_bytes(slice[8..12].try_into().unwrap());
+            Ok(SimVal::IVec([x, y, z, 0], 3))
         }
         Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => {
             let x = f32::from_le_bytes(slice[0..4].try_into().unwrap());
@@ -3161,9 +3689,10 @@ fn decode_ty_from_bytes(
                 .iter()
                 .find(|e| e.canonical_name == *n || e.canonical_name == q)
             {
-                let v = match ed.repr_bytes {
-                    1 => i64::from(slice[0]),
-                    2 => i64::from(u16::from_le_bytes(slice.try_into().unwrap())),
+                let v = match (ed.repr_bytes, ed.is_signed) {
+                    (1, _) => i64::from(slice[0]),
+                    (2, _) => i64::from(u16::from_le_bytes(slice.try_into().unwrap())),
+                    (_, true) => i64::from(i32::from_le_bytes(slice.try_into().unwrap())),
                     _ => i64::from(u32::from_le_bytes(slice.try_into().unwrap())),
                 };
                 return Ok(SimVal::Int(v));
@@ -3174,7 +3703,7 @@ fn decode_ty_from_bytes(
     }
 }
 
-fn encode_ty_to_bytes(
+pub(crate) fn encode_ty_to_bytes(
     bytes: &mut [u8],
     offset: usize,
     ty: &Ty,
@@ -3214,14 +3743,36 @@ fn encode_ty_to_bytes(
             slice.copy_from_slice(&(as_float(val)? as f32).to_le_bytes());
         }
         Ty::F64 => slice.copy_from_slice(&as_float(val)?.to_le_bytes()),
-        Ty::Vec2 | Ty::UVec2 | Ty::IVec2 => {
+        Ty::Vec2 => {
             let SimVal::Vec(v, _) = val else {
                 return Err(format!("expected vec2, got `{val:?}`"));
             };
             slice[0..4].copy_from_slice(&v[0].to_le_bytes());
             slice[4..8].copy_from_slice(&v[1].to_le_bytes());
         }
-        Ty::Vec3 | Ty::IVec3 => {
+        Ty::IVec2 => match val {
+            SimVal::IVec(v, _) => {
+                slice[0..4].copy_from_slice(&v[0].to_le_bytes());
+                slice[4..8].copy_from_slice(&v[1].to_le_bytes());
+            }
+            SimVal::Vec(v, _) => {
+                slice[0..4].copy_from_slice(&(v[0] as i32).to_le_bytes());
+                slice[4..8].copy_from_slice(&(v[1] as i32).to_le_bytes());
+            }
+            other => return Err(format!("expected ivec2, got `{other:?}`")),
+        },
+        Ty::UVec2 => match val {
+            SimVal::UVec(v, _) => {
+                slice[0..4].copy_from_slice(&v[0].to_le_bytes());
+                slice[4..8].copy_from_slice(&v[1].to_le_bytes());
+            }
+            SimVal::Vec(v, _) => {
+                slice[0..4].copy_from_slice(&(v[0] as u32).to_le_bytes());
+                slice[4..8].copy_from_slice(&(v[1] as u32).to_le_bytes());
+            }
+            other => return Err(format!("expected uvec2, got `{other:?}`")),
+        },
+        Ty::Vec3 => {
             let SimVal::Vec(v, _) = val else {
                 return Err(format!("expected vec3, got `{val:?}`"));
             };
@@ -3229,6 +3780,19 @@ fn encode_ty_to_bytes(
             slice[4..8].copy_from_slice(&v[1].to_le_bytes());
             slice[8..12].copy_from_slice(&v[2].to_le_bytes());
         }
+        Ty::IVec3 => match val {
+            SimVal::IVec(v, _) => {
+                slice[0..4].copy_from_slice(&v[0].to_le_bytes());
+                slice[4..8].copy_from_slice(&v[1].to_le_bytes());
+                slice[8..12].copy_from_slice(&v[2].to_le_bytes());
+            }
+            SimVal::Vec(v, _) => {
+                slice[0..4].copy_from_slice(&(v[0] as i32).to_le_bytes());
+                slice[4..8].copy_from_slice(&(v[1] as i32).to_le_bytes());
+                slice[8..12].copy_from_slice(&(v[2] as i32).to_le_bytes());
+            }
+            other => return Err(format!("expected ivec3, got `{other:?}`")),
+        },
         Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => {
             let SimVal::Vec(v, _) = val else {
                 return Err(format!("expected vec4, got `{val:?}`"));
@@ -3266,14 +3830,14 @@ fn encode_ty_to_bytes(
     Ok(())
 }
 
-fn as_bool(v: &SimVal) -> Result<bool, String> {
+pub(crate) fn as_bool(v: &SimVal) -> Result<bool, String> {
     match v {
         SimVal::Bool(b) => Ok(*b),
         other => Err(format!("expected bool, got `{other:?}`")),
     }
 }
 
-fn as_int(v: &SimVal) -> Result<i64, String> {
+pub(crate) fn as_int(v: &SimVal) -> Result<i64, String> {
     match v {
         SimVal::Int(i) => Ok(*i),
         SimVal::Bool(b) => Ok(i64::from(*b)),
@@ -3281,7 +3845,7 @@ fn as_int(v: &SimVal) -> Result<i64, String> {
     }
 }
 
-fn as_float(v: &SimVal) -> Result<f64, String> {
+pub(crate) fn as_float(v: &SimVal) -> Result<f64, String> {
     match v {
         SimVal::Float(f) => Ok(*f),
         SimVal::Int(i) => Ok(*i as f64),
@@ -3289,9 +3853,9 @@ fn as_float(v: &SimVal) -> Result<f64, String> {
     }
 }
 
-fn sim_val_eq(a: &SimVal, b: &SimVal) -> bool {
+pub(crate) fn sim_val_eq(a: &SimVal, b: &SimVal) -> bool {
     match (a, b) {
-        (SimVal::Unit, SimVal::Unit) => true,
+        (SimVal::Unit, SimVal::Unit) | (SimVal::OptionHit(None), SimVal::OptionHit(None)) => true,
         (SimVal::Bool(x), SimVal::Bool(y)) => x == y,
         (SimVal::Int(x), SimVal::Int(y)) => x == y,
         (SimVal::Float(x), SimVal::Float(y)) => (x - y).abs() < 1e-6,
@@ -3302,11 +3866,19 @@ fn sim_val_eq(a: &SimVal, b: &SimVal) -> bool {
         (SimVal::Vec(x, dx), SimVal::Vec(y, dy)) if dx == dy => {
             (0..usize::from(*dx)).all(|i| (x[i] - y[i]).abs() < 1e-5)
         }
+        (SimVal::IVec(x, dx), SimVal::IVec(y, dy)) if dx == dy => {
+            (0..usize::from(*dx)).all(|i| x[i] == y[i])
+        }
+        (SimVal::UVec(x, dx), SimVal::UVec(y, dy)) if dx == dy => {
+            (0..usize::from(*dx)).all(|i| x[i] == y[i])
+        }
+        (SimVal::QueryHit { entity: a, .. }, SimVal::QueryHit { entity: b, .. }) => a == b,
+        (SimVal::OptionHit(Some(x)), SimVal::OptionHit(Some(y))) => sim_val_eq(x, y),
         _ => false,
     }
 }
 
-fn eval_unary(op: HirUnOp, v: SimVal) -> Result<SimVal, String> {
+pub(crate) fn eval_unary(op: HirUnOp, v: SimVal) -> Result<SimVal, String> {
     match (op, v) {
         (HirUnOp::Neg, SimVal::Int(i)) => Ok(SimVal::Int(-i)),
         (HirUnOp::Neg, SimVal::Float(f)) => Ok(SimVal::Float(-f)),
@@ -3316,6 +3888,12 @@ fn eval_unary(op: HirUnOp, v: SimVal) -> Result<SimVal, String> {
             }
             Ok(SimVal::Vec(vec, dims))
         }
+        (HirUnOp::Neg, SimVal::IVec(mut vec, dims)) => {
+            for lane in vec.iter_mut().take(usize::from(dims)) {
+                *lane = lane.wrapping_neg();
+            }
+            Ok(SimVal::IVec(vec, dims))
+        }
         (HirUnOp::Not, SimVal::Bool(b)) => Ok(SimVal::Bool(!b)),
         (HirUnOp::BitNot, SimVal::Int(i)) => Ok(SimVal::Int(!i)),
         (HirUnOp::Ref | HirUnOp::RefMut, inner) => Ok(inner),
@@ -3323,7 +3901,7 @@ fn eval_unary(op: HirUnOp, v: SimVal) -> Result<SimVal, String> {
     }
 }
 
-fn eval_cast(v: SimVal, target: &Ty) -> Result<SimVal, String> {
+pub(crate) fn eval_cast(v: SimVal, target: &Ty) -> Result<SimVal, String> {
     match target {
         Ty::Bool => Ok(SimVal::Bool(match v {
             SimVal::Bool(b) => b,
@@ -3331,12 +3909,75 @@ fn eval_cast(v: SimVal, target: &Ty) -> Result<SimVal, String> {
             SimVal::Float(f) => f != 0.0,
             other => return Err(format!("cannot cast `{other:?}` to bool")),
         })),
-        Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => {
+        Ty::I8 => {
+            let iv = match v {
+                SimVal::Int(i) => i64::from(i as i8),
+                SimVal::Float(f) => i64::from(f as i8),
+                SimVal::Bool(b) => i64::from(b),
+                other => return Err(format!("cannot cast `{other:?}` to i8")),
+            };
+            Ok(SimVal::Int(iv))
+        }
+        Ty::I16 => {
+            let iv = match v {
+                SimVal::Int(i) => i64::from(i as i16),
+                SimVal::Float(f) => i64::from(f as i16),
+                SimVal::Bool(b) => i64::from(b),
+                other => return Err(format!("cannot cast `{other:?}` to i16")),
+            };
+            Ok(SimVal::Int(iv))
+        }
+        Ty::I32 => {
+            let iv = match v {
+                SimVal::Int(i) => i64::from(i as i32),
+                SimVal::Float(f) => i64::from(f as i32),
+                SimVal::Bool(b) => i64::from(b),
+                other => return Err(format!("cannot cast `{other:?}` to i32")),
+            };
+            Ok(SimVal::Int(iv))
+        }
+        Ty::I64 => {
             let iv = match v {
                 SimVal::Int(i) => i,
                 SimVal::Float(f) => f as i64,
                 SimVal::Bool(b) => i64::from(b),
-                other => return Err(format!("cannot cast `{other:?}` to integer")),
+                other => return Err(format!("cannot cast `{other:?}` to i64")),
+            };
+            Ok(SimVal::Int(iv))
+        }
+        Ty::U8 => {
+            let iv = match v {
+                SimVal::Int(i) => i64::from(i as u8),
+                SimVal::Float(f) => i64::from(f as u8),
+                SimVal::Bool(b) => i64::from(b),
+                other => return Err(format!("cannot cast `{other:?}` to u8")),
+            };
+            Ok(SimVal::Int(iv))
+        }
+        Ty::U16 => {
+            let iv = match v {
+                SimVal::Int(i) => i64::from(i as u16),
+                SimVal::Float(f) => i64::from(f as u16),
+                SimVal::Bool(b) => i64::from(b),
+                other => return Err(format!("cannot cast `{other:?}` to u16")),
+            };
+            Ok(SimVal::Int(iv))
+        }
+        Ty::U32 | Ty::Sym | Ty::Rgba8 => {
+            let iv = match v {
+                SimVal::Int(i) => i64::from(i as u32),
+                SimVal::Float(f) => i64::from(f as u32),
+                SimVal::Bool(b) => i64::from(b),
+                other => return Err(format!("cannot cast `{other:?}` to u32")),
+            };
+            Ok(SimVal::Int(iv))
+        }
+        Ty::U64 => {
+            let iv = match v {
+                SimVal::Int(i) => i,
+                SimVal::Float(f) => (f as u64) as i64,
+                SimVal::Bool(b) => i64::from(b),
+                other => return Err(format!("cannot cast `{other:?}` to u64")),
             };
             Ok(SimVal::Int(iv))
         }
@@ -3345,7 +3986,7 @@ fn eval_cast(v: SimVal, target: &Ty) -> Result<SimVal, String> {
     }
 }
 
-fn eval_binop_vals(op: HirBinOp, lv: SimVal, rv: SimVal) -> Result<SimVal, String> {
+pub(crate) fn eval_binop_vals(op: HirBinOp, lv: SimVal, rv: SimVal) -> Result<SimVal, String> {
     match (lv, rv) {
         (SimVal::Vec(mut a, da), SimVal::Vec(b, db)) if da == db => {
             if op == HirBinOp::Eq {
@@ -3368,6 +4009,44 @@ fn eval_binop_vals(op: HirBinOp, lv: SimVal, rv: SimVal) -> Result<SimVal, Strin
                 };
             }
             Ok(SimVal::Vec(a, da))
+        }
+        (SimVal::IVec(mut a, da), SimVal::IVec(b, db)) if da == db => {
+            if op == HirBinOp::Eq {
+                return Ok(SimVal::Bool((0..usize::from(da)).all(|i| a[i] == b[i])));
+            }
+            if op == HirBinOp::Ne {
+                return Ok(SimVal::Bool((0..usize::from(da)).any(|i| a[i] != b[i])));
+            }
+            for i in 0..usize::from(da) {
+                a[i] = match op {
+                    HirBinOp::Add => a[i].wrapping_add(b[i]),
+                    HirBinOp::Sub => a[i].wrapping_sub(b[i]),
+                    HirBinOp::Mul => a[i].wrapping_mul(b[i]),
+                    HirBinOp::Div if b[i] != 0 => a[i].wrapping_div(b[i]),
+                    HirBinOp::Div => return Err("ivec division by zero in sim_test".to_owned()),
+                    _ => return Err(format!("unsupported ivec binop `{op:?}`")),
+                };
+            }
+            Ok(SimVal::IVec(a, da))
+        }
+        (SimVal::UVec(mut a, da), SimVal::UVec(b, db)) if da == db => {
+            if op == HirBinOp::Eq {
+                return Ok(SimVal::Bool((0..usize::from(da)).all(|i| a[i] == b[i])));
+            }
+            if op == HirBinOp::Ne {
+                return Ok(SimVal::Bool((0..usize::from(da)).any(|i| a[i] != b[i])));
+            }
+            for i in 0..usize::from(da) {
+                a[i] = match op {
+                    HirBinOp::Add => a[i].wrapping_add(b[i]),
+                    HirBinOp::Sub => a[i].wrapping_sub(b[i]),
+                    HirBinOp::Mul => a[i].wrapping_mul(b[i]),
+                    HirBinOp::Div if b[i] != 0 => a[i] / b[i],
+                    HirBinOp::Div => return Err("uvec division by zero in sim_test".to_owned()),
+                    _ => return Err(format!("unsupported uvec binop `{op:?}`")),
+                };
+            }
+            Ok(SimVal::UVec(a, da))
         }
         (SimVal::Vec(mut a, da), s @ (SimVal::Float(_) | SimVal::Int(_))) => {
             let sv = as_float(&s)? as f32;
@@ -3460,7 +4139,7 @@ fn eval_binop_vals(op: HirBinOp, lv: SimVal, rv: SimVal) -> Result<SimVal, Strin
     }
 }
 
-fn apply_assign_op(op: HirAssignOp, old: SimVal, rhs: SimVal) -> Result<SimVal, String> {
+pub(crate) fn apply_assign_op(op: HirAssignOp, old: SimVal, rhs: SimVal) -> Result<SimVal, String> {
     let bin = match op {
         HirAssignOp::Set => return Ok(rhs),
         HirAssignOp::AddAssign => HirBinOp::Add,
@@ -3477,7 +4156,7 @@ fn apply_assign_op(op: HirAssignOp, old: SimVal, rhs: SimVal) -> Result<SimVal, 
     eval_binop_vals(bin, old, rhs)
 }
 
-fn eval_math_fn(name: &str, args: &[SimVal]) -> Result<SimVal, String> {
+pub(crate) fn eval_math_fn(name: &str, args: &[SimVal]) -> Result<SimVal, String> {
     match name {
         "abs" => {
             let v = args.first().ok_or("abs requires 1 arg")?;
@@ -3539,6 +4218,20 @@ fn eval_math_fn(name: &str, args: &[SimVal]) -> Result<SimVal, String> {
                 }
                 Ok(SimVal::Float(sum))
             }
+            (Some(SimVal::IVec(a, da)), Some(SimVal::IVec(b, db))) if da == db => {
+                let mut sum = 0i64;
+                for i in 0..usize::from(*da) {
+                    sum += i64::from(a[i]) * i64::from(b[i]);
+                }
+                Ok(SimVal::Int(sum))
+            }
+            (Some(SimVal::UVec(a, da)), Some(SimVal::UVec(b, db))) if da == db => {
+                let mut sum = 0i64;
+                for i in 0..usize::from(*da) {
+                    sum += i64::from(a[i]) * i64::from(b[i]);
+                }
+                Ok(SimVal::Int(sum))
+            }
             _ => Err("dot requires two matching vectors".to_owned()),
         },
         _ => Err(format!("unknown math function `{name}`")),
@@ -3558,6 +4251,7 @@ mod tests {
     /// `GraceWindow`, `InputBuffer`, and `PadInput`) inside a headless `bamabi_host` Bevy `World`.
     #[test]
     fn metroidvania_coyote_within_95ms_passes_real_execution() {
+        let _alloc_guard = crate::test_alloc_read_guard();
         let cookbook = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
@@ -3582,6 +4276,7 @@ mod tests {
     /// near `0.0` and `assert(vy > 14.0)` fails!
     #[test]
     fn metroidvania_expired_coyote_after_95ms_fails_real_execution() {
+        let _alloc_guard = crate::test_alloc_read_guard();
         let cookbook = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
@@ -3636,6 +4331,7 @@ mod tests {
     /// allocation counting work end-to-end without any gameplay mocks.
     #[test]
     fn mod_local_resource_roundtrip_and_alloc_region_work() {
+        let _alloc_guard = crate::test_alloc_write_guard();
         let src = r#"
 module test::res_roundtrip @version(1.0.0);
 
@@ -3704,6 +4400,7 @@ sim_test "resource_mutation_drives_system" {
     /// host-registered via `ModAppExt::register_mod_resource`.
     #[test]
     fn host_registered_resource_apply_and_export_work() {
+        let _alloc_guard = crate::test_alloc_read_guard();
         let mut app = App::new();
         app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
         app.world_mut().insert_resource(HostClock {

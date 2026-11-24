@@ -69,4 +69,40 @@ proptest! {
         let mir = lower_to_mir(&sema);
         prop_assert!(verify_mir(&mir).is_ok());
     }
+
+    /// Verifies arbitrary `atomic { ... require_true(...) } on_rollback { ... }` and `spatial_grid`
+    /// modules lower cleanly to pre-image undo logs + 2-pass CSR and pass `verify_mir`.
+    #[test]
+    fn generated_atomic_and_spatial_modules_lower_and_verify(
+        cell_size in 1u32..32,
+        cap in 16u32..512,
+        opt_mut in any::<bool>(),
+    ) {
+        let opt_term = if opt_mut { ", b: ?&mut Bonus" } else { ", b: ?&Bonus" };
+        let opt_body = if opt_mut {
+            "if let Some(opt) = e.b { opt.val += 1.0; }"
+        } else {
+            "if e.b.is_some() { let _v = e.b.unwrap().val; }"
+        };
+        let src = format!(
+            "module prop::atomic_spatial @version(1.0.0);\n\
+             resource Vault {{ gold: i32 = 100 }}\n\
+             component Pos2D {{ xy: vec2 = vec2::ZERO }}\n\
+             component Bonus {{ val: f32 = 2.0 }}\n\
+             spatial_grid G(cell_size: {cell_size}.0_m, bounds: vec2(-64.0_m, -64.0_m)..vec2(64.0_m, 64.0_m), capacity: {cap}) over Pos2D by Pos2D.xy;\n\
+             sys s(v: &mut Vault) {{\n\
+                 atomic {{\n\
+                     v.gold -= 10;\n\
+                     require_true(v.gold >= 0);\n\
+                 }} on_rollback {{ }}\n\
+                 for e in query(p: &Pos2D{opt_term}) {{ {opt_body} }}\n\
+                 for cand in G.query_disc(vec2::ZERO, 8.0_m) {{ let _e = cand.entity; }}\n\
+             }}\n\
+             schedule FixedUpdate {{ s }}\n"
+        );
+        let sema = analyze_source("prop_atomic_spatial.strata", &src);
+        prop_assert!(sema.ok(), "{:?}", sema.diagnostics);
+        let mir = lower_to_mir(&sema);
+        prop_assert!(verify_mir(&mir).is_ok());
+    }
 }

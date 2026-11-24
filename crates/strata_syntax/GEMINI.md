@@ -1,13 +1,13 @@
 # Agent Guide: `strata_syntax`
 
-Crate guide for **`strata_syntax`** (`v0.3.0`) — zero-Bevy, lossless CST frontend and canonical formatter for Strata v2.0.
+Crate guide for **`strata_syntax`** (`v0.3.0`) — zero-Bevy, lossless CST frontend, canonical formatter, and Graph IR engine for Strata v2.0.
 
 ---
 
 ## 1. Crate Identity & Allowed Dependencies
 - **Name:** `strata_syntax` (`edition = "2024"`, MSRV `1.95`)
 - **Bevy Isolation:** **ZERO `bevy*` dependencies**.
-- **Allowed Dependencies:** `logos`, `rowan`, `serde`, `thiserror`. NEVER add `bamabi*` or `bevy*` dependencies.
+- **Allowed Dependencies:** `logos`, `rowan`, `serde`, `serde_json`, `thiserror`. NEVER add `bamabi*` or `bevy*` dependencies.
 
 ---
 
@@ -22,6 +22,7 @@ Crate guide for **`strata_syntax`** (`v0.3.0`) — zero-Bevy, lossless CST front
 - **`Parser` & `Parse` (`parser.rs`):** Error-recovering LL(2)/Pratt parser producing a lossless `rowan::SyntaxNode` (`syntax().text() == src` invariant) and structured `ParseError`s.
 - **Typed AST (`ast.rs`):** Safe `rowan::ast::AstNode` wrappers over the CST consumed by `strata_sema`.
 - **Canonical Formatter (`fmt.rs`):** Idempotent `stratafmt` formatter preserving trivia/comments.
+- **Graph IR & Sidecars (`graph_ir.rs`):** Lossless CST <-> Graph IR JSON serialization (`export_graph_ir`, `apply_graph_patch`, `apply_graph_document`) and hash-isolated `.strata.graph.json` layout sidecars (`load_sidecar`, `merge_sidecar`, `save_sidecar`).
 
 ---
 

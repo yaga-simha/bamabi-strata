@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 description = "Zero-Bevy Cranelift PIC native .dylib/.so compiler for StrataMir targeting bamabi ABI 0.3.0"
 
+[features]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+
 [dependencies]
 bamabi_sys.workspace = true
 cranelift-codegen.workspace = true
@@ -21,8 +26,14 @@ target-lexicon.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+hotpath.workspace = true
 strata_syntax.workspace = true
 tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "jit_bench"
+harness = false

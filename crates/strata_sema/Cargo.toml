@@ -8,6 +8,11 @@ authors.workspace = true
 repository.workspace = true
 description = "Salsa incremental semantic analyzer, AbiPod layout solver, ComponentUuid parity, and Theorem 0.1 access prover for Strata v2.0"
 
+[features]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+
 [dependencies]
 bamabi_sys.workspace = true
 indexmap.workspace = true
@@ -15,10 +20,17 @@ salsa.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 strata_syntax.workspace = true
+rowan.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+hotpath.workspace = true
 proptest.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "sema_bench"
+harness = false

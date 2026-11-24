@@ -16,6 +16,7 @@ mod tests {
     /// Verifies all deterministic CI exit codes are distinct non-negative process codes.
     #[test]
     fn exit_codes_are_unique_and_documented() {
+        let _alloc_guard = crate::test_alloc_read_guard();
         let codes = [
             EXIT_OK,
             EXIT_COMPILE_ERROR,

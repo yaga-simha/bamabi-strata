@@ -11,6 +11,7 @@ pub mod runtime_bench;
 pub mod stats;
 
 use report::BenchmarkReport;
+use runtime_bench::ParGatePolicy;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -26,6 +27,8 @@ enum SuiteChoice {
 #[derive(Debug)]
 struct BenchArgs {
     quick: bool,
+    enforce_par_gate: bool,
+    warn_only_par_gate: bool,
     suite: SuiteChoice,
     json_path: Option<PathBuf>,
     markdown_path: Option<PathBuf>,
@@ -35,6 +38,8 @@ struct BenchArgs {
 fn parse_bench_args(args: &[String]) -> Result<BenchArgs, String> {
     let mut out = BenchArgs {
         quick: false,
+        enforce_par_gate: false,
+        warn_only_par_gate: false,
         suite: SuiteChoice::All,
         json_path: None,
         markdown_path: None,
@@ -45,6 +50,8 @@ fn parse_bench_args(args: &[String]) -> Result<BenchArgs, String> {
         match args[i].as_str() {
             "-h" | "--help" => out.help = true,
             "--quick" => out.quick = true,
+            "--enforce-par-gate" => out.enforce_par_gate = true,
+            "--warn-only-par-gate" => out.warn_only_par_gate = true,
             "--suite" => {
                 i += 1;
                 let v = args
@@ -71,6 +78,11 @@ fn parse_bench_args(args: &[String]) -> Result<BenchArgs, String> {
         }
         i += 1;
     }
+    if out.enforce_par_gate && out.warn_only_par_gate {
+        return Err(
+            "--enforce-par-gate and --warn-only-par-gate are mutually exclusive".to_owned(),
+        );
+    }
     Ok(out)
 }
 
@@ -85,7 +97,7 @@ fn main() -> ExitCode {
     };
     if cfg.help {
         println!(
-            "Usage: strata_bench [--quick] [--suite <all|compiler|runtime>] [--json <path>] [--markdown <path>]"
+            "Usage: strata_bench [--quick] [--enforce-par-gate | --warn-only-par-gate] [--suite <all|compiler|runtime>] [--json <path>] [--markdown <path>]"
         );
         return ExitCode::SUCCESS;
     }
@@ -102,8 +114,18 @@ fn main() -> ExitCode {
         Vec::new()
     };
 
-    let runtime = if matches!(cfg.suite, SuiteChoice::All | SuiteChoice::Runtime) {
-        match runtime_bench::run_runtime_suite(cfg.quick) {
+    let (runtime, par_gate) = if matches!(cfg.suite, SuiteChoice::All | SuiteChoice::Runtime) {
+        let host_threads = std::thread::available_parallelism().map_or(1, usize::from);
+        let allow_variance = env::var("STRATA_BENCH_ALLOW_HOST_VARIANCE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let policy = ParGatePolicy {
+            quick: cfg.quick,
+            enforce_par_gate: cfg.enforce_par_gate,
+            warn_only_par_gate: cfg.warn_only_par_gate || allow_variance,
+            host_threads,
+            in_ci: env::var("CI").is_ok(),
+        };
+        match runtime_bench::run_runtime_suite_with_policy(policy) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("runtime benchmark failed: {e}");
@@ -111,7 +133,7 @@ fn main() -> ExitCode {
             }
         }
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
 
     let report = BenchmarkReport {
@@ -123,6 +145,7 @@ fn main() -> ExitCode {
         },
         compiler,
         runtime,
+        par_gate,
     };
 
     let md = report.render_markdown();
@@ -148,6 +171,24 @@ fn main() -> ExitCode {
         }
     }
 
+    if let Some(ref gate) = report.par_gate
+        && gate.enforced
+        && !gate.passed
+    {
+        let failed: Vec<String> = gate
+            .targets
+            .iter()
+            .filter(|t| t.required && !t.passed)
+            .map(|t| format!("{}={:.3} ns/entity", t.subject, t.ns_per_entity))
+            .collect();
+        eprintln!(
+            "@par(chunk = 1024) 100k gate failed (threshold <= {:.2} ns/entity): {}",
+            gate.threshold_ns_per_entity,
+            failed.join(", ")
+        );
+        return ExitCode::FAILURE;
+    }
+
     ExitCode::SUCCESS
 }
 
@@ -160,6 +201,7 @@ mod tests {
     fn bench_cli_parser_handles_flags_and_errors() {
         let cfg = parse_bench_args(&[
             "--quick".to_owned(),
+            "--enforce-par-gate".to_owned(),
             "--suite".to_owned(),
             "runtime".to_owned(),
             "--json".to_owned(),
@@ -167,8 +209,17 @@ mod tests {
         ])
         .unwrap();
         assert!(cfg.quick);
+        assert!(cfg.enforce_par_gate);
+        assert!(!cfg.warn_only_par_gate);
         assert_eq!(cfg.suite, SuiteChoice::Runtime);
         assert_eq!(cfg.json_path, Some(PathBuf::from("out.json")));
         assert!(parse_bench_args(&["--suite".to_owned(), "bad".to_owned()]).is_err());
+        assert!(
+            parse_bench_args(&[
+                "--enforce-par-gate".to_owned(),
+                "--warn-only-par-gate".to_owned()
+            ])
+            .is_err()
+        );
     }
 }

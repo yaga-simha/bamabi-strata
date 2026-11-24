@@ -103,11 +103,22 @@ pub enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
         /// Package artifacts into a signed `.bampack` archive using Ed25519 keys.
-        #[arg(long)]
+        #[arg(long, requires = "signing_key")]
         bampack: bool,
         /// Sign the built shared library / `.bampack` with Ed25519 `SSHSIG`.
-        #[arg(long)]
+        #[arg(long, requires = "signing_key")]
         sign: bool,
+        /// Path to an OpenSSH Ed25519 private key file for deterministic signing.
+        #[arg(
+            long,
+            value_name = "PATH",
+            group = "signing_key",
+            conflicts_with = "ephemeral_key"
+        )]
+        key: Option<PathBuf>,
+        /// Generate and use a throwaway ephemeral Ed25519 keypair (development/testing only).
+        #[arg(long, group = "signing_key", conflicts_with = "key")]
+        ephemeral_key: bool,
         /// Output format (`text` or `json`).
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
@@ -117,8 +128,19 @@ pub enum Commands {
         /// Path to `.strata` source file.
         file: PathBuf,
         /// Sign rebuilt `.dylib` via Ed25519.
-        #[arg(long)]
+        #[arg(long, requires = "signing_key")]
         sign: bool,
+        /// Path to an OpenSSH Ed25519 private key file for deterministic signing.
+        #[arg(
+            long,
+            value_name = "PATH",
+            group = "signing_key",
+            conflicts_with = "ephemeral_key"
+        )]
+        key: Option<PathBuf>,
+        /// Generate and use a throwaway ephemeral Ed25519 keypair (development/testing only).
+        #[arg(long, group = "signing_key", conflicts_with = "key")]
+        ephemeral_key: bool,
         /// Run one watch/rebuild cycle immediately and exit (for CI & tests).
         #[arg(long)]
         once: bool,
@@ -146,6 +168,35 @@ pub enum Commands {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
+    /// Export or apply visual node Graph IR JSON and `.strata.graph.json` layout sidecars.
+    Graph {
+        /// Graph action (`export` or `apply`).
+        #[command(subcommand)]
+        action: GraphAction,
+    },
+}
+
+/// Subcommands for `stratac graph`.
+#[derive(Debug, Subcommand)]
+pub enum GraphAction {
+    /// Export lossless Graph IR JSON (merging `.strata.graph.json` sidecar positions).
+    Export {
+        /// Path to `.strata` source file.
+        file: PathBuf,
+        /// Output format (`text` or `json`).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Apply a Graph IR document or delta patch JSON to `.strata` and `.strata.graph.json`.
+    Apply {
+        /// Path to `.strata` source file.
+        file: PathBuf,
+        /// Path to Graph IR document or delta patch JSON file.
+        patch: PathBuf,
+        /// Output format (`text` or `json`).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
 }
 
 #[cfg(test)]
@@ -155,6 +206,7 @@ mod tests {
     /// Verifies `stratac` parses all 8 subcommands and flags cleanly and rejects invalid targets.
     #[test]
     fn cli_parses_subcommands_and_rejects_unknown_target() {
+        let _alloc_guard = crate::test_alloc_read_guard();
         let cli = Cli::try_parse_from([
             "stratac",
             "build",
@@ -163,6 +215,7 @@ mod tests {
             "rust-guest",
             "--release",
             "--sign",
+            "--ephemeral-key",
             "--format",
             "json",
         ])
@@ -172,11 +225,14 @@ mod tests {
                 target,
                 release,
                 sign,
+                key,
+                ephemeral_key,
                 format,
                 ..
             } => {
                 assert_eq!(target, BuildTarget::RustGuest);
-                assert!(release && sign);
+                assert!(release && sign && ephemeral_key);
+                assert!(key.is_none());
                 assert_eq!(format, OutputFormat::Json);
             }
             other => panic!("unexpected command parsed: {other:?}"),
@@ -204,5 +260,147 @@ mod tests {
         assert!(
             Cli::try_parse_from(["stratac", "build", "sim.strata", "--target", "bogus"]).is_err()
         );
+    }
+
+    /// Verifies `--key <path>` and `--ephemeral-key` requirements and mutual exclusion on `build` and `watch`.
+    #[test]
+    fn cli_enforces_signing_key_flags_and_conflicts() {
+        let _alloc_guard = crate::test_alloc_read_guard();
+        // Unsigned build and watch succeed with neither flag.
+        assert!(Cli::try_parse_from(["stratac", "build", "sim.strata"]).is_ok());
+        assert!(Cli::try_parse_from(["stratac", "watch", "sim.strata"]).is_ok());
+
+        // Signed/packaged build and signed watch accept `--key <path>` or `--ephemeral-key`.
+        let build_key = Cli::try_parse_from([
+            "stratac",
+            "build",
+            "sim.strata",
+            "--sign",
+            "--key",
+            "id.ed25519",
+        ])
+        .expect("build --sign --key parses");
+        assert!(matches!(
+            build_key.command,
+            Commands::Build {
+                sign: true,
+                key: Some(_),
+                ephemeral_key: false,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "stratac",
+                "build",
+                "sim.strata",
+                "--bampack",
+                "--ephemeral-key"
+            ])
+            .is_ok()
+        );
+
+        let watch_key = Cli::try_parse_from([
+            "stratac",
+            "watch",
+            "sim.strata",
+            "--sign",
+            "--key",
+            "id.ed25519",
+            "--once",
+        ])
+        .expect("watch --sign --key --once parses");
+        assert!(matches!(
+            watch_key.command,
+            Commands::Watch {
+                sign: true,
+                key: Some(_),
+                ephemeral_key: false,
+                once: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "stratac",
+                "watch",
+                "sim.strata",
+                "--sign",
+                "--ephemeral-key"
+            ])
+            .is_ok()
+        );
+
+        // Missing key source when signing/packaging is rejected.
+        assert!(Cli::try_parse_from(["stratac", "build", "sim.strata", "--sign"]).is_err());
+        assert!(Cli::try_parse_from(["stratac", "build", "sim.strata", "--bampack"]).is_err());
+        assert!(Cli::try_parse_from(["stratac", "watch", "sim.strata", "--sign"]).is_err());
+
+        // Conflicting `--key` + `--ephemeral-key` is rejected on both `build` and `watch`.
+        assert!(
+            Cli::try_parse_from([
+                "stratac",
+                "build",
+                "sim.strata",
+                "--sign",
+                "--key",
+                "id.ed25519",
+                "--ephemeral-key",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "stratac",
+                "watch",
+                "sim.strata",
+                "--sign",
+                "--key",
+                "id.ed25519",
+                "--ephemeral-key",
+            ])
+            .is_err()
+        );
+    }
+
+    /// Verifies `stratac graph export` and `stratac graph apply` CLI parsing.
+    #[test]
+    fn cli_parses_graph_export_and_apply() {
+        let _alloc_guard = crate::test_alloc_read_guard();
+
+        let export_json =
+            Cli::try_parse_from(["stratac", "graph", "export", "boss.strata", "--format=json"])
+                .expect("graph export --format=json parses");
+        match export_json.command {
+            Commands::Graph {
+                action: GraphAction::Export { file, format },
+            } => {
+                assert_eq!(file, PathBuf::from("boss.strata"));
+                assert_eq!(format, OutputFormat::Json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let apply_default =
+            Cli::try_parse_from(["stratac", "graph", "apply", "boss.strata", "patch.json"])
+                .expect("graph apply parses");
+        match apply_default.command {
+            Commands::Graph {
+                action:
+                    GraphAction::Apply {
+                        file,
+                        patch,
+                        format,
+                    },
+            } => {
+                assert_eq!(file, PathBuf::from("boss.strata"));
+                assert_eq!(patch, PathBuf::from("patch.json"));
+                assert_eq!(format, OutputFormat::Text);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        assert!(Cli::try_parse_from(["stratac", "graph", "apply", "boss.strata"]).is_err());
+        assert!(Cli::try_parse_from(["stratac", "graph", "unknown", "boss.strata"]).is_err());
     }
 }

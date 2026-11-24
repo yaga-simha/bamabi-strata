@@ -78,6 +78,9 @@ pub struct QueryAccessDesc {
     pub with_filters: BTreeSet<String>,
     /// `Without<T>` archetype exclusion filters.
     pub without_filters: BTreeSet<String>,
+    /// `.changed()` / `.changed<T>()` change-detection filters.
+    #[serde(default)]
+    pub changed_filters: BTreeSet<String>,
     /// `true` when this descriptor comes from a `task`'s `on (...)` header.
     pub is_task_on_header: bool,
     /// `true` when this query is a single-entity `.on(id)` point lookup.
@@ -89,6 +92,13 @@ pub struct QueryAccessDesc {
 }
 
 impl QueryAccessDesc {
+    /// Returns `true` if `storage_key` (or its base component) has a `.changed()` filter.
+    pub fn is_term_changed(&self, storage_key: &str) -> bool {
+        self.changed_filters
+            .iter()
+            .any(|f| storage_keys_overlap(f, storage_key))
+    }
+
     /// Returns `true` iff `self` and `other` cannot match any shared archetype due to complementary
     /// `With<X>` / `Without<X>` filters (Theorem 0.1 archetype disjointness).
     pub fn is_archetype_disjoint_from(&self, other: &Self) -> bool {

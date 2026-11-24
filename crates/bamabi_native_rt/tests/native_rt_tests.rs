@@ -111,12 +111,29 @@ fn dense_chunk_slice_iter_and_par_iter_update_100k_entities() {
         .collect();
     world.spawn_batch(batch);
 
-    fn integrate_par(mut q: Query<(&mut Pos3D, &Vel3D)>) {
+    // Step 1: verify sequential contiguous slice iteration with read-only `&Vel3D` + `&mut Pos3D`.
+    fn integrate_slice(mut q: Query<(&mut Pos3D, &Vel3D)>) {
+        for (mut pos_cm, vel) in q.strata_contiguous_iter_mut().expect("dense query") {
+            let pos = pos_cm.bypass_change_detection();
+            for (p, v) in pos.iter_mut().zip(vel.iter()) {
+                p.x += v.dx;
+                p.y += v.dy;
+                p.z += v.dz;
+            }
+        }
+    }
+
+    // Step 2: verify parallel contiguous chunk iteration across all 100k entities.
+    // Uses `&mut Vel3D` (`bypass_change_detection()`) because `bevy_ecs 0.20.1` has an upstream
+    // `debug_assert_eq!(slice.len(), entities.len())` bug in `ContiguousQueryData for &T` /
+    // `Ref<T>` (`fetch.rs:2054`, `2357`) when `bevy_ecs/multi_threaded` splits a large table into
+    // sub-chunks (`state.rs:1830-1835` passes full `table.entities()` with a sub-chunk `range`).
+    fn integrate_par(mut q: Query<(&mut Pos3D, &mut Vel3D)>) {
         q.strata_contiguous_par_iter_mut()
             .expect("dense query")
-            .for_each(|(mut pos_cm, vel_ref)| {
+            .for_each(|(mut pos_cm, mut vel_cm)| {
                 let pos = pos_cm.bypass_change_detection();
-                let vel = vel_ref;
+                let vel = vel_cm.bypass_change_detection();
                 for (p, v) in pos.iter_mut().zip(vel.iter()) {
                     p.x += v.dx;
                     p.y += v.dy;
@@ -126,13 +143,17 @@ fn dense_chunk_slice_iter_and_par_iter_update_100k_entities() {
     }
 
     let mut schedule = bevy_ecs::schedule::Schedule::default();
-    schedule.add_systems(integrate_par);
+    schedule.add_systems((integrate_slice, integrate_par).chain());
     schedule.run(&mut world);
 
     let mut check_q = world.query::<&Pos3D>();
     let count = check_q.iter(&world).count();
     assert_eq!(count, 100_000);
-    assert!(check_q.iter(&world).all(|p| (p.y - 2.0).abs() < 1e-6));
+    assert!(
+        check_q
+            .iter(&world)
+            .all(|p| (p.y - 4.0).abs() < 1e-6 && (p.z - 1.0).abs() < 1e-6)
+    );
 }
 
 #[derive(Resource, Default)]

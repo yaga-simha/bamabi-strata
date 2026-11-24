@@ -433,10 +433,14 @@ impl Fixed32 {
         Self((v as i32) << 16)
     }
 
-    /// Converts an `f32` into Q16.16 fixed-point with deterministic round-to-nearest.
+    /// Converts an `f32` into Q16.16 fixed-point with deterministic round-to-nearest (`0` on non-finite).
     #[inline]
     pub fn from_f32(v: f32) -> Self {
-        Self((v * (Self::SCALE as f32)).round() as i32)
+        if v.is_finite() {
+            Self(((v as f64) * (Self::SCALE as f64)).round() as i32)
+        } else {
+            Self(0)
+        }
     }
 
     /// Converts this Q16.16 fixed-point value to `f32`.
@@ -474,6 +478,9 @@ impl Div for Fixed32 {
     type Output = Self;
     #[inline]
     fn div(self, rhs: Self) -> Self {
+        if rhs.0 == 0 {
+            return Self(0);
+        }
         Self((((self.0 as i64) << 16) / (rhs.0 as i64)) as i32)
     }
 }
@@ -501,16 +508,53 @@ impl Fixed64 {
         Self((v as i64) << 32)
     }
 
-    /// Converts an `f64` into Q32.32 fixed-point.
+    /// Converts an `f64` into Q32.32 fixed-point (`0` on non-finite).
     #[inline]
     pub fn from_f64(v: f64) -> Self {
-        Self((v * (Self::SCALE as f64)).round() as i64)
+        if v.is_finite() {
+            Self((v * (Self::SCALE as f64)).round() as i64)
+        } else {
+            Self(0)
+        }
     }
 
     /// Converts this Q32.32 fixed-point value to `f64`.
     #[inline]
     pub fn to_f64(self) -> f64 {
         (self.0 as f64) / (Self::SCALE as f64)
+    }
+
+    /// Reference 96-by-64 unsigned restoring division matching C99 (`strata_fix64_div`) and
+    /// Cranelift JIT (`__strata_fix64_div`) Q32.32 semantics without `i128` division, returning
+    /// `Fixed64(0)` on zero divisor.
+    #[inline]
+    pub const fn div_restoring(self, rhs: Self) -> Self {
+        if rhs.0 == 0 {
+            return Self(0);
+        }
+        let neg = (self.0 ^ rhs.0) < 0;
+        let ua = self.0.unsigned_abs();
+        let ub = rhs.0.unsigned_abs();
+        let mut rem = (ua >> 32) % ub;
+        let mut lo = ua << 32;
+        let mut quo = 0u64;
+        let mut i = 0;
+        while i < 64 {
+            let carry = rem >> 63;
+            rem = (rem << 1) | (lo >> 63);
+            lo <<= 1;
+            quo <<= 1;
+            if carry != 0 || rem >= ub {
+                rem = rem.wrapping_sub(ub);
+                quo |= 1;
+            }
+            i += 1;
+        }
+        Self(if neg {
+            quo.wrapping_neg() as i64
+        } else {
+            quo as i64
+        })
     }
 }
 
@@ -542,6 +586,9 @@ impl Div for Fixed64 {
     type Output = Self;
     #[inline]
     fn div(self, rhs: Self) -> Self {
+        if rhs.0 == 0 {
+            return Self(0);
+        }
         Self((((self.0 as i128) << 32) / (rhs.0 as i128)) as i64)
     }
 }
@@ -646,5 +693,39 @@ mod tests {
         assert_eq!((a / b).to_f32(), 2.0);
         let d = Fixed64::from_int(5) - Fixed64::from_f64(1.25);
         assert_eq!(d.to_f64(), 3.75);
+        assert_eq!(
+            Fixed64::from_f64(7.5) / Fixed64::from_f64(2.5),
+            Fixed64::from_int(3)
+        );
+        assert_eq!(
+            Fixed64::from_f64(-7.5) / Fixed64::from_f64(2.5),
+            Fixed64::from_int(-3)
+        );
+        assert_eq!(
+            Fixed64::from_int(1) / Fixed64::from_int(3),
+            Fixed64((1i64 << 32) / 3)
+        );
+        // Zero-divisor totality and negative/MIN restoring parity
+        assert_eq!(Fixed32::from_int(3) / Fixed32(0), Fixed32(0));
+        assert_eq!(Fixed64::from_int(5) / Fixed64(0), Fixed64(0));
+        assert_eq!(Fixed32::from_f32(f32::NAN), Fixed32(0));
+        assert_eq!(Fixed32::from_f32(f32::INFINITY), Fixed32(0));
+        assert_eq!(Fixed32::from_f32(f32::NEG_INFINITY), Fixed32(0));
+        assert_eq!(Fixed64::from_f64(f64::NAN), Fixed64(0));
+        assert_eq!(Fixed64::from_f64(f64::INFINITY), Fixed64(0));
+        assert_eq!(Fixed64::from_f64(f64::NEG_INFINITY), Fixed64(0));
+        for &(a, b) in &[
+            (i64::MIN, -1),
+            (i64::MIN, i64::MIN),
+            (i64::MIN, 2),
+            (i64::MAX, -3),
+            (-1_234_567_890_123, 987_654_321),
+            (0, -1),
+            (1, 0),
+        ] {
+            let lhs = Fixed64(a);
+            let rhs = Fixed64(b);
+            assert_eq!(lhs / rhs, lhs.div_restoring(rhs), "a={a} b={b}");
+        }
     }
 }

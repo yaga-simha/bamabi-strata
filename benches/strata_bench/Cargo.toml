@@ -14,7 +14,7 @@ bamabi_host.workspace = true
 bamabi_native_rt.workspace = true
 bamabi_sys.workspace = true
 bevy_app.workspace = true
-bevy_ecs.workspace = true
+bevy_ecs = { workspace = true, features = ["multi_threaded"] }
 serde.workspace = true
 serde_json.workspace = true
 strata_codegen.workspace = true

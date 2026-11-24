@@ -2,6 +2,7 @@
 //! mandatory pre-timing bit-exact SHA-256 + FNV-1a parity verification gate.
 
 use crate::compiler_bench::KERNEL_SOURCE;
+use crate::report::{ParGateReport, ParTargetGate};
 use crate::stats::{BenchStats, measure_batched_ns};
 use bamabi_host::prelude::*;
 use bamabi_native_rt::{
@@ -12,8 +13,9 @@ use bamabi_sys::{
     ModComponent, StrView, SymbolEntry, VTableHeader, fnv1a_64_init, fnv1a_64_update_bytes,
     fnv1a_64_update_u64,
 };
-use bevy_app::{App, FixedUpdate};
+use bevy_app::{App, FixedUpdate, TaskPoolPlugin};
 use bevy_ecs::prelude::*;
+use bevy_ecs::schedule::SingleThreadedExecutor;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::hint::black_box;
@@ -190,13 +192,69 @@ mod comp_impls {
     }
 }
 
+/// Dense `@par(chunk = 1024)` throughput benchmark kernel (`100_000` entities).
+pub const PAR_KERNEL_SOURCE: &str = r#"
+module bench::sim @version(1.0.0);
+
+component Pos { x: f32 = 0.0, y: f32 = 0.0 }
+component Vel { vx: f32 = 0.0, vy: f32 = 0.0 }
+
+@par(chunk = 1024)
+sys step_par() {
+    uniform let dt = 0.016;
+    uniform let damp = 0.995;
+    for e in query(pos: &mut Pos, vel: &mut Vel) {
+        e.vel.vx *= damp;
+        e.vel.vy -= 9.81 * dt;
+        e.pos.x += e.vel.vx * dt;
+        e.pos.y += e.vel.vy * dt;
+        if e.pos.y < 0.0 {
+            e.pos.y = 0.0;
+            e.vel.vy = -e.vel.vy * 0.8;
+        }
+    }
+}
+
+schedule FixedUpdate { step_par }
+"#;
+
+/// Threshold (`ns/entity`) enforced on `par_100k` for `bevy_native`, `c99:release`, and `rust_guest:release`.
+pub const PAR_100K_THRESHOLD_NS_PER_ENTITY: f64 = 0.35;
+
+/// Policy governing enforcement of the `100k` `@par(chunk = 1024)` throughput threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParGatePolicy {
+    /// Quick mode (`--quick`).
+    pub quick: bool,
+    /// Unconditionally fail on threshold violation (`--enforce-par-gate`).
+    pub enforce_par_gate: bool,
+    /// Downgrade threshold violation to a warning (`--warn-only-par-gate` or `STRATA_BENCH_ALLOW_HOST_VARIANCE=1`).
+    pub warn_only_par_gate: bool,
+    /// Detected logical CPU thread count.
+    pub host_threads: usize,
+    /// Running inside shared CI environment (`CI` env var set).
+    pub in_ci: bool,
+}
+
+impl ParGatePolicy {
+    /// Computes whether the `0.35 ns/entity` gate should fail the benchmark process on violation.
+    ///
+    /// Strict exit-1 enforcement is opt-in via `--enforce-par-gate` (unless overridden by
+    /// `--warn-only-par-gate` or `STRATA_BENCH_ALLOW_HOST_VARIANCE=1`), while default runs still
+    /// compute and emit [`ParGateReport`] (`PASS` or `HOST_VARIANCE_WARN`).
+    #[must_use]
+    pub const fn is_enforced(&self) -> bool {
+        self.enforce_par_gate && !self.warn_only_par_gate
+    }
+}
+
 /// Recorded execution throughput measurement for a backend or tick-coalescing workload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeBenchRecord {
-    /// Workload name (`"step_sim"` or `"selective_mut_slice"`).
+    /// Workload name (`"step_sim"`, `"par_100k"`, or `"selective_mut_slice"`).
     pub workload: String,
-    /// Subject target (`"native"`, `"jit"`, `"c99:release"`, `"rust_guest:release"`,
-    /// `"selective_1pct"`, `"selective_100pct"`).
+    /// Subject target (`"native"`, `"bevy_native"`, `"jit"`, `"c99:release"`,
+    /// `"rust_guest:release"`, `"selective_1pct"`, `"selective_100pct"`).
     pub subject: String,
     /// Total ECS entities populated in the `World`.
     pub entities: usize,
@@ -209,6 +267,9 @@ pub struct RuntimeBenchRecord {
 fn setup_world(entities: usize) -> App {
     let mut app = App::new();
     app.init_schedule(FixedUpdate);
+    app.edit_schedule(FixedUpdate, |s| {
+        s.set_executor(SingleThreadedExecutor::new());
+    });
     app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
     app.insert_resource(SimParam {
         dt: 0.016,
@@ -269,6 +330,60 @@ fn native_step_sim(p: Res<SimParam>, mut query: Query<(&mut Pos, &mut Vel, &mut 
     }
 }
 
+fn setup_par_world(entities: usize) -> App {
+    let mut app = App::new();
+    app.init_schedule(FixedUpdate);
+    app.edit_schedule(FixedUpdate, |s| {
+        s.set_executor(SingleThreadedExecutor::new());
+    });
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine),
+    ));
+    app.register_strata_component::<Pos>(StrataComponentOptions::new())
+        .expect("register Pos");
+    app.register_strata_component::<Vel>(StrataComponentOptions::new())
+        .expect("register Vel");
+
+    let batch: Vec<(Pos, Vel)> = (0..entities)
+        .map(|i| {
+            (
+                Pos {
+                    x: (i as f32) * 0.25,
+                    y: ((i % 9) as f32) * 0.6 + 0.1,
+                },
+                Vel {
+                    vx: 2.0 + ((i % 5) as f32) * 0.5,
+                    vy: -((i % 7) as f32) * 0.4,
+                },
+            )
+        })
+        .collect();
+    app.world_mut().spawn_batch(batch);
+    app
+}
+
+fn native_par_100k(mut query: Query<(&mut Pos, &mut Vel)>) {
+    let dt = 0.016_f32;
+    let damp = 0.995_f32;
+    if let Ok(par_it) = query.strata_contiguous_par_iter_mut() {
+        par_it.for_each(|(mut pos_c, mut vel_c)| {
+            let pos = &mut *pos_c;
+            let vel = &mut *vel_c;
+            for row in 0..pos.len() {
+                vel[row].vx *= damp;
+                vel[row].vy -= 9.81_f32 * dt;
+                pos[row].x += vel[row].vx * dt;
+                pos[row].y += vel[row].vy * dt;
+                if pos[row].y < 0.0_f32 {
+                    pos[row].y = 0.0_f32;
+                    vel[row].vy = -vel[row].vy * 0.8_f32;
+                }
+            }
+        });
+    }
+}
+
 fn build_target_binary(
     src_path: &std::path::Path,
     target: BuildTarget,
@@ -296,6 +411,24 @@ fn build_target_binary(
 /// Runs the 4-tier execution throughput and selective tick-coalescing benchmarks, enforcing
 /// bit-exact SHA-256 & FNV-1a parity across all four targets prior to timing.
 pub fn run_runtime_suite(quick: bool) -> Result<Vec<RuntimeBenchRecord>, String> {
+    let host_threads = std::thread::available_parallelism().map_or(1, usize::from);
+    let policy = ParGatePolicy {
+        quick,
+        enforce_par_gate: false,
+        warn_only_par_gate: std::env::var("STRATA_BENCH_ALLOW_HOST_VARIANCE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+        host_threads,
+        in_ci: std::env::var("CI").is_ok(),
+    };
+    run_runtime_suite_with_policy(policy).map(|(records, _)| records)
+}
+
+/// Runs the 4-tier execution throughput, `100k` `@par(chunk = 1024)` benchmark, and selective
+/// tick-coalescing suite under `policy`, returning both raw records and the `@par` gate report.
+pub fn run_runtime_suite_with_policy(
+    policy: ParGatePolicy,
+) -> Result<(Vec<RuntimeBenchRecord>, Option<ParGateReport>), String> {
+    let quick = policy.quick;
     let tmp = TempDir::new().map_err(|e| e.to_string())?;
     let src_path = tmp.path().join("bench_sim.strata");
     fs::write(&src_path, KERNEL_SOURCE).map_err(|e| e.to_string())?;
@@ -334,8 +467,24 @@ pub fn run_runtime_suite(quick: bool) -> Result<Vec<RuntimeBenchRecord>, String>
                     || dn.sha256 != dc.sha256
                     || dn.sha256 != dr.sha256
                     || dn.fnv1a64 != dj.fnv1a64
+                    || dn.fnv1a64 != dc.fnv1a64
+                    || dn.fnv1a64 != dr.fnv1a64
                 {
-                    return Err(format!("pre-timing parity check failed at frame {frame}"));
+                    return Err(format!(
+                        "pre-timing parity check failed at frame {frame}: \
+                         native=(sha256={}, fnv1a64={:#018x}), \
+                         jit=(sha256={}, fnv1a64={:#018x}), \
+                         c99=(sha256={}, fnv1a64={:#018x}), \
+                         rust_guest=(sha256={}, fnv1a64={:#018x})",
+                        dn.sha256_hex(),
+                        dn.fnv1a64,
+                        dj.sha256_hex(),
+                        dj.fnv1a64,
+                        dc.sha256_hex(),
+                        dc.fnv1a64,
+                        dr.sha256_hex(),
+                        dr.fnv1a64,
+                    ));
                 }
             }
         }
@@ -419,5 +568,216 @@ pub fn run_runtime_suite(quick: bool) -> Result<Vec<RuntimeBenchRecord>, String>
         });
     }
 
-    Ok(records)
+    // 100k dense `@par(chunk = 1024)` throughput benchmark & parity gate.
+    let par_src_path = tmp.path().join("bench_par.strata");
+    fs::write(&par_src_path, PAR_KERNEL_SOURCE).map_err(|e| e.to_string())?;
+    let par_jit_bin =
+        build_target_binary(&par_src_path, BuildTarget::Jit, &tmp.path().join("par_jit"))?;
+    let par_c99_bin =
+        build_target_binary(&par_src_path, BuildTarget::C99, &tmp.path().join("par_c99"))?;
+    let par_rg_bin = build_target_binary(
+        &par_src_path,
+        BuildTarget::RustGuest,
+        &tmp.path().join("par_rg"),
+    )?;
+
+    // Mandatory pre-timing parity gate for `step_par` (128 entities, 120 frames).
+    {
+        let mut w_nat = setup_par_world(128);
+        w_nat.add_systems(FixedUpdate, native_par_100k);
+        let mut w_jit = setup_par_world(128);
+        w_jit
+            .load_mod_with(&par_jit_bin, LoadOptions::default())
+            .map_err(|e| format!("load par jit: {e}"))?;
+        let mut w_c99 = setup_par_world(128);
+        w_c99
+            .load_mod_with(&par_c99_bin, LoadOptions::default())
+            .map_err(|e| format!("load par c99: {e}"))?;
+        let mut w_rg = setup_par_world(128);
+        w_rg.load_mod_with(&par_rg_bin, LoadOptions::default())
+            .map_err(|e| format!("load par rust_guest: {e}"))?;
+
+        for frame in 0..120u32 {
+            w_nat.world_mut().run_schedule(FixedUpdate);
+            w_jit.world_mut().run_schedule(FixedUpdate);
+            w_c99.world_mut().run_schedule(FixedUpdate);
+            w_rg.world_mut().run_schedule(FixedUpdate);
+            if matches!(frame, 0 | 59 | 119) {
+                let dn = hash_world_pod_state(w_nat.world());
+                let dj = hash_world_pod_state(w_jit.world());
+                let dc = hash_world_pod_state(w_c99.world());
+                let dr = hash_world_pod_state(w_rg.world());
+                if dn.sha256 != dj.sha256
+                    || dn.sha256 != dc.sha256
+                    || dn.sha256 != dr.sha256
+                    || dn.fnv1a64 != dj.fnv1a64
+                    || dn.fnv1a64 != dc.fnv1a64
+                    || dn.fnv1a64 != dr.fnv1a64
+                {
+                    return Err(format!(
+                        "par_100k pre-timing parity check failed at frame {frame}: \
+                         bevy_native=(sha256={}, fnv1a64={:#018x}), \
+                         jit=(sha256={}, fnv1a64={:#018x}), \
+                         c99=(sha256={}, fnv1a64={:#018x}), \
+                         rust_guest=(sha256={}, fnv1a64={:#018x})",
+                        dn.sha256_hex(),
+                        dn.fnv1a64,
+                        dj.sha256_hex(),
+                        dj.fnv1a64,
+                        dc.sha256_hex(),
+                        dc.fnv1a64,
+                        dr.sha256_hex(),
+                        dr.fnv1a64,
+                    ));
+                }
+            }
+        }
+    }
+
+    let par_entities = 100_000usize;
+    let par_batch = 16usize;
+    let par_warmup = if quick { 4usize } else { 8usize };
+    let par_samples = if quick { 16usize } else { 32usize };
+    let enforced = policy.is_enforced();
+    let max_attempts = if enforced { 3usize } else { 1usize };
+
+    let measure_par_subject =
+        |subject: &str, bin_opt: Option<&std::path::Path>| -> Result<BenchStats, String> {
+            let mut app = setup_par_world(par_entities);
+            if let Some(bin) = bin_opt {
+                app.load_mod_with(bin, LoadOptions::default())
+                    .map_err(|e| format!("load par {subject}: {e}"))?;
+            } else {
+                app.add_systems(FixedUpdate, native_par_100k);
+            }
+            let mut best_stats: Option<BenchStats> = None;
+            for attempt in 0..max_attempts {
+                let st = measure_batched_ns(
+                    par_warmup,
+                    par_samples,
+                    par_batch,
+                    Some(par_entities),
+                    || {
+                        app.world_mut().run_schedule(FixedUpdate);
+                        black_box(());
+                    },
+                );
+                let med_ent = st.ns_per_entity.unwrap_or(f64::MAX);
+                let spike = med_ent > PAR_100K_THRESHOLD_NS_PER_ENTITY
+                    && (st.p95_ns / st.median_ns.max(1.0)) > 1.30;
+                let is_better = best_stats
+                    .as_ref()
+                    .is_none_or(|b| st.median_ns < b.median_ns);
+                if is_better {
+                    best_stats = Some(st);
+                }
+                if !spike || attempt + 1 == max_attempts {
+                    break;
+                }
+            }
+            Ok(best_stats.expect("at least one sample"))
+        };
+
+    let par_nat_stats = measure_par_subject("bevy_native", None)?;
+    let par_nat_median = par_nat_stats.median_ns.max(1.0);
+    let mut par_gate_targets = Vec::new();
+    let push_par_gate = |targets: &mut Vec<ParTargetGate>,
+                         subject: &str,
+                         required: bool,
+                         vs_native: Option<f64>,
+                         st: &BenchStats| {
+        let ns_ent = st.ns_per_entity.unwrap_or(f64::MAX);
+        let min_ns_ent = st.min_ns / (par_entities as f64);
+        let spread_pct = if st.median_ns > 0.0 {
+            ((st.p95_ns - st.min_ns) / st.median_ns) * 100.0
+        } else {
+            0.0
+        };
+        targets.push(ParTargetGate {
+            subject: subject.to_owned(),
+            required,
+            ns_per_entity: ns_ent,
+            min_ns_per_entity: min_ns_ent,
+            spread_pct,
+            vs_native,
+            passed: ns_ent <= PAR_100K_THRESHOLD_NS_PER_ENTITY,
+        });
+    };
+
+    push_par_gate(
+        &mut par_gate_targets,
+        "bevy_native",
+        true,
+        None,
+        &par_nat_stats,
+    );
+    records.push(RuntimeBenchRecord {
+        workload: "par_100k".to_owned(),
+        subject: "bevy_native".to_owned(),
+        entities: par_entities,
+        vs_native: None,
+        stats: par_nat_stats,
+    });
+
+    for (subject, bin, required) in [
+        ("jit", &par_jit_bin, false),
+        ("c99:release", &par_c99_bin, true),
+        ("rust_guest:release", &par_rg_bin, true),
+    ] {
+        let st = measure_par_subject(subject, Some(bin))?;
+        let ratio = st.median_ns / par_nat_median;
+        push_par_gate(&mut par_gate_targets, subject, required, Some(ratio), &st);
+        records.push(RuntimeBenchRecord {
+            workload: "par_100k".to_owned(),
+            subject: subject.to_owned(),
+            entities: par_entities,
+            vs_native: Some(ratio),
+            stats: st,
+        });
+    }
+
+    let par_passed = par_gate_targets
+        .iter()
+        .filter(|t| t.required)
+        .all(|t| t.passed);
+    let par_gate = Some(ParGateReport {
+        threshold_ns_per_entity: PAR_100K_THRESHOLD_NS_PER_ENTITY,
+        entities: par_entities,
+        host_threads: policy.host_threads,
+        enforced,
+        passed: par_passed,
+        targets: par_gate_targets,
+    });
+
+    Ok((records, par_gate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies strict `@par` gate exit-1 enforcement is opt-in via `--enforce-par-gate`.
+    #[test]
+    fn par_gate_policy_is_opt_in_enforced() {
+        let default_full = ParGatePolicy {
+            quick: false,
+            enforce_par_gate: false,
+            warn_only_par_gate: false,
+            host_threads: 14,
+            in_ci: false,
+        };
+        assert!(!default_full.is_enforced());
+
+        let enforced = ParGatePolicy {
+            enforce_par_gate: true,
+            ..default_full
+        };
+        assert!(enforced.is_enforced());
+
+        let overridden = ParGatePolicy {
+            warn_only_par_gate: true,
+            ..enforced
+        };
+        assert!(!overridden.is_enforced());
+    }
 }

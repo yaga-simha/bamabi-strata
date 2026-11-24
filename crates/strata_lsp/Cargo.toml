@@ -10,6 +10,11 @@ description = "Zero-Bevy tower-lsp Language Server and SystemTelemetryDigest64 /
 name = "strata-lsp"
 path = "src/main.rs"
 
+[features]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+
 [dependencies]
 bamabi_sys.workspace = true
 serde.workspace = true
@@ -17,11 +22,17 @@ serde_json.workspace = true
 strata_sema.workspace = true
 strata_syntax.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
 tower-lsp.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+hotpath.workspace = true
 proptest.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "lsp_bench"
+harness = false

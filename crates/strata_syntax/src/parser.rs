@@ -71,6 +71,7 @@ pub fn parse(src: &str) -> Parse {
         non_trivia,
         tok_cursor: 0,
         nt_cursor: 0,
+        pending_gt: false,
         builder: GreenNodeBuilder::new(),
         errors: Vec::new(),
     };
@@ -88,13 +89,22 @@ struct Parser<'a> {
     non_trivia: Vec<usize>,
     tok_cursor: usize,
     nt_cursor: usize,
+    pending_gt: bool,
     builder: GreenNodeBuilder<'static>,
     errors: Vec<ParseError>,
 }
 
 impl<'a> Parser<'a> {
     #[inline]
+    fn cursor_state(&self) -> (usize, bool) {
+        (self.nt_cursor, self.pending_gt)
+    }
+
+    #[inline]
     fn nth(&self, offset: usize) -> SyntaxKind {
+        if self.pending_gt && offset == 0 {
+            return SyntaxKind::Gt;
+        }
         self.non_trivia
             .get(self.nt_cursor + offset)
             .map_or(SyntaxKind::Eof, |&idx| self.tokens[idx].kind)
@@ -102,6 +112,9 @@ impl<'a> Parser<'a> {
 
     #[inline]
     fn nth_text(&self, offset: usize) -> &'a str {
+        if self.pending_gt && offset == 0 {
+            return ">";
+        }
         self.non_trivia
             .get(self.nt_cursor + offset)
             .map_or("", |&idx| self.tokens[idx].text)
@@ -110,7 +123,12 @@ impl<'a> Parser<'a> {
     #[inline]
     fn current_range(&self) -> TextRange {
         if let Some(&idx) = self.non_trivia.get(self.nt_cursor) {
-            self.tokens[idx].range
+            let range = self.tokens[idx].range;
+            if self.pending_gt {
+                TextRange::new(range.start() + TextSize::from(1), range.end())
+            } else {
+                range
+            }
         } else {
             let end = TextSize::try_from(self.src.len()).unwrap_or(TextSize::from(0));
             TextRange::new(end, end)
@@ -138,6 +156,9 @@ impl<'a> Parser<'a> {
     }
 
     fn eat_trivia(&mut self) {
+        if self.pending_gt {
+            return;
+        }
         let stop = self
             .non_trivia
             .get(self.nt_cursor)
@@ -151,6 +172,15 @@ impl<'a> Parser<'a> {
     }
 
     fn bump_raw(&mut self, override_kind: Option<SyntaxKind>) {
+        if self.pending_gt {
+            let kind = override_kind.unwrap_or(SyntaxKind::Gt);
+            self.builder.token(kind.into(), ">");
+            self.pending_gt = false;
+            let target_idx = self.non_trivia[self.nt_cursor];
+            self.tok_cursor = target_idx + 1;
+            self.nt_cursor += 1;
+            return;
+        }
         self.eat_trivia();
         if self.nt_cursor >= self.non_trivia.len() {
             return;
@@ -168,6 +198,13 @@ impl<'a> Parser<'a> {
         self.builder.token(kind.into(), tok.text);
         self.tok_cursor = target_idx + 1;
         self.nt_cursor += 1;
+    }
+
+    fn bump_split_shr_gt(&mut self) {
+        debug_assert!(self.at(SyntaxKind::Shr) && !self.pending_gt);
+        self.eat_trivia();
+        self.builder.token(SyntaxKind::Gt.into(), ">");
+        self.pending_gt = true;
     }
 
     #[inline]
@@ -500,6 +537,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::KwPrefab => self.parse_bundle_item_decl(cp, SyntaxKind::PrefabDecl),
             SyntaxKind::KwObject => self.parse_bundle_item_decl(cp, SyntaxKind::ObjectDecl),
             SyntaxKind::Ident if self.at_ctx("zone") => self.parse_zone_decl(cp),
+            SyntaxKind::Ident if self.at_ctx("rpc") => self.parse_rpc_decl(cp),
             SyntaxKind::KwTimeline => self.parse_timeline_decl(cp),
             SyntaxKind::KwTask => self.parse_task_decl(cp),
             SyntaxKind::KwFsm => self.parse_fsm_decl(cp),
@@ -511,6 +549,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::KwAssertLayout => self.parse_assert_layout_decl(cp),
             SyntaxKind::KwAssertPar => self.parse_assert_par_decl(cp),
             SyntaxKind::KwSimTest => self.parse_sim_test_decl(cp),
+            SyntaxKind::KwNetSimTest => self.parse_net_sim_test_decl(cp),
             _ => {
                 // Close any attributes parsed at `cp` under an `Error` node.
                 self.start_node_at(cp, SyntaxKind::Error);
@@ -877,6 +916,17 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    fn parse_rpc_decl(&mut self, cp: rowan::Checkpoint) {
+        self.start_node_at(cp, SyntaxKind::RpcDecl);
+        self.bump_as(SyntaxKind::KwRpc);
+        self.bump_ident_or_ctx();
+        self.parse_inline_modifiers_and_require();
+        if !self.eat(SyntaxKind::Semi) {
+            self.parse_field_decl_braced();
+        }
+        self.finish_node();
+    }
+
     fn parse_timeline_decl(&mut self, cp: rowan::Checkpoint) {
         self.start_node_at(cp, SyntaxKind::TimelineDecl);
         self.bump(); // timeline
@@ -1218,6 +1268,44 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    fn parse_net_sim_test_decl(&mut self, cp: rowan::Checkpoint) {
+        self.start_node_at(cp, SyntaxKind::NetSimTestDecl);
+        self.bump(); // net_sim_test
+        self.expect(SyntaxKind::StringLit);
+        if self.at(SyntaxKind::LParen) {
+            self.parse_net_sim_param_list();
+        }
+        self.parse_block();
+        self.finish_node();
+    }
+
+    fn parse_net_sim_param_list(&mut self) {
+        self.start_node(SyntaxKind::NetSimParamList);
+        self.expect(SyntaxKind::LParen);
+        while !self.at(SyntaxKind::RParen) && !self.at_eof() {
+            let guard = self.nt_cursor;
+            self.start_node(SyntaxKind::NetSimParam);
+            self.bump_ident_or_ctx();
+            self.expect(SyntaxKind::Colon);
+            if !self.at(SyntaxKind::RParen) && !self.at(SyntaxKind::Comma) {
+                self.parse_expr(true);
+            } else {
+                let r = self.current_range();
+                self.error("expected value for net_sim_test parameter", r);
+            }
+            self.finish_node();
+            if !self.eat(SyntaxKind::Comma) {
+                break;
+            }
+            if self.nt_cursor == guard {
+                self.error_and_bump("expected net_sim_test parameter");
+                break;
+            }
+        }
+        self.expect(SyntaxKind::RParen);
+        self.finish_node();
+    }
+
     // --- Fields, Parameters & Projections ---
 
     fn parse_field_decl_braced(&mut self) {
@@ -1433,7 +1521,7 @@ impl<'a> Parser<'a> {
         self.bump(); // <
         let mut depth: usize = 1;
         while depth > 0 && !self.at_eof() {
-            let guard = self.nt_cursor;
+            let guard = self.cursor_state();
             if self.at(SyntaxKind::Gt) {
                 depth -= 1;
                 self.bump();
@@ -1441,15 +1529,11 @@ impl<'a> Parser<'a> {
                     break;
                 }
             } else if self.at(SyntaxKind::Shr) {
-                // Split `>>` conceptually when closing nested generics.
-                if depth >= 2 {
-                    depth -= 2;
-                    self.bump();
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    self.bump();
+                // Split `>>` into two `>` tokens so enclosing GenericParams / GenericArgs
+                // retain their own closing `Gt` token in the CST.
+                depth -= 1;
+                self.bump_split_shr_gt();
+                if depth == 0 {
                     break;
                 }
             } else if self.at(SyntaxKind::Lt) {
@@ -1465,7 +1549,7 @@ impl<'a> Parser<'a> {
                 self.parse_type_no_consume_outer_gt(&mut depth);
                 let _ = self.eat(SyntaxKind::Comma);
             }
-            if self.nt_cursor == guard && depth > 0 {
+            if self.cursor_state() == guard && depth > 0 {
                 break;
             }
         }
@@ -1513,15 +1597,16 @@ impl<'a> Parser<'a> {
             let target_depth = *depth;
             *depth += 1;
             while *depth > target_depth && !self.at_eof() {
-                let guard = self.nt_cursor;
+                let guard = self.cursor_state();
                 if self.at(SyntaxKind::Gt) {
                     *depth -= 1;
                     self.bump();
                     break;
                 } else if self.at(SyntaxKind::Shr) {
-                    // Consume `>>` which closes both this inner `<` and outer `<` if target_depth == 1
-                    *depth = depth.saturating_sub(2);
-                    self.bump();
+                    // Split `>>` so this inner GenericArgs consumes only one `>` and leaves the
+                    // second `>` for the enclosing GenericArgs or GenericParams.
+                    *depth -= 1;
+                    self.bump_split_shr_gt();
                     break;
                 } else if matches!(
                     self.nth(0),
@@ -1533,7 +1618,7 @@ impl<'a> Parser<'a> {
                     self.parse_type_no_consume_outer_gt(depth);
                     let _ = self.eat(SyntaxKind::Comma);
                 }
-                if self.nt_cursor == guard {
+                if self.cursor_state() == guard {
                     break;
                 }
             }
@@ -2175,8 +2260,11 @@ impl<'a> Parser<'a> {
                     }
                 }
                 SyntaxKind::Shr => {
-                    if depth <= 2 {
+                    if depth == 2 {
                         return self.nth(off + 1) == SyntaxKind::LParen;
+                    }
+                    if depth < 2 {
+                        return false;
                     }
                     depth -= 2;
                 }
@@ -2267,6 +2355,7 @@ fn is_keyword_usable_as_member(kind: SyntaxKind) -> bool {
     matches!(
         kind,
         SyntaxKind::KwZone
+            | SyntaxKind::KwRpc
             | SyntaxKind::KwBy
             | SyntaxKind::KwOver
             | SyntaxKind::KwKey
@@ -2353,5 +2442,142 @@ mod tests {
             .filter(|n| n.kind() == SyntaxKind::ComponentDecl)
             .count();
         assert_eq!(comp_count, 2);
+    }
+
+    /// Verifies `RpcDecl` parses with attributes, fields, marker form, and contextual `rpc` usage.
+    #[test]
+    fn rpc_decl_parses_with_attrs_fields_and_contextual_ident() {
+        let src = r#"
+@net_rpc(direction = client_to_server, reliability = reliable)
+@authority(client)
+@node_group("net")
+rpc MoveInput {
+    @quantize(min = -1.0, max = 1.0, bits = 12)
+    dx: f32,
+    dy: f32,
+    seq: u32,
+}
+
+rpc Ping {}
+rpc Marker;
+
+struct Carrier { rpc: u32 }
+fn use_rpc(rpc: u32) -> u32 {
+    let x = rpc;
+    return x;
+}
+"#;
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "{:?}", p.errors());
+        assert_eq!(p.syntax().text().to_string(), src);
+        let rpc_count = p
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::RpcDecl)
+            .count();
+        assert_eq!(rpc_count, 3);
+    }
+
+    /// Verifies `NetSimTestDecl` parses network parameters and simulation body statements.
+    #[test]
+    fn net_sim_test_decl_parses_options_and_network_statements() {
+        let src = r#"
+net_sim_test "reconciles_under_loss"(latency: 50ms, jitter: 10ms, loss: 0.05, seed: 42, clients: 2) {
+    clients(2);
+    spawn_client(0);
+    send_rpc(0, MoveInput { dx: 1.0, dy: 0.0, seq: 1 });
+    send_rpc(0, Ping {});
+    server_step(1);
+    client_step(0, 1);
+    step_net(5);
+    server_spawn(Pos3D { xyz: vec3(0.0, 0.0, 0.0) });
+    client_spawn(0, Pos3D { xyz: vec3(0.0, 0.0, 0.0) });
+    let s = server_res<SimClock>();
+    let c = client_res<SimClock>(0);
+    server_query(pos: &Pos3D);
+    client_query(0, pos: &Pos3D);
+    assert_converged(0, 0.01);
+    assert(true);
+    assert_eq(1, 1);
+    assert_ne(1, 2);
+}
+
+net_sim_test "defaults" {
+    step_net(1);
+}
+
+net_sim_test "empty_opts"() {
+    step_net(1);
+}
+"#;
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "{:?}", p.errors());
+        assert_eq!(p.syntax().text().to_string(), src);
+        let net_tests: Vec<_> = p
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::NetSimTestDecl)
+            .collect();
+        assert_eq!(net_tests.len(), 3);
+    }
+
+    /// Verifies malformed `rpc` and `net_sim_test` declarations recover losslessly.
+    #[test]
+    fn malformed_rpc_and_net_sim_test_recover_losslessly() {
+        let src = "net_sim_test \"bad\"(latency: ) { step_net(1); }\nrpc Broken { x: }\ncomponent Ok { x: f32 }\n";
+        let p = parse(src);
+        assert!(!p.errors().is_empty());
+        assert_eq!(p.syntax().text().to_string(), src);
+        let comp_count = p
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::ComponentDecl)
+            .count();
+        assert_eq!(comp_count, 1);
+    }
+
+    /// Verifies `>>` splits cleanly across `GenericArgs` / `GenericParams` and nested
+    /// `GenericArgs` boundaries while preserving lossless CST text and operator contrasts.
+    #[test]
+    fn generic_params_and_args_split_shr_losslessly() {
+        for src in [
+            "struct S<T: Box<u32>> { x: T }\n",
+            "struct S<T: Box<u32> > { x: T }\n",
+            "struct S<T: Box<u32>, U: Box<u32>> { x: T, y: U }\n",
+            "fn f<T: Box<Box<u32>>>(x: T) {}\n",
+            "struct S<T: Box<Box<Box<u32>>>> { x: T }\n",
+            "fn f() { let x = a < b >> (c); }\n",
+        ] {
+            let p = parse(src);
+            assert!(
+                p.errors().is_empty(),
+                "errors for {src:?}: {:?}",
+                p.errors()
+            );
+            assert_eq!(p.syntax().text().to_string(), src);
+            for node in p.syntax().descendants().filter(|n| {
+                matches!(
+                    n.kind(),
+                    SyntaxKind::GenericParams | SyntaxKind::GenericArgs
+                )
+            }) {
+                assert_eq!(
+                    node.last_token().map(|t| t.kind()),
+                    Some(SyntaxKind::Gt),
+                    "expected closing Gt on {:?} in {src:?}",
+                    node.kind()
+                );
+            }
+        }
+
+        // Malformed extra `>` after `>>` must recover losslessly without panicking.
+        for bad in [
+            "struct S<T: Box<u32>>> { x: T }\n",
+            "fn f() { let x: Box<u32>>; }\n",
+        ] {
+            let p = parse(bad);
+            assert!(!p.ok(), "expected error on {bad:?}");
+            assert_eq!(p.syntax().text().to_string(), bad);
+        }
     }
 }

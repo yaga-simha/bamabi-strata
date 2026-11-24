@@ -86,8 +86,23 @@ pub struct EnumDef {
     pub canonical_name: String,
     /// Ordered variants with explicit or sequential discriminants.
     pub variants: Vec<(String, i64)>,
-    /// Discriminant integer width (`u8` / `u16` / `u32`).
+    /// Discriminant integer width (`1` / `2` / `4` bytes).
     pub repr_bytes: usize,
+    /// Whether a 4-byte enum uses signed `i32` representation (`@repr(i32)` or negative discriminant).
+    pub is_signed: bool,
+}
+
+impl EnumDef {
+    /// Returns the Rust/Strata primitive scalar type name for this enum's representation.
+    #[must_use]
+    pub const fn rust_repr(&self) -> &'static str {
+        match (self.repr_bytes, self.is_signed) {
+            (1, _) => "u8",
+            (2, _) => "u16",
+            (_, true) => "i32",
+            _ => "u32",
+        }
+    }
 }
 
 /// Known user-defined type layouts available while solving field types.
@@ -196,21 +211,25 @@ pub fn resolve_ty_layout(
                 ));
             }
             if let Some(en) = env.enums.get(name) {
-                let kind = match en.repr_bytes {
-                    1 => BamFieldKind::U8,
-                    2 => BamFieldKind::U16,
+                let kind = match (en.repr_bytes, en.is_signed) {
+                    (1, _) => BamFieldKind::U8,
+                    (2, _) => BamFieldKind::U16,
+                    (_, true) => BamFieldKind::I32,
                     _ => BamFieldKind::U32,
                 };
-                let tag = match en.repr_bytes {
-                    1 => "u8",
-                    2 => "u16",
-                    _ => "u32",
-                };
+                let tag = en.rust_repr();
                 return Some((en.repr_bytes, en.repr_bytes, true, kind, tag.to_owned()));
             }
             return None;
         }
-        Ty::BannedWire(_) | Ty::Unknown => return None,
+        Ty::Option(_)
+        | Ty::Result { .. }
+        | Ty::Borrow { .. }
+        | Ty::Trigger { .. }
+        | Ty::QueryRow(_)
+        | Ty::Record(_)
+        | Ty::BannedWire(_)
+        | Ty::Unknown => return None,
     };
     Some(res)
 }
@@ -396,6 +415,113 @@ pub fn compute_wire_identity(
     }
 
     (uuid, fp)
+}
+
+/// Computes a deterministic 64-bit FNV-1a module-level network schema fingerprint over
+/// `module_path`, sorted solved layouts, sorted [`NetComponentMeta`](crate::hir::NetComponentMeta),
+/// and sorted [`HirRpc`](crate::hir::HirRpc) declarations.
+///
+/// Explicitly excludes `@node_group` labels, visual graph positions, `sys`/`fn` bodies,
+/// `sim_test`, and `net_sim_test` blocks so visual layout or test edits never alter the wire
+/// handshake fingerprint.
+pub fn compute_net_schema_fingerprint(
+    module_path: &str,
+    layouts: &IndexMap<String, SolvedLayout>,
+    net_components: &[crate::hir::NetComponentMeta],
+    rpcs: &[crate::hir::HirRpc],
+) -> u64 {
+    use crate::hir::{AuthorityKind, NetDirection, NetReliability};
+
+    let mut fp = fnv1a_64_init();
+    fp = fnv1a_64_update_bytes(fp, b"strata_net_schema_v1:");
+    fp = fnv1a_64_update_bytes(fp, module_path.as_bytes());
+
+    let mut sorted_layouts: Vec<(&str, u64)> = layouts
+        .iter()
+        .map(|(k, l)| (k.as_str(), l.schema_fingerprint))
+        .collect();
+    sorted_layouts.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    fp = fnv1a_64_update_u64(fp, sorted_layouts.len() as u64);
+    for (k, layout_fp) in sorted_layouts {
+        fp = fnv1a_64_update_bytes(fp, k.as_bytes());
+        fp = fnv1a_64_update_u64(fp, layout_fp);
+    }
+
+    let mut sorted_net: Vec<&crate::hir::NetComponentMeta> = net_components.iter().collect();
+    sorted_net.sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+    fp = fnv1a_64_update_u64(fp, sorted_net.len() as u64);
+    for nc in sorted_net {
+        fp = fnv1a_64_update_bytes(fp, nc.canonical_name.as_bytes());
+        fp = fnv1a_64_update_u64(fp, u64::from(nc.is_resource));
+        fp = fnv1a_64_update_u64(fp, u64::from(nc.is_replicated));
+        let auth_tag: u64 = match nc.authority {
+            AuthorityKind::Unspecified => 0,
+            AuthorityKind::Server => 1,
+            AuthorityKind::Client => 2,
+            AuthorityKind::Predicted => 3,
+            AuthorityKind::Shared => 4,
+        };
+        fp = fnv1a_64_update_u64(fp, auth_tag);
+        fp = fnv1a_64_update_u64(fp, u64::from(nc.is_predicted));
+        if let Some(ref cfg) = nc.net_config {
+            fp = fnv1a_64_update_u64(fp, 1);
+            fp = fnv1a_64_update_u64(
+                fp,
+                match cfg.reliability {
+                    NetReliability::Reliable => 0,
+                    NetReliability::Unreliable => 1,
+                },
+            );
+            fp = fnv1a_64_update_u64(fp, cfg.rate_hz.map_or(0, f64::to_bits));
+            fp = fnv1a_64_update_u64(fp, u64::from(cfg.interval_ticks.unwrap_or(0)));
+            fp = fnv1a_64_update_u64(fp, u64::from(cfg.channel));
+        } else {
+            fp = fnv1a_64_update_u64(fp, 0);
+        }
+        fp = fnv1a_64_update_u64(fp, nc.quantized_fields.len() as u64);
+        for q in &nc.quantized_fields {
+            fp = fnv1a_64_update_bytes(fp, q.field_name.as_bytes());
+            fp = fnv1a_64_update_u64(fp, q.min.to_bits());
+            fp = fnv1a_64_update_u64(fp, q.max.to_bits());
+            fp = fnv1a_64_update_u64(fp, u64::from(q.bits));
+            fp = fnv1a_64_update_u64(fp, q.step.map_or(0, f64::to_bits));
+        }
+    }
+
+    let mut sorted_rpcs: Vec<&crate::hir::HirRpc> = rpcs.iter().collect();
+    sorted_rpcs.sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+    fp = fnv1a_64_update_u64(fp, sorted_rpcs.len() as u64);
+    for rpc in sorted_rpcs {
+        fp = fnv1a_64_update_bytes(fp, rpc.canonical_name.as_bytes());
+        fp = fnv1a_64_update_u64(fp, rpc.payload_layout.schema_fingerprint);
+        fp = fnv1a_64_update_u64(
+            fp,
+            match rpc.direction {
+                NetDirection::ClientToServer => 0,
+                NetDirection::ServerToClient => 1,
+                NetDirection::Bidirectional => 2,
+            },
+        );
+        fp = fnv1a_64_update_u64(
+            fp,
+            match rpc.reliability {
+                NetReliability::Reliable => 0,
+                NetReliability::Unreliable => 1,
+            },
+        );
+        fp = fnv1a_64_update_u64(fp, u64::from(rpc.channel));
+        fp = fnv1a_64_update_u64(fp, u64::from(rpc.is_marker));
+        fp = fnv1a_64_update_u64(fp, rpc.quantized_fields.len() as u64);
+        for q in &rpc.quantized_fields {
+            fp = fnv1a_64_update_bytes(fp, q.field_name.as_bytes());
+            fp = fnv1a_64_update_u64(fp, q.min.to_bits());
+            fp = fnv1a_64_update_u64(fp, q.max.to_bits());
+            fp = fnv1a_64_update_u64(fp, u64::from(q.bits));
+            fp = fnv1a_64_update_u64(fp, q.step.map_or(0, f64::to_bits));
+        }
+    }
+
+    fp
 }
 
 /// Synthesizes the canonical 16-byte `@sparse` `TimelineCursor` layout for a `timeline` item.

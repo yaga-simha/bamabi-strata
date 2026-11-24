@@ -1,0 +1,35 @@
+[package]
+name = "strata_profile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "Headless Bevy 0.20 + bamabi_host + hotpath-rs closed-loop profiling suite for bamabi-strata"
+
+[features]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+
+[dependencies]
+bamabi_host.workspace = true
+bamabi_native_rt.workspace = true
+bamabi_sys.workspace = true
+bevy_app.workspace = true
+bevy_ecs = { workspace = true, features = ["multi_threaded"] }
+hotpath = "0.32"
+strata_jit.workspace = true
+strata_mir.workspace = true
+strata_sema.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "strata_profile"
+path = "benches/strata_profile.rs"
+harness = false

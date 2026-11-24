@@ -12,8 +12,12 @@ description = "Zero-overhead Tier 3 static Bevy 0.20 runtime adapter and AbiPod 
 default = ["shared-bridge"]
 shared-bridge = ["dep:bamabi_host"]
 static-console = []
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
+bamabi_macros.workspace = true
 bamabi_sys.workspace = true
 bamabi_host = { workspace = true, optional = true }
 bevy_app.workspace = true
@@ -22,7 +26,13 @@ bevy_reflect.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+hotpath.workspace = true
 proptest.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "native_rt_bench"
+harness = false

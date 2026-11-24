@@ -1,6 +1,6 @@
 # Agent Guide: `strata_codegen`
 
-Crate guide for **`strata_codegen`** (`v0.3.0`) — zero-Bevy code generator producing strict ISO C99, safe `#![forbid(unsafe_code)]` Rust Guest (`.cdylib`), and Tier 3 static Bevy `Plugin` (`--target bevy-native`) artifacts from `StrataMir`.
+Crate guide for **`strata_codegen`** (`v0.3.0`) — zero-Bevy direct-MIR code generator producing strict ISO C99, safe `#![forbid(unsafe_code)]` Rust Guest (`.cdylib`), and Tier 3 static Bevy `Plugin` (`--target bevy-native`) artifacts from `StrataMir`.
 
 ---
 
@@ -17,10 +17,10 @@ Crate guide for **`strata_codegen`** (`v0.3.0`) — zero-Bevy code generator pro
 ---
 
 ## 3. Owned Surface & Frozen Contracts
-- **`expr.rs`:** Shared neutral per-row kernel extraction (`SystemPlan`, `KernelStmt`, `KernelExpr`) consumed by `c99`, `rust_guest`, `bevy_native`, and `strata_jit` so all 4 tiers execute bit-identical operations.
-- **`c99.rs`:** Strict ISO C99 (`-std=c99 -Wall -Wextra -Wpedantic -Werror`) emitter targeting `bamabi.h` (`bamabi_sdk_gen::render_c99_header()`).
-- **`rust_guest.rs`:** Safe `#![forbid(unsafe_code)]` `bamabi_guest` `.cdylib` emitter with bit-exact `ComponentUuid` / `SCHEMA_FINGERPRINT`.
-- **`bevy_native.rs`:** Tier 3 static Bevy `Plugin` (`bamabi_native_rt`) emitter supporting both `shared-bridge` and `dlopen`-free `static-console` profiles.
+- **`net.rs`:** Shared 184-byte `#[repr(C)]` POD `StrataNetPacket` (`"STNP"`) wire metadata, field offsets, and capacity validation across C99, Rust Guest, Bevy Native, and `strata_jit`.
+- **`c99/` (`mod`, `prelude`, `decls`, `fn_emit`, `inst_emit`, `net_emit`):** Strict ISO C99 (`-std=c99 -Wall -Wextra -Wpedantic -Werror`) emitter targeting `bamabi.h` (`bamabi_sdk_gen::render_c99_header()`), lowering `MirModule` CFGs directly (2-pass CSR spatial grids, Slot 10 `iter_reset`, Slot 58 `iter_up_cascade`, ISO C99 `Fix32`/`Fix64` restoring division).
+- **`rust_guest/` (`mod`, `prelude`, `items`, `fn_emit`, `inst_emit`, `export_mod`):** Safe `#![forbid(unsafe_code)]` `bamabi_guest` `.cdylib` emitter with bit-exact `ComponentUuid` / `SCHEMA_FINGERPRINT`.
+- **`bevy_native/` (`mod`, `items`, `analysis`, `fn_emit`, `places_ops`):** Tier 3 static Bevy `Plugin` (`bamabi_native_rt`) emitter supporting both `shared-bridge` and `dlopen`-free `static-console` profiles.
 
 ---
 

@@ -100,6 +100,11 @@ mod tests {
             schedules: Vec::new(),
             sim_tests: Vec::new(),
             field_defaults: IndexMap::new(),
+            rpcs: Vec::new(),
+            net_components: Vec::new(),
+            net_sim_tests: Vec::new(),
+            net_handshake: crate::ir::MirNetHandshake::default(),
+            net_stream_ops: Vec::new(),
         };
         run(&mut module);
         let stmts = &module.functions[0].blocks[0].stmts;

@@ -1,6 +1,10 @@
 //! Structural SSA, CFG, zero-padding ABI, `@sparse`/`&mut?`, and `@deterministic` MIR verifier.
 
-use crate::ir::{Inst, LocalId, MirFunction, MirModule, MirType, Terminator};
+use crate::ir::{
+    Inst, LocalId, MirFunction, MirModule, MirQuantizeSpec, MirStreamOpKind, MirType, Terminator,
+};
+use std::collections::{HashMap, HashSet};
+use strata_sema::hir::AuthorityKind;
 use thiserror::Error;
 
 /// Structural invariant violation discovered in lowered `StrataMir`.
@@ -60,6 +64,14 @@ pub enum MirVerifyError {
         /// Violation detail.
         detail: String,
     },
+    /// Networking, quantization, RPC, handshake, or `net_sim_test` invariant violation.
+    #[error("MIR network/quantization invariant violation in `{subject}`: {detail}")]
+    InvalidNetworkInvariant {
+        /// Component, RPC, test, or module subject name.
+        subject: String,
+        /// Violation detail.
+        detail: String,
+    },
 }
 
 /// Verifies CFG well-formedness, SSA local validity, zero-padding ABI layout invariants, sparse /
@@ -82,10 +94,439 @@ pub fn verify_mir(module: &MirModule) -> Result<(), Vec<MirVerifyError>> {
         verify_function(func, module.is_deterministic, &mut errors);
     }
 
+    verify_network_ir(module, &mut errors);
+
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn is_quantizable_mir_ty(ty: &MirType) -> bool {
+    match ty {
+        MirType::U8
+        | MirType::U16
+        | MirType::U32
+        | MirType::U64
+        | MirType::I8
+        | MirType::I16
+        | MirType::I32
+        | MirType::I64
+        | MirType::F32
+        | MirType::F64
+        | MirType::Fix32
+        | MirType::Fix64
+        | MirType::Vec2
+        | MirType::Vec3
+        | MirType::Vec4
+        | MirType::IVec2
+        | MirType::IVec3
+        | MirType::UVec2 => true,
+        MirType::Named(n) => matches!(n.as_str(), "IVec2" | "IVec3" | "UVec2" | "Vec3a"),
+        _ => false,
+    }
+}
+
+fn verify_quantize_spec(subject: &str, spec: &MirQuantizeSpec, errors: &mut Vec<MirVerifyError>) {
+    if !(1..=32).contains(&spec.bits) {
+        errors.push(MirVerifyError::InvalidNetworkInvariant {
+            subject: subject.to_owned(),
+            detail: format!(
+                "quantize field `{}` bits={} must be in 1..=32",
+                spec.field_name, spec.bits
+            ),
+        });
+    }
+    if !(1..=4).contains(&spec.lane_count) {
+        errors.push(MirVerifyError::InvalidNetworkInvariant {
+            subject: subject.to_owned(),
+            detail: format!(
+                "quantize field `{}` lane_count={} must be in 1..=4",
+                spec.field_name, spec.lane_count
+            ),
+        });
+    }
+    if !spec.min.is_finite() || !spec.max.is_finite() || spec.min >= spec.max {
+        errors.push(MirVerifyError::InvalidNetworkInvariant {
+            subject: subject.to_owned(),
+            detail: format!(
+                "quantize field `{}` requires finite min < max (got min={}, max={})",
+                spec.field_name, spec.min, spec.max
+            ),
+        });
+    }
+    if let Some(step) = spec.step
+        && (!step.is_finite() || step <= 0.0)
+    {
+        errors.push(MirVerifyError::InvalidNetworkInvariant {
+            subject: subject.to_owned(),
+            detail: format!(
+                "quantize field `{}` step={} must be finite and > 0.0",
+                spec.field_name, step
+            ),
+        });
+    }
+    let expected_total = u32::from(spec.bits) * u32::from(spec.lane_count);
+    if spec.total_bits != expected_total {
+        errors.push(MirVerifyError::InvalidNetworkInvariant {
+            subject: subject.to_owned(),
+            detail: format!(
+                "quantize field `{}` total_bits={} != bits({}) * lane_count({})",
+                spec.field_name, spec.total_bits, spec.bits, spec.lane_count
+            ),
+        });
+    }
+    if !is_quantizable_mir_ty(&spec.field_ty) {
+        errors.push(MirVerifyError::InvalidNetworkInvariant {
+            subject: subject.to_owned(),
+            detail: format!(
+                "quantize field `{}` has non-numeric/non-vector MirType::{:?}",
+                spec.field_name, spec.field_ty
+            ),
+        });
+    }
+}
+
+fn verify_bit_intervals(
+    subject: &str,
+    mut intervals: Vec<(u32, u32, &str)>,
+    packed_bits: u32,
+    errors: &mut Vec<MirVerifyError>,
+) {
+    intervals.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut prev_end = 0u32;
+    let mut prev_name = "";
+    for (start, end, name) in intervals {
+        if end < start || end > packed_bits {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: subject.to_owned(),
+                detail: format!(
+                    "bit interval [{start}, {end}) for field `{name}` exceeds packed_bits={packed_bits}"
+                ),
+            });
+        }
+        if start < prev_end {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: subject.to_owned(),
+                detail: format!(
+                    "overlapping bit-packed field `{name}` starting at bit {start} overlaps `{prev_name}` ending at bit {prev_end}"
+                ),
+            });
+        }
+        prev_end = prev_end.max(end);
+        prev_name = name;
+    }
+}
+
+fn verify_network_ir(module: &MirModule, errors: &mut Vec<MirVerifyError>) {
+    let mut seen_net_components = HashSet::new();
+    for nc in &module.net_components {
+        if nc.name.is_empty() || nc.canonical_name.is_empty() {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: nc.canonical_name.clone(),
+                detail: "MirNetComponent name and canonical_name must be non-empty".to_owned(),
+            });
+        }
+        if !seen_net_components.insert(nc.canonical_name.clone()) {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: nc.canonical_name.clone(),
+                detail: format!(
+                    "duplicate MirNetComponent canonical_name `{}`",
+                    nc.canonical_name
+                ),
+            });
+        }
+        if nc.schema_fingerprint == 0 {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: nc.canonical_name.clone(),
+                detail: "MirNetComponent schema_fingerprint must be non-zero".to_owned(),
+            });
+        }
+        if nc.authority == AuthorityKind::Server && nc.is_predicted {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: nc.canonical_name.clone(),
+                detail:
+                    "MirNetComponent cannot combine AuthorityKind::Server with is_predicted=true"
+                        .to_owned(),
+            });
+        }
+        if let Some(rate) = nc.rate_hz
+            && (!rate.is_finite() || rate <= 0.0)
+        {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: nc.canonical_name.clone(),
+                detail: format!("MirNetComponent rate_hz ({rate}) must be finite and > 0"),
+            });
+        }
+        if let Some(iv) = nc.interval_ticks
+            && iv == 0
+        {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: nc.canonical_name.clone(),
+                detail: "MirNetComponent interval_ticks must be > 0".to_owned(),
+            });
+        }
+        if nc.packed_bytes != nc.packed_bits.div_ceil(8) {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: nc.canonical_name.clone(),
+                detail: format!(
+                    "packed_bytes ({}) != packed_bits ({}).div_ceil(8)",
+                    nc.packed_bytes, nc.packed_bits
+                ),
+            });
+        }
+        for spec in &nc.quantize_specs {
+            verify_quantize_spec(&nc.canonical_name, spec, errors);
+        }
+        for wf in &nc.wire_fields {
+            if let Some(ref spec) = wf.quantize {
+                verify_quantize_spec(&nc.canonical_name, spec, errors);
+                if spec.bit_offset != wf.bit_offset || spec.total_bits != wf.total_bits {
+                    errors.push(MirVerifyError::InvalidNetworkInvariant {
+                        subject: nc.canonical_name.clone(),
+                        detail: format!(
+                            "wire_field `{}` quantize bit range [{}..+{}) mismatches wire_field [{}..+{})",
+                            wf.field_name,
+                            spec.bit_offset,
+                            spec.total_bits,
+                            wf.bit_offset,
+                            wf.total_bits
+                        ),
+                    });
+                }
+            }
+        }
+        let mut wf_intervals = Vec::with_capacity(nc.wire_fields.len());
+        for wf in &nc.wire_fields {
+            match wf.bit_offset.checked_add(wf.total_bits) {
+                Some(end) => wf_intervals.push((wf.bit_offset, end, wf.field_name.as_str())),
+                None => errors.push(MirVerifyError::InvalidNetworkInvariant {
+                    subject: nc.canonical_name.clone(),
+                    detail: format!(
+                        "wire_field `{}` bit interval ({} + {}) overflows u32",
+                        wf.field_name, wf.bit_offset, wf.total_bits
+                    ),
+                }),
+            }
+        }
+        verify_bit_intervals(&nc.canonical_name, wf_intervals, nc.packed_bits, errors);
+
+        let mut q_intervals = Vec::with_capacity(nc.quantize_specs.len());
+        for q in &nc.quantize_specs {
+            match q.bit_offset.checked_add(q.total_bits) {
+                Some(end) => q_intervals.push((q.bit_offset, end, q.field_name.as_str())),
+                None => errors.push(MirVerifyError::InvalidNetworkInvariant {
+                    subject: nc.canonical_name.clone(),
+                    detail: format!(
+                        "quantize_specs `{}` bit interval ({} + {}) overflows u32",
+                        q.field_name, q.bit_offset, q.total_bits
+                    ),
+                }),
+            }
+        }
+        verify_bit_intervals(&nc.canonical_name, q_intervals, nc.packed_bits, errors);
+    }
+
+    let mut seen_rpc_names = HashSet::new();
+    let mut seen_rpc_ids = HashSet::new();
+    for rpc in &module.rpcs {
+        if rpc.name.is_empty() || rpc.canonical_name.is_empty() {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: rpc.canonical_name.clone(),
+                detail: "MirRpc name and canonical_name must be non-empty".to_owned(),
+            });
+        }
+        if !seen_rpc_names.insert(rpc.canonical_name.clone()) {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: rpc.canonical_name.clone(),
+                detail: format!("duplicate MirRpc canonical_name `{}`", rpc.canonical_name),
+            });
+        }
+        if !seen_rpc_ids.insert(rpc.rpc_id) {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: rpc.canonical_name.clone(),
+                detail: format!("duplicate MirRpc rpc_id {:#x}", rpc.rpc_id),
+            });
+        }
+        if rpc.schema_fingerprint == 0 {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: rpc.canonical_name.clone(),
+                detail: "MirRpc schema_fingerprint must be non-zero".to_owned(),
+            });
+        }
+        if rpc.packed_bytes != rpc.packed_bits.div_ceil(8) {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: rpc.canonical_name.clone(),
+                detail: format!(
+                    "MirRpc packed_bytes ({}) != packed_bits ({}).div_ceil(8)",
+                    rpc.packed_bytes, rpc.packed_bits
+                ),
+            });
+        }
+        for spec in &rpc.quantize_specs {
+            verify_quantize_spec(&rpc.canonical_name, spec, errors);
+        }
+        for wf in &rpc.wire_fields {
+            if let Some(ref spec) = wf.quantize {
+                verify_quantize_spec(&rpc.canonical_name, spec, errors);
+                if spec.bit_offset != wf.bit_offset || spec.total_bits != wf.total_bits {
+                    errors.push(MirVerifyError::InvalidNetworkInvariant {
+                        subject: rpc.canonical_name.clone(),
+                        detail: format!(
+                            "wire_field `{}` quantize bit range [{}..+{}) mismatches wire_field [{}..+{})",
+                            wf.field_name,
+                            spec.bit_offset,
+                            spec.total_bits,
+                            wf.bit_offset,
+                            wf.total_bits
+                        ),
+                    });
+                }
+            }
+        }
+        let mut wf_intervals = Vec::with_capacity(rpc.wire_fields.len());
+        for wf in &rpc.wire_fields {
+            match wf.bit_offset.checked_add(wf.total_bits) {
+                Some(end) => wf_intervals.push((wf.bit_offset, end, wf.field_name.as_str())),
+                None => errors.push(MirVerifyError::InvalidNetworkInvariant {
+                    subject: rpc.canonical_name.clone(),
+                    detail: format!(
+                        "wire_field `{}` bit interval ({} + {}) overflows u32",
+                        wf.field_name, wf.bit_offset, wf.total_bits
+                    ),
+                }),
+            }
+        }
+        verify_bit_intervals(&rpc.canonical_name, wf_intervals, rpc.packed_bits, errors);
+
+        let mut q_intervals = Vec::with_capacity(rpc.quantize_specs.len());
+        for q in &rpc.quantize_specs {
+            match q.bit_offset.checked_add(q.total_bits) {
+                Some(end) => q_intervals.push((q.bit_offset, end, q.field_name.as_str())),
+                None => errors.push(MirVerifyError::InvalidNetworkInvariant {
+                    subject: rpc.canonical_name.clone(),
+                    detail: format!(
+                        "quantize_specs `{}` bit interval ({} + {}) overflows u32",
+                        q.field_name, q.bit_offset, q.total_bits
+                    ),
+                }),
+            }
+        }
+        verify_bit_intervals(&rpc.canonical_name, q_intervals, rpc.packed_bits, errors);
+    }
+
+    for op in &module.net_stream_ops {
+        if matches!(
+            op.kind,
+            MirStreamOpKind::StreamRead | MirStreamOpKind::StreamWriteBatch
+        ) && !op.requires_outside_par
+        {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: op.canonical_stream.clone(),
+                detail: format!(
+                    "net_stream_ops {:?} on `{}` (Slots 30/32) must have requires_outside_par=true",
+                    op.kind, op.stream
+                ),
+            });
+        }
+    }
+
+    for nst in &module.net_sim_tests {
+        if !nst.loss.is_finite() || !(0.0..=1.0).contains(&nst.loss) {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: nst.name.clone(),
+                detail: format!("MirNetSimTest loss ({}) must be in 0.0..=1.0", nst.loss),
+            });
+        }
+        if !nst.latency_ms.is_finite() || nst.latency_ms < 0.0 {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: nst.name.clone(),
+                detail: format!(
+                    "MirNetSimTest latency_ms ({}) must be finite and >= 0.0",
+                    nst.latency_ms
+                ),
+            });
+        }
+        if !nst.jitter_ms.is_finite() || nst.jitter_ms < 0.0 {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: nst.name.clone(),
+                detail: format!(
+                    "MirNetSimTest jitter_ms ({}) must be finite and >= 0.0",
+                    nst.jitter_ms
+                ),
+            });
+        }
+        if nst.clients == 0 {
+            errors.push(MirVerifyError::InvalidNetworkInvariant {
+                subject: nst.name.clone(),
+                detail: "MirNetSimTest clients must be >= 1".to_owned(),
+            });
+        }
+    }
+
+    let comp_fp_map: HashMap<&str, u64> = module
+        .net_handshake
+        .component_fingerprints
+        .iter()
+        .map(|(k, v)| (k.as_str(), *v))
+        .collect();
+    for nc in &module.net_components {
+        match comp_fp_map.get(nc.canonical_name.as_str()) {
+            Some(&fp) if fp == nc.schema_fingerprint => {}
+            Some(&fp) => {
+                errors.push(MirVerifyError::InvalidNetworkInvariant {
+                    subject: nc.canonical_name.clone(),
+                    detail: format!(
+                        "MirNetHandshake component fingerprint mismatch: expected {:#x}, got {:#x}",
+                        nc.schema_fingerprint, fp
+                    ),
+                });
+            }
+            None => {
+                errors.push(MirVerifyError::InvalidNetworkInvariant {
+                    subject: nc.canonical_name.clone(),
+                    detail: "MirNetComponent missing from MirNetHandshake::component_fingerprints"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+
+    let rpc_fp_map: HashMap<&str, u64> = module
+        .net_handshake
+        .rpc_fingerprints
+        .iter()
+        .map(|(k, v)| (k.as_str(), *v))
+        .collect();
+    for rpc in &module.rpcs {
+        match rpc_fp_map.get(rpc.canonical_name.as_str()) {
+            Some(&fp) if fp == rpc.schema_fingerprint => {}
+            Some(&fp) => {
+                errors.push(MirVerifyError::InvalidNetworkInvariant {
+                    subject: rpc.canonical_name.clone(),
+                    detail: format!(
+                        "MirNetHandshake rpc fingerprint mismatch: expected {:#x}, got {:#x}",
+                        rpc.schema_fingerprint, fp
+                    ),
+                });
+            }
+            None => {
+                errors.push(MirVerifyError::InvalidNetworkInvariant {
+                    subject: rpc.canonical_name.clone(),
+                    detail: "MirRpc missing from MirNetHandshake::rpc_fingerprints".to_owned(),
+                });
+            }
+        }
+    }
+
+    if (!module.net_components.is_empty() || !module.rpcs.is_empty())
+        && module.net_handshake.module_net_fingerprint == 0
+    {
+        errors.push(MirVerifyError::InvalidNetworkInvariant {
+            subject: module.module_path.clone(),
+            detail: "MirNetHandshake module_net_fingerprint must be non-zero when net_components or rpcs exist".to_owned(),
+        });
     }
 }
 
@@ -268,41 +709,272 @@ fn verify_function(func: &MirFunction, mod_det: bool, errors: &mut Vec<MirVerify
         }
     }
 
-    // Verify `@sparse` terms use sparse row indirections (`IterColRows*`) rather than dense column borrows
+    // Verify `@sparse` terms use `IterColRows*` and dense terms use `IterCol*`
     for qb in &func.query_bindings {
         if qb.is_point_lookup {
             continue;
         }
         for term in &qb.terms {
-            if !term.is_sparse {
-                continue;
+            if term.is_sparse {
+                let used_dense = func.blocks.iter().any(|bb| {
+                    bb.stmts.iter().any(|s| match &s.inst {
+                        Inst::IterColRead {
+                            query_idx,
+                            term_idx,
+                            ..
+                        }
+                        | Inst::IterColWrite {
+                            query_idx,
+                            term_idx,
+                            ..
+                        }
+                        | Inst::IterColWriteUntracked {
+                            query_idx,
+                            term_idx,
+                            ..
+                        } => *query_idx == qb.query_idx && *term_idx == term.term_idx,
+                        _ => false,
+                    })
+                });
+                if used_dense {
+                    errors.push(MirVerifyError::InvalidCfgInvariant {
+                        function: func.name.clone(),
+                        detail: format!(
+                            "@sparse query {} term {} (`{}`) used dense IterCol* instead of IterColRows*",
+                            qb.query_idx, term.term_idx, term.storage_key
+                        ),
+                    });
+                }
+            } else {
+                let used_sparse = func.blocks.iter().any(|bb| {
+                    bb.stmts.iter().any(|s| match &s.inst {
+                        Inst::IterColRowsRead {
+                            query_idx,
+                            term_idx,
+                            ..
+                        }
+                        | Inst::IterColRowsWrite {
+                            query_idx,
+                            term_idx,
+                            ..
+                        } => *query_idx == qb.query_idx && *term_idx == term.term_idx,
+                        _ => false,
+                    })
+                });
+                if used_sparse {
+                    errors.push(MirVerifyError::InvalidCfgInvariant {
+                        function: func.name.clone(),
+                        detail: format!(
+                            "dense query {} term {} (`{}`) used sparse IterColRows* instead of IterCol*",
+                            qb.query_idx, term.term_idx, term.storage_key
+                        ),
+                    });
+                }
             }
-            let used_dense = func.blocks.iter().any(|bb| {
-                bb.stmts.iter().any(|s| match &s.inst {
-                    Inst::IterColRead {
-                        query_idx,
-                        term_idx,
-                        ..
-                    }
-                    | Inst::IterColWrite {
-                        query_idx,
-                        term_idx,
-                        ..
-                    }
-                    | Inst::IterColWriteUntracked {
-                        query_idx,
-                        term_idx,
-                        ..
-                    } => *query_idx == qb.query_idx && *term_idx == term.term_idx,
-                    _ => false,
-                })
+        }
+    }
+
+    for ct in &func.changed_terms {
+        let q_idx = ct.query_idx as usize;
+        let t_idx = ct.term_idx as usize;
+        let valid_q = q_idx < func.queries.len() && q_idx < func.query_bindings.len();
+        let valid_t = valid_q && t_idx < func.query_bindings[q_idx].terms.len();
+        if !valid_t {
+            errors.push(MirVerifyError::InvalidCfgInvariant {
+                function: func.name.clone(),
+                detail: format!(
+                    "MirChangedTerm ({}, {}) out of bounds for query_bindings",
+                    ct.query_idx, ct.term_idx
+                ),
             });
-            if used_dense {
+        }
+    }
+
+    for op in &func.stream_ops {
+        if matches!(
+            op.kind,
+            MirStreamOpKind::StreamRead | MirStreamOpKind::StreamWriteBatch
+        ) {
+            if !op.requires_outside_par {
                 errors.push(MirVerifyError::InvalidCfgInvariant {
                     function: func.name.clone(),
                     detail: format!(
-                        "@sparse query {} term {} (`{}`) used dense IterCol* instead of IterColRows*",
-                        qb.query_idx, term.term_idx, term.storage_key
+                        "{:?} on `{}` (Slots 30/32) must have requires_outside_par=true",
+                        op.kind, op.stream
+                    ),
+                });
+            }
+            if func.par_chunk.is_some() {
+                errors.push(MirVerifyError::InvalidCfgInvariant {
+                    function: func.name.clone(),
+                    detail: format!(
+                        "@par chunk function cannot execute {:?} on `{}` (Slots 30/32 must run outside @par)",
+                        op.kind, op.stream
+                    ),
+                });
+            }
+        }
+    }
+
+    verify_atomic_tx_no_row_ptr_loops(func, errors);
+}
+
+fn verify_atomic_tx_no_row_ptr_loops(func: &MirFunction, errors: &mut Vec<MirVerifyError>) {
+    use crate::ir::BlockId;
+    use std::collections::VecDeque;
+
+    let ckpt_blocks: Vec<BlockId> = func
+        .blocks
+        .iter()
+        .filter(|bb| {
+            bb.stmts
+                .iter()
+                .any(|s| matches!(s.inst, Inst::CmdCheckpoint))
+        })
+        .map(|bb| bb.id)
+        .collect();
+    if ckpt_blocks.is_empty() {
+        return;
+    }
+
+    // Trace locals derived from `Inst::RowPtr` (direct or via `FieldPtr` / `Copy`).
+    let mut row_derived: HashSet<LocalId> = HashSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in &func.blocks {
+            for s in &bb.stmts {
+                let Some(dst) = s.dst else { continue };
+                let is_row = match &s.inst {
+                    Inst::RowPtr { .. } => true,
+                    Inst::FieldPtr { base_ptr, .. } => row_derived.contains(base_ptr),
+                    Inst::Copy { val } => row_derived.contains(val),
+                    _ => false,
+                };
+                if is_row && row_derived.insert(dst) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    if row_derived.is_empty() {
+        return;
+    }
+
+    let term_succs = |t: &Terminator| -> Vec<BlockId> {
+        match t {
+            Terminator::Return(_) => Vec::new(),
+            Terminator::Goto(b) => vec![*b],
+            Terminator::Branch {
+                then_bb, else_bb, ..
+            } => vec![*then_bb, *else_bb],
+            Terminator::Switch {
+                cases, default_bb, ..
+            } => {
+                let mut v: Vec<BlockId> = cases.iter().map(|(_, b)| *b).collect();
+                v.push(*default_bb);
+                v
+            }
+        }
+    };
+
+    for ckpt_bb in ckpt_blocks {
+        // Find matching `atomic_merge` reachable from `ckpt_bb`
+        let mut merge_bb = None;
+        let mut vis = HashSet::new();
+        let mut q = VecDeque::new();
+        vis.insert(ckpt_bb);
+        q.push_back(ckpt_bb);
+        while let Some(b) = q.pop_front() {
+            if let Some(bb) = func.blocks.get(b.0 as usize) {
+                if bb.label == "atomic_merge" && b != ckpt_bb {
+                    merge_bb = Some(b);
+                    break;
+                }
+                for s in term_succs(&bb.terminator) {
+                    if vis.insert(s) {
+                        q.push_back(s);
+                    }
+                }
+            }
+        }
+        let Some(merge_bb) = merge_bb else {
+            continue;
+        };
+
+        // Collect non-rollback `tx_blocks` starting from successors of `ckpt_bb`
+        let mut tx_set = HashSet::new();
+        let mut tx_q = VecDeque::new();
+        if let Some(cbb) = func.blocks.get(ckpt_bb.0 as usize) {
+            for s in term_succs(&cbb.terminator) {
+                if s != merge_bb
+                    && func
+                        .blocks
+                        .get(s.0 as usize)
+                        .is_some_and(|b| b.label != "atomic_rollback")
+                    && tx_set.insert(s)
+                {
+                    tx_q.push_back(s);
+                }
+            }
+        }
+        while let Some(b) = tx_q.pop_front() {
+            if let Some(bb) = func.blocks.get(b.0 as usize) {
+                for s in term_succs(&bb.terminator) {
+                    if s != merge_bb
+                        && func
+                            .blocks
+                            .get(s.0 as usize)
+                            .is_some_and(|blk| blk.label != "atomic_rollback")
+                        && tx_set.insert(s)
+                    {
+                        tx_q.push_back(s);
+                    }
+                }
+            }
+        }
+
+        // Any block `b` in `tx_set` that can reach itself within `tx_set` is inside a tx loop.
+        for &b in &tx_set {
+            let Some(bb) = func.blocks.get(b.0 as usize) else {
+                continue;
+            };
+            let has_row_store = bb.stmts.iter().any(|s| match &s.inst {
+                Inst::FieldStore { base_ptr, .. } | Inst::ArrayStore { base_ptr, .. } => {
+                    row_derived.contains(base_ptr)
+                }
+                _ => false,
+            });
+            if !has_row_store {
+                continue;
+            }
+            let mut seen = HashSet::new();
+            let mut lq = VecDeque::new();
+            for s in term_succs(&bb.terminator) {
+                if tx_set.contains(&s) && seen.insert(s) {
+                    lq.push_back(s);
+                }
+            }
+            let mut in_cycle = false;
+            while let Some(cur) = lq.pop_front() {
+                if cur == b {
+                    in_cycle = true;
+                    break;
+                }
+                if let Some(cbb) = func.blocks.get(cur.0 as usize) {
+                    for s in term_succs(&cbb.terminator) {
+                        if tx_set.contains(&s) && seen.insert(s) {
+                            lq.push_back(s);
+                        }
+                    }
+                }
+            }
+            if in_cycle {
+                errors.push(MirVerifyError::InvalidCfgInvariant {
+                    function: func.name.clone(),
+                    detail: format!(
+                        "multi-entity RowPtr mutation loop inside `atomic` block `{}` is not supported by single-slot pre-image undo log",
+                        bb.label
                     ),
                 });
             }
@@ -327,7 +999,9 @@ fn inst_locals(inst: &Inst) -> Vec<LocalId> {
         | Inst::IterColRowsRead { .. }
         | Inst::IterColRowsWrite { .. }
         | Inst::IterCount { .. }
-        | Inst::IterUpCascade { .. }
+        | Inst::IterReset { .. }
+        | Inst::SpatialCsrBegin { .. }
+        | Inst::SpatialCsrPrefixSum { .. }
         | Inst::ParForEachChunk { .. }
         | Inst::ParForEachChunkReadonly { .. }
         | Inst::ResRead { .. }
@@ -354,6 +1028,8 @@ fn inst_locals(inst: &Inst) -> Vec<LocalId> {
         | Inst::FieldLoad { base_ptr: val, .. }
         | Inst::EntityGet { entity: val, .. }
         | Inst::EntityGetMut { entity: val, .. }
+        | Inst::IterUpCascade { entity: val, .. }
+        | Inst::SpatialCsrCount { pos: val, .. }
         | Inst::GraceIsActive { ptr: val }
         | Inst::GraceClear { ptr: val }
         | Inst::TimelineInWindow { ptr: val, .. }
@@ -382,6 +1058,11 @@ fn inst_locals(inst: &Inst) -> Vec<LocalId> {
         | Inst::RowPtr {
             col_ptr: slot,
             row_idx: val,
+            ..
+        }
+        | Inst::SpatialCsrScatter {
+            entity: slot,
+            pos: val,
             ..
         }
         | Inst::EntityAtRow {
@@ -471,6 +1152,12 @@ fn inst_locals(inst: &Inst) -> Vec<LocalId> {
             run_start,
             run_len,
             row_idx,
+        }
+        | Inst::ArrayStore {
+            base_ptr: run_start,
+            index: run_len,
+            val: row_idx,
+            ..
         } => vec![*run_start, *run_len, *row_idx],
 
         Inst::InputBufPush {
@@ -579,6 +1266,11 @@ mod tests {
             schedules: Vec::new(),
             sim_tests: Vec::new(),
             field_defaults: IndexMap::new(),
+            rpcs: Vec::new(),
+            net_components: Vec::new(),
+            net_sim_tests: Vec::new(),
+            net_handshake: crate::ir::MirNetHandshake::default(),
+            net_stream_ops: Vec::new(),
         }
     }
 

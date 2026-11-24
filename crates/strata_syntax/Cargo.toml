@@ -12,6 +12,7 @@ description = "Lossless CST, logos lexer, error-recovering LL(2)/Pratt parser, a
 logos.workspace = true
 rowan.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -1,8 +1,9 @@
 //! Strata v2.0 static type system and SI physical unit dimensional algebra.
 
+use crate::access::TermAccessMode;
 use serde::{Deserialize, Serialize};
-use strata_syntax::SyntaxKind;
-use strata_syntax::SyntaxNode;
+use std::collections::HashSet;
+use strata_syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 
 /// SI physical unit exponents `(sec, meters, rad, frames)` checked at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -98,6 +99,23 @@ impl UnitDim {
     }
 }
 
+/// Single projected or borrowed term inside a [`Ty::QueryRow`] expression type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct QueryRowTerm {
+    /// Binding alias (`"h"` or `"v"`).
+    pub alias: String,
+    /// Logical component or `@soa` stratum key (`"Health"` or `"Body::hot"`).
+    pub storage_key: String,
+    /// Canonical layout name (`"demo::Health"`).
+    pub canonical_component: String,
+    /// Optional projected field name (`Some("pos")`).
+    pub field_name: Option<String>,
+    /// Borrow mode (`Read`, `Write`, `SelectiveWrite`, `OptionalRead`, `OptionalWrite`).
+    pub mode: TermAccessMode,
+    /// Resolved semantic type of this term.
+    pub ty: Ty,
+}
+
 /// Static Strata v2.0 type representation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[allow(missing_docs)]
@@ -116,7 +134,10 @@ pub enum Ty {
     Fix64,
     Bool,
     Sym,
-    UnitScalar { name: String, dim: UnitDim },
+    UnitScalar {
+        name: String,
+        dim: UnitDim,
+    },
     Vec2,
     Vec3,
     Vec3a,
@@ -129,11 +150,20 @@ pub enum Ty {
     Mat4,
     Rgba8,
     Rgba,
-    Array { elem: Box<Ty>, len: usize },
-    SmallVec { elem: Box<Ty>, cap: usize },
+    Array {
+        elem: Box<Ty>,
+        len: usize,
+    },
+    SmallVec {
+        elem: Box<Ty>,
+        cap: usize,
+    },
     InlineStr(usize),
     BitSet(usize),
-    InputBuffer { action: String, cap: usize },
+    InputBuffer {
+        action: String,
+        cap: usize,
+    },
     GraceWindow,
     Ref(String),
     Asset(String),
@@ -141,6 +171,27 @@ pub enum Ty {
     Tuple(Vec<Ty>),
     Unit,
     BannedWire(String),
+    /// Optional value `Option<T>` (and `?&T` / `?&mut T` query term target).
+    Option(Box<Ty>),
+    /// Fallible result `Result<T, E>`.
+    Result {
+        ok: Box<Ty>,
+        err: Box<Ty>,
+    },
+    /// Live borrow `&T` (`mutable: false`) or `&mut T` (`mutable: true`).
+    Borrow {
+        mutable: bool,
+        inner: Box<Ty>,
+    },
+    /// Observer event trigger `Trigger<Event, Target?>`.
+    Trigger {
+        event: String,
+        target: Option<String>,
+    },
+    /// Projected row type of a `query(...)` / `query_one(...)` expression.
+    QueryRow(Vec<QueryRowTerm>),
+    /// Anonymous structural record `{ field: ty, ... }`.
+    Record(Vec<(String, Ty)>),
     Unknown,
 }
 
@@ -156,17 +207,163 @@ impl Ty {
     /// Returns `true` if `self` and `other` represent compatible types (including matching SI
     /// dimensions such as `sec` and `ms`, or `rad` and `deg`).
     pub fn is_compatible_with(&self, other: &Self) -> bool {
-        if self == other {
-            return true;
-        }
         match (self, other) {
+            (Self::U8, Self::U8)
+            | (Self::U16, Self::U16)
+            | (Self::U32, Self::U32)
+            | (Self::U64, Self::U64)
+            | (Self::I8, Self::I8)
+            | (Self::I16, Self::I16)
+            | (Self::I32, Self::I32)
+            | (Self::I64, Self::I64)
+            | (Self::F32, Self::F32)
+            | (Self::F64, Self::F64)
+            | (Self::Bool, Self::Bool)
+            | (Self::Fix32, Self::Fix32)
+            | (Self::Fix64, Self::Fix64)
+            | (Self::Vec2, Self::Vec2)
+            | (Self::Vec3, Self::Vec3)
+            | (Self::Vec3a, Self::Vec3a)
+            | (Self::Vec4, Self::Vec4)
+            | (Self::Quat, Self::Quat)
+            | (Self::Mat3, Self::Mat3)
+            | (Self::Mat4, Self::Mat4)
+            | (Self::IVec2, Self::IVec2)
+            | (Self::IVec3, Self::IVec3)
+            | (Self::UVec2, Self::UVec2)
+            | (Self::Sym, Self::Sym)
+            | (Self::Rgba8, Self::Rgba8)
+            | (Self::Rgba, Self::Rgba)
+            | (Self::GraceWindow, Self::GraceWindow)
+            | (Self::Unit, Self::Unit)
+            | (Self::Unknown, Self::Unknown) => true,
+            (Self::InlineStr(a), Self::InlineStr(b)) | (Self::BitSet(a), Self::BitSet(b)) => a == b,
+            (
+                Self::InputBuffer {
+                    cap: c1,
+                    action: a1,
+                },
+                Self::InputBuffer {
+                    cap: c2,
+                    action: a2,
+                },
+            ) => c1 == c2 && a1 == a2,
+            (Self::Ref(a), Self::Ref(b))
+            | (Self::Asset(a), Self::Asset(b))
+            | (Self::Named(a), Self::Named(b))
+            | (Self::BannedWire(a), Self::BannedWire(b)) => a == b,
+            (
+                Self::Trigger {
+                    event: e1,
+                    target: t1,
+                },
+                Self::Trigger {
+                    event: e2,
+                    target: t2,
+                },
+            ) => e1 == e2 && t1 == t2,
+            (Self::QueryRow(a), Self::QueryRow(b)) => {
+                if a.len() != b.len() {
+                    return false;
+                }
+                let mut i = 0;
+                while i < a.len() {
+                    let x = &a[i];
+                    let y = &b[i];
+                    if x.alias != y.alias
+                        || x.storage_key != y.storage_key
+                        || x.canonical_component != y.canonical_component
+                        || x.field_name != y.field_name
+                        || x.mode != y.mode
+                        || !x.ty.is_compatible_with(&y.ty)
+                    {
+                        return false;
+                    }
+                    i += 1;
+                }
+                true
+            }
             (Self::UnitScalar { dim: a, .. }, Self::UnitScalar { dim: b, .. }) => a == b,
+            (Self::Option(a), Self::Option(b))
+            | (
+                Self::Borrow {
+                    mutable: true,
+                    inner: a,
+                },
+                Self::Borrow {
+                    mutable: true,
+                    inner: b,
+                },
+            )
+            | (
+                Self::Borrow {
+                    mutable: false,
+                    inner: a,
+                },
+                Self::Borrow {
+                    mutable: false,
+                    inner: b,
+                },
+            ) => a.is_compatible_with(b),
+            (Self::Array { elem: a, len: l1 }, Self::Array { elem: b, len: l2 }) if l1 == l2 => {
+                a.is_compatible_with(b)
+            }
+            (Self::SmallVec { elem: a, cap: c1 }, Self::SmallVec { elem: b, cap: c2 })
+                if c1 == c2 =>
+            {
+                a.is_compatible_with(b)
+            }
+            (Self::Result { ok: ok1, err: err1 }, Self::Result { ok: ok2, err: err2 }) => {
+                ok1.is_compatible_with(ok2) && err1.is_compatible_with(err2)
+            }
+            (Self::Tuple(t1), Self::Tuple(t2)) => {
+                if t1.len() != t2.len() {
+                    return false;
+                }
+                let mut i = 0;
+                while i < t1.len() {
+                    if !t1[i].is_compatible_with(&t2[i]) {
+                        return false;
+                    }
+                    i += 1;
+                }
+                true
+            }
+            (Self::Record(r1), Self::Record(r2)) => {
+                if r1.len() != r2.len() {
+                    return false;
+                }
+                let mut i = 0;
+                while i < r1.len() {
+                    if r1[i].0 != r2[i].0 || !r1[i].1.is_compatible_with(&r2[i].1) {
+                        return false;
+                    }
+                    i += 1;
+                }
+                true
+            }
             _ => false,
         }
     }
 
     /// Canonical Rust/C ABI type tag string matching `bamabi_macros::classify::canonical_field_type_tag`.
     pub fn canonical_tag(&self) -> String {
+        fn push_usize(out: &mut String, mut n: usize) {
+            let mut buf = [0u8; 20];
+            let mut idx = buf.len();
+            if n == 0 {
+                out.push('0');
+                return;
+            }
+            while n > 0 {
+                idx -= 1;
+                buf[idx] = b'0' + (n % 10) as u8;
+                n /= 10;
+            }
+            if let Ok(s) = std::str::from_utf8(&buf[idx..]) {
+                out.push_str(s);
+            }
+        }
         match self {
             Self::U8 => "u8".to_owned(),
             Self::U16 => "u16".to_owned(),
@@ -187,47 +384,146 @@ impl Ty {
             Self::UVec2 => "[u32;2]".to_owned(),
             Self::Mat3 => "[f32;9]".to_owned(),
             Self::Mat4 => "[f32;16]".to_owned(),
-            Self::Array { elem, len } => format!("[{};{}]", elem.canonical_tag(), len),
-            Self::SmallVec { elem, cap } => {
-                format!("SmallVecPod<{},{}>", elem.canonical_tag(), cap)
+            Self::Array { elem, len } => {
+                let tag = elem.canonical_tag();
+                let mut s = String::with_capacity(tag.len() + 12);
+                s.push('[');
+                s.push_str(&tag);
+                s.push(';');
+                push_usize(&mut s, *len);
+                s.push(']');
+                s
             }
-            Self::InlineStr(cap) => format!("InlineStr<{cap}>"),
-            Self::BitSet(bits) => format!("BitSet<{}>", (*bits).div_ceil(32).max(1)),
-            Self::InputBuffer { cap, .. } => format!("InputBuffer<{cap}>"),
+            Self::SmallVec { elem, cap } => {
+                let tag = elem.canonical_tag();
+                let mut s = String::with_capacity(tag.len() + 24);
+                s.push_str("SmallVecPod<");
+                s.push_str(&tag);
+                s.push(',');
+                push_usize(&mut s, *cap);
+                s.push('>');
+                s
+            }
+            Self::InlineStr(cap) => {
+                let mut s = String::with_capacity(20);
+                s.push_str("InlineStr<");
+                push_usize(&mut s, *cap);
+                s.push('>');
+                s
+            }
+            Self::BitSet(bits) => {
+                let mut s = String::with_capacity(18);
+                s.push_str("BitSet<");
+                push_usize(&mut s, (*bits).div_ceil(32).max(1));
+                s.push('>');
+                s
+            }
+            Self::InputBuffer { cap, .. } => {
+                let mut s = String::with_capacity(22);
+                s.push_str("InputBuffer<");
+                push_usize(&mut s, *cap);
+                s.push('>');
+                s
+            }
             Self::Ref(_) => "FfiEntity".to_owned(),
             Self::Asset(_) => "FfiAssetHandle".to_owned(),
             Self::Named(n) | Self::BannedWire(n) => n.clone(),
             Self::Tuple(_) => "Tuple".to_owned(),
             Self::Unit => "()".to_owned(),
+            Self::Option(inner) => {
+                let tag = inner.canonical_tag();
+                let mut s = String::with_capacity(8 + tag.len());
+                s.push_str("Option<");
+                s.push_str(&tag);
+                s.push('>');
+                s
+            }
+            Self::Result { ok, err } => {
+                let ok_tag = ok.canonical_tag();
+                let err_tag = err.canonical_tag();
+                let mut s = String::with_capacity(9 + ok_tag.len() + err_tag.len());
+                s.push_str("Result<");
+                s.push_str(&ok_tag);
+                s.push(',');
+                s.push_str(&err_tag);
+                s.push('>');
+                s
+            }
+            Self::Borrow { mutable, inner } => {
+                let tag = inner.canonical_tag();
+                let prefix = if *mutable { "&mut " } else { "&" };
+                let mut s = String::with_capacity(prefix.len() + tag.len());
+                s.push_str(prefix);
+                s.push_str(&tag);
+                s
+            }
+            Self::Trigger { event, target } => {
+                let mut s = String::with_capacity(12 + event.len());
+                s.push_str("Trigger<");
+                s.push_str(event);
+                if let Some(t) = target {
+                    s.push(',');
+                    s.push_str(t);
+                }
+                s.push('>');
+                s
+            }
+            Self::QueryRow(_) => "QueryRow".to_owned(),
+            Self::Record(fields) => {
+                let mut s = String::from("{");
+                let mut i = 0;
+                while i < fields.len() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str(&fields[i].0);
+                    s.push(':');
+                    s.push_str(&fields[i].1.canonical_tag());
+                    i += 1;
+                }
+                s.push('}');
+                s
+            }
             Self::Unknown => "unknown".to_owned(),
         }
     }
 
-    /// Parses a unit scalar suffix (`_ms`, `_s`, `_hz`, `_f`, `_rad`, `_deg`, `_m`, `_mps`, `_mps2`)
-    /// into its [`UnitDim`].
+    /// Splits a unit literal (e.g. `"50ms"`, `"1_000ms"`, `"20Hz"`, `"1.5s"`, `"1_000_f"`) into
+    /// `(numeric_stem, canonical_unit_name, UnitDim, si_scale_factor)`.
+    pub fn split_unit_literal(lit: &str) -> Option<(&str, &'static str, UnitDim, f64)> {
+        const UNITS: &[(&str, &str, UnitDim, f64)] = &[
+            ("frames", "frames", UnitDim::FRAMES, 1.0),
+            ("meters", "meters", UnitDim::METERS, 1.0),
+            ("mps2", "mps2", UnitDim::MPS2, 1.0),
+            ("mps", "mps", UnitDim::MPS, 1.0),
+            ("sec", "sec", UnitDim::SEC, 1.0),
+            ("rad", "rad", UnitDim::RAD, 1.0),
+            ("deg", "deg", UnitDim::RAD, std::f64::consts::PI / 180.0),
+            ("ms", "ms", UnitDim::SEC, 0.001),
+            ("hz", "hz", UnitDim::HZ, 1.0),
+            ("Hz", "hz", UnitDim::HZ, 1.0),
+            ("s", "sec", UnitDim::SEC, 1.0),
+            ("m", "meters", UnitDim::METERS, 1.0),
+            ("f", "frames", UnitDim::FRAMES, 1.0),
+        ];
+        for &(suf, name, dim, factor) in UNITS {
+            if let Some(rest) = lit.strip_suffix(suf) {
+                let stem = rest.strip_suffix('_').unwrap_or(rest);
+                if !stem.is_empty() && stem.as_bytes()[0].is_ascii_digit() {
+                    let cleaned: String = stem.chars().filter(|&c| c != '_').collect();
+                    if cleaned.parse::<f64>().is_ok_and(f64::is_finite) {
+                        return Some((stem, name, dim, factor));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Parses a unit scalar suffix (`ms`, `s`, `sec`, `hz`, `Hz`, `f`, `frames`, `rad`, `deg`,
+    /// `m`, `meters`, `mps`, `mps2`, with optional `_` separator) into its [`UnitDim`].
     pub fn unit_from_literal(lit: &str) -> Option<Self> {
-        let (name, dim) = if lit.ends_with("_sec") || lit.ends_with("_s") {
-            ("sec", UnitDim::SEC)
-        } else if lit.ends_with("_ms") {
-            ("ms", UnitDim::SEC)
-        } else if lit.ends_with("_hz") {
-            ("hz", UnitDim::HZ)
-        } else if lit.ends_with("_frames") || lit.ends_with("_f") {
-            ("frames", UnitDim::FRAMES)
-        } else if lit.ends_with("_rad") {
-            ("rad", UnitDim::RAD)
-        } else if lit.ends_with("_deg") {
-            ("deg", UnitDim::RAD)
-        } else if lit.ends_with("_meters") || lit.ends_with("_m") {
-            ("meters", UnitDim::METERS)
-        } else if lit.ends_with("_mps2") {
-            ("mps2", UnitDim::MPS2)
-        } else if lit.ends_with("_mps") {
-            ("mps", UnitDim::MPS)
-        } else {
-            return None;
-        };
-        Some(Self::UnitScalar {
+        Self::split_unit_literal(lit).map(|(_, name, dim, _)| Self::UnitScalar {
             name: name.to_owned(),
             dim,
         })
@@ -236,14 +532,22 @@ impl Ty {
 
 /// Parses a CST type node (`TypeRef`, `ArrayType`, `TupleType`, `RefType`, `PtrTermType`) into a [`Ty`].
 pub fn parse_type_node(node: &SyntaxNode) -> Ty {
+    parse_type_node_with_user_types(node, &HashSet::new())
+}
+
+/// Parses a CST type node into a [`Ty`], honoring user-declared type names that shadow built-in
+/// PascalCase aliases (`Quat`, `Rgba8`, `Option`, `Result`, `Trigger`).
+pub fn parse_type_node_with_user_types(node: &SyntaxNode, user_types: &HashSet<String>) -> Ty {
     match node.kind() {
         SyntaxKind::ArrayType => {
             let child_types: Vec<_> = node
                 .children()
                 .filter(|c| is_type_node_kind(c.kind()))
                 .collect();
-            let elem = child_types.first().map_or(Ty::Unknown, parse_type_node);
-            let len = extract_first_int_in_node(node).unwrap_or(0);
+            let elem = child_types.first().map_or(Ty::Unknown, |c| {
+                parse_type_node_with_user_types(c, user_types)
+            });
+            let len = extract_array_len(node).unwrap_or(0);
             Ty::Array {
                 elem: Box::new(elem),
                 len,
@@ -253,7 +557,7 @@ pub fn parse_type_node(node: &SyntaxNode) -> Ty {
             let items = node
                 .children()
                 .filter(|c| is_type_node_kind(c.kind()))
-                .map(|c| parse_type_node(&c))
+                .map(|c| parse_type_node_with_user_types(&c, user_types))
                 .collect::<Vec<_>>();
             if items.is_empty() {
                 Ty::Unit
@@ -261,14 +565,37 @@ pub fn parse_type_node(node: &SyntaxNode) -> Ty {
                 Ty::Tuple(items)
             }
         }
-        SyntaxKind::RefType | SyntaxKind::PtrTermType => {
+        SyntaxKind::RefType => {
+            let has_mut = node
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .any(|t| t.kind() == SyntaxKind::KwMut);
             if let Some(inner) = node.children().find(|c| is_type_node_kind(c.kind())) {
-                parse_type_node(&inner)
+                let inner_ty = parse_type_node_with_user_types(&inner, user_types);
+                Ty::Borrow {
+                    mutable: has_mut,
+                    inner: Box::new(inner_ty),
+                }
             } else {
                 Ty::Unknown
             }
         }
-        SyntaxKind::TypeRef => parse_typeref_node(node),
+        SyntaxKind::PtrTermType => {
+            let has_mut = node
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .any(|t| t.kind() == SyntaxKind::KwMut);
+            if let Some(inner) = node.children().find(|c| is_type_node_kind(c.kind())) {
+                let inner_ty = parse_type_node_with_user_types(&inner, user_types);
+                Ty::Option(Box::new(Ty::Borrow {
+                    mutable: has_mut,
+                    inner: Box::new(inner_ty),
+                }))
+            } else {
+                Ty::Unknown
+            }
+        }
+        SyntaxKind::TypeRef => parse_typeref_node(node, user_types),
         _ => Ty::Unknown,
     }
 }
@@ -284,7 +611,7 @@ fn is_type_node_kind(kind: SyntaxKind) -> bool {
     )
 }
 
-fn parse_typeref_node(node: &SyntaxNode) -> Ty {
+fn parse_typeref_node(node: &SyntaxNode, user_types: &HashSet<String>) -> Ty {
     let base_name = node
         .children()
         .find(|c| c.kind() == SyntaxKind::Path)
@@ -361,22 +688,72 @@ fn parse_typeref_node(node: &SyntaxNode) -> Ty {
         "ivec3" => Ty::IVec3,
         "uvec2" => Ty::UVec2,
         "quat" => Ty::Quat,
+        "Quat" if !user_types.contains("Quat") => Ty::Quat,
         "mat3" => Ty::Mat3,
         "mat4" => Ty::Mat4,
         "rgba8" => Ty::Rgba8,
+        "Rgba8" if !user_types.contains("Rgba8") => Ty::Rgba8,
         "rgba" => Ty::Rgba,
         "GraceWindow" => Ty::GraceWindow,
-        "usize" | "isize" | "u128" | "i128" | "String" | "Vec" | "Box" | "char" => {
+        "usize" | "isize" | "u128" | "i128" | "String" | "str" | "Vec" | "Box" | "char" => {
             Ty::BannedWire(base_name)
+        }
+        "Option" | "std::option::Option" if !user_types.contains("Option") => {
+            let inner = gen_args
+                .as_ref()
+                .and_then(|g| g.children().find(|c| is_type_node_kind(c.kind())))
+                .map_or(Ty::Unknown, |c| {
+                    parse_type_node_with_user_types(&c, user_types)
+                });
+            Ty::Option(Box::new(inner))
+        }
+        "Result" | "std::result::Result" if !user_types.contains("Result") => {
+            let type_args: Vec<_> = gen_args
+                .as_ref()
+                .map(|g| {
+                    g.children()
+                        .filter(|c| is_type_node_kind(c.kind()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let ok = type_args.first().map_or(Ty::Unknown, |c| {
+                parse_type_node_with_user_types(c, user_types)
+            });
+            let err = type_args.get(1).map_or(Ty::Unknown, |c| {
+                parse_type_node_with_user_types(c, user_types)
+            });
+            Ty::Result {
+                ok: Box::new(ok),
+                err: Box::new(err),
+            }
+        }
+        "Trigger" if !user_types.contains("Trigger") => {
+            let type_args: Vec<String> = gen_args
+                .as_ref()
+                .map(|g| {
+                    g.children()
+                        .filter(|c| is_type_node_kind(c.kind()))
+                        .map(|c| c.text().to_string().trim().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let event = type_args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "Event".to_owned());
+            let target = type_args.get(1).cloned();
+            Ty::Trigger { event, target }
         }
         "SmallVec" => {
             let elem = gen_args
                 .as_ref()
                 .and_then(|g| g.children().find(|c| is_type_node_kind(c.kind())))
-                .map_or(Ty::Unknown, |c| parse_type_node(&c));
+                .map_or(Ty::Unknown, |c| {
+                    parse_type_node_with_user_types(&c, user_types)
+                });
             let cap = gen_args
                 .as_ref()
-                .and_then(extract_first_int_in_node)
+                .and_then(|g| extract_generic_arg_int(g, 1))
                 .unwrap_or(0);
             Ty::SmallVec {
                 elem: Box::new(elem),
@@ -386,14 +763,14 @@ fn parse_typeref_node(node: &SyntaxNode) -> Ty {
         "InlineStr" => {
             let cap = gen_args
                 .as_ref()
-                .and_then(extract_first_int_in_node)
+                .and_then(|g| extract_generic_arg_int(g, 0))
                 .unwrap_or(0);
             Ty::InlineStr(cap)
         }
         "BitSet" => {
             let bits = gen_args
                 .as_ref()
-                .and_then(extract_first_int_in_node)
+                .and_then(|g| extract_generic_arg_int(g, 0))
                 .unwrap_or(32);
             Ty::BitSet(bits)
         }
@@ -407,7 +784,7 @@ fn parse_typeref_node(node: &SyntaxNode) -> Ty {
                 );
             let cap = gen_args
                 .as_ref()
-                .and_then(extract_first_int_in_node)
+                .and_then(|g| extract_generic_arg_int(g, 1))
                 .unwrap_or(4);
             Ty::InputBuffer { action, cap }
         }
@@ -435,14 +812,65 @@ fn parse_typeref_node(node: &SyntaxNode) -> Ty {
     }
 }
 
+fn parse_int_lit_token(t: &SyntaxToken) -> Option<usize> {
+    let raw = t.text().split('_').next().unwrap_or("");
+    raw.parse::<usize>().ok()
+}
+
+fn extract_array_len(node: &SyntaxNode) -> Option<usize> {
+    let mut after_semi = false;
+    for el in node.children_with_tokens() {
+        if !after_semi {
+            if el.as_token().is_some_and(|t| t.kind() == SyntaxKind::Semi) {
+                after_semi = true;
+            }
+            continue;
+        }
+        if let Some(t) = el.as_token() {
+            if t.kind() == SyntaxKind::IntLit
+                && let Some(val) = parse_int_lit_token(t)
+            {
+                return Some(val);
+            }
+        } else if let Some(n) = el.as_node()
+            && let Some(val) = extract_first_int_in_node(n)
+        {
+            return Some(val);
+        }
+    }
+    None
+}
+
+fn extract_generic_arg_int(gen_args: &SyntaxNode, arg_index: usize) -> Option<usize> {
+    let mut current_arg = 0usize;
+    for el in gen_args.children_with_tokens() {
+        if let Some(t) = el.as_token() {
+            if t.kind() == SyntaxKind::Comma {
+                current_arg += 1;
+                if current_arg > arg_index {
+                    break;
+                }
+            } else if current_arg == arg_index
+                && t.kind() == SyntaxKind::IntLit
+                && let Some(val) = parse_int_lit_token(t)
+            {
+                return Some(val);
+            }
+        } else if let Some(n) = el.as_node()
+            && current_arg == arg_index
+            && let Some(val) = extract_first_int_in_node(n)
+        {
+            return Some(val);
+        }
+    }
+    None
+}
+
 fn extract_first_int_in_node(node: &SyntaxNode) -> Option<usize> {
     node.descendants_with_tokens()
         .filter_map(|e| e.into_token())
         .find(|t| t.kind() == SyntaxKind::IntLit)
-        .and_then(|t| {
-            let raw = t.text().split('_').next().unwrap_or("");
-            raw.parse::<usize>().ok()
-        })
+        .and_then(|t| parse_int_lit_token(&t))
 }
 
 #[cfg(test)]

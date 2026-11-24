@@ -1,7 +1,7 @@
 # Cross-repository ABI & toolchain synchronization lockfile
 [project]
 name = "bamabi-strata"
-layer = 2
+layer = 3
 
 [abi]
 bam_abi_version = "0x0003_0000"

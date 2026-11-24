@@ -1,58 +1,77 @@
 #![forbid(unsafe_code)]
-//! Property-based (`proptest`) suites for [`strata_lsp`] 64-byte binary telemetry packets.
+
+//! Property-based tests for `strata_lsp` Layer-0 `SystemTelemetryDigest64` (`"BAMT"`) wire codec.
 
 use proptest::prelude::*;
-use strata_lsp::{SystemTelemetryDigest64, TELEMETRY_DIGEST_MAGIC, TelemetryError};
+use strata_lsp::{
+    SYSTEM_TELEMETRY_DIGEST_SIZE, SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC,
+    SystemTelemetryDigest64, TelemetryError, decode_digest_slice,
+};
 
 proptest! {
-    /// Verifies full 64-byte binary wire round-trip over random field payloads.
     #[test]
-    fn telemetry_digest64_roundtrip(
-        version in any::<u16>(),
+    fn system_telemetry_digest64_wire_roundtrip_is_lossless(
         flags in any::<u16>(),
-        system_name_hash in any::<u64>(),
-        frame_index in any::<u64>(),
-        avg_ns in any::<u64>(),
-        p99_ns in any::<u64>(),
-        entity_count in any::<u64>(),
-        dirty_rows in any::<u64>(),
-        alloc_bytes in any::<u64>(),
+        mod_id in any::<u64>(),
+        system_hash in any::<u64>(),
+        frame_seq in any::<u64>(),
+        matched_entities in any::<u32>(),
+        matched_tables in any::<u32>(),
+        skipped_summary_tick_tables in any::<u32>(),
+        chunks in any::<u32>(),
+        p50_us in any::<u32>(),
+        p99_us in any::<u32>(),
+        commands_queued in any::<u32>(),
+        reserved in any::<u32>(),
     ) {
         let msg = SystemTelemetryDigest64 {
-            magic: TELEMETRY_DIGEST_MAGIC,
-            version,
+            magic: SYSTEM_TELEMETRY_MAGIC,
+            version: SYSTEM_TELEMETRY_DIGEST_VERSION,
             flags,
-            system_name_hash,
-            frame_index,
-            avg_ns,
-            p99_ns,
-            entity_count,
-            dirty_rows,
-            alloc_bytes,
+            mod_id,
+            system_hash,
+            frame_seq,
+            matched_entities,
+            matched_tables,
+            skipped_summary_tick_tables,
+            chunks,
+            p50_us,
+            p99_us,
+            commands_queued,
+            reserved,
         };
         let bytes = msg.to_le_bytes();
-        prop_assert_eq!(SystemTelemetryDigest64::from_le_bytes(&bytes).unwrap(), msg);
+        prop_assert_eq!(bytes.len(), SYSTEM_TELEMETRY_DIGEST_SIZE);
+        prop_assert_eq!(decode_digest_slice(&bytes).unwrap(), msg);
     }
 
-    /// Verifies arbitrary byte slices with wrong length or wrong magic return structured errors.
     #[test]
-    fn telemetry_digest64_rejects_arbitrary_corrupt_frames(raw in prop::collection::vec(any::<u8>(), 0..96)) {
-        if raw.len() != 64 {
-            let is_len_err = matches!(
-                SystemTelemetryDigest64::from_le_bytes(&raw),
+    fn system_telemetry_digest64_rejects_arbitrary_non_canonical_packets(
+        raw in proptest::collection::vec(any::<u8>(), 0..=128)
+    ) {
+        if raw.len() != SYSTEM_TELEMETRY_DIGEST_SIZE {
+            let is_invalid_len = matches!(
+                decode_digest_slice(&raw),
                 Err(TelemetryError::InvalidLength { .. })
             );
-            prop_assert!(is_len_err);
+            prop_assert!(is_invalid_len);
         } else {
-            let magic = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-            if magic != TELEMETRY_DIGEST_MAGIC {
-                let is_magic_err = matches!(
-                    SystemTelemetryDigest64::from_le_bytes(&raw),
+            let magic: [u8; 4] = raw[0..4].try_into().unwrap();
+            let version = u16::from_le_bytes(raw[4..6].try_into().unwrap());
+            if magic != SYSTEM_TELEMETRY_MAGIC {
+                let is_invalid_magic = matches!(
+                    decode_digest_slice(&raw),
                     Err(TelemetryError::InvalidMagic { .. })
                 );
-                prop_assert!(is_magic_err);
+                prop_assert!(is_invalid_magic);
+            } else if version != SYSTEM_TELEMETRY_DIGEST_VERSION {
+                let is_unsupported_ver = matches!(
+                    decode_digest_slice(&raw),
+                    Err(TelemetryError::UnsupportedVersion { .. })
+                );
+                prop_assert!(is_unsupported_ver);
             } else {
-                prop_assert!(SystemTelemetryDigest64::from_le_bytes(&raw).is_ok());
+                prop_assert!(decode_digest_slice(&raw).is_ok());
             }
         }
     }

@@ -1,4 +1,4 @@
-//! Machine-readable JSON diagnostics and fix-its for Strata v2.0 (`E01xx..E03xx`, `W04xx`).
+//! Machine-readable JSON diagnostics and fix-its for Strata v2.0 (`E01xx..E06xx`, `W04xx`).
 
 use serde::{Deserialize, Serialize};
 use strata_syntax::{TextRange, TextSize};
@@ -136,6 +136,14 @@ pub mod codes {
     pub const E0204_EFFECTS_MISMATCH: &str = "E0204_EFFECTS_MISMATCH";
     pub const E0301_UNRESOLVED_SYMBOL: &str = "E0301_UNRESOLVED_SYMBOL";
     pub const E0302_NON_POD_ACROSS_WAIT: &str = "E0302_NON_POD_ACROSS_WAIT";
+    pub const E0303_DUPLICATE_SYMBOL: &str = "E0303_DUPLICATE_SYMBOL";
+    pub const E0501_AUTHORITY_VIOLATION: &str = "E0501_AUTHORITY_VIOLATION";
+    pub const E0502_INVALID_NET_ATTR: &str = "E0502_INVALID_NET_ATTR";
+    pub const E0503_INVALID_QUANTIZE: &str = "E0503_INVALID_QUANTIZE";
+    pub const E0504_INVALID_AUTHORITY: &str = "E0504_INVALID_AUTHORITY";
+    pub const E0505_INVALID_NET_SIM_PARAM: &str = "E0505_INVALID_NET_SIM_PARAM";
+    pub const E0601_NODE_PURE_VIOLATION: &str = "E0601_NODE_PURE_VIOLATION";
+    pub const E0602_INVALID_NODE_GROUP: &str = "E0602_INVALID_NODE_GROUP";
     pub const W0401_QUADRATIC_NESTED_QUERY: &str = "W0401_QUADRATIC_NESTED_QUERY";
     pub const W0402_USE_SELECTIVE_MUT_TICK: &str = "W0402_USE_SELECTIVE_MUT_TICK";
     pub const W0403_USE_SPAWN_BATCH: &str = "W0403_USE_SPAWN_BATCH";

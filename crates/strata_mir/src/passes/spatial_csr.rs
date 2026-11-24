@@ -125,6 +125,9 @@ pub fn run(module: &mut MirModule) {
         let p2_row_body = b.new_block("csr_pass2_row_body");
         let exit_bb = b.new_block("csr_exit");
 
+        b.emit_void(Inst::SpatialCsrBegin {
+            index_name: idx.name.clone(),
+        });
         b.terminate(Terminator::Goto(p1_chunk_hdr));
         b.switch_to(p1_chunk_hdr);
         let p1_has = b.alloc_and_emit(
@@ -197,7 +200,7 @@ pub fn run(module: &mut MirModule) {
                 is_sparse: pos_sparse,
             },
         );
-        let _pos_val = b.alloc_and_emit(
+        let p1_pos = b.alloc_and_emit(
             "p1_pos",
             pos_mty.clone(),
             Inst::FieldLoad {
@@ -208,6 +211,10 @@ pub fn run(module: &mut MirModule) {
                 field_ty: pos_mty.clone(),
             },
         );
+        b.emit_void(Inst::SpatialCsrCount {
+            index_name: idx.name.clone(),
+            pos: p1_pos,
+        });
         let one = b.alloc_and_emit("one", MirType::U32, Inst::ConstInt { value: 1 });
         let cur_c = b.alloc_and_emit("cur_c", MirType::U32, Inst::SlotLoad { slot: count_slot });
         let nxt_c = b.alloc_and_emit(
@@ -256,6 +263,10 @@ pub fn run(module: &mut MirModule) {
                 .0,
             val: total_entries,
         });
+        b.emit_void(Inst::SpatialCsrPrefixSum {
+            index_name: idx.name.clone(),
+        });
+        b.emit_void(Inst::IterReset { query_idx: 0 });
         b.terminate(Terminator::Goto(p2_chunk_hdr));
 
         // Pass 2: Scatter entities and quantized coordinates into dense CSR buckets
@@ -325,7 +336,7 @@ pub fn run(module: &mut MirModule) {
         });
 
         b.switch_to(p2_row_body);
-        let _p2_ent = b.alloc_and_emit(
+        let p2_ent = b.alloc_and_emit(
             "p2_ent",
             MirType::Entity,
             Inst::EntityAtRow {
@@ -343,7 +354,7 @@ pub fn run(module: &mut MirModule) {
                 is_sparse: pos_sparse,
             },
         );
-        let _p2_pos = b.alloc_and_emit(
+        let p2_pos = b.alloc_and_emit(
             "p2_pos",
             pos_mty.clone(),
             Inst::FieldLoad {
@@ -354,6 +365,11 @@ pub fn run(module: &mut MirModule) {
                 field_ty: pos_mty,
             },
         );
+        b.emit_void(Inst::SpatialCsrScatter {
+            index_name: idx.name.clone(),
+            entity: p2_ent,
+            pos: p2_pos,
+        });
         let p2_nxt = b.alloc_and_emit(
             "p2_nxt",
             MirType::U32,

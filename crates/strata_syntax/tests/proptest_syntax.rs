@@ -27,6 +27,13 @@ fn strata_fragment_strategy() -> impl Strategy<Value = String> {
         "/* c */ ",
         "??? ",
         "\"str\" ",
+        "rpc ",
+        "net_sim_test ",
+        "\"net_case\"",
+        "(latency: 50ms, jitter: 10ms, loss: 0.05, seed: 42) ",
+        "send_rpc(0, MoveInput { dx: 1.0, seq: 1 }); ",
+        "@net_rpc(direction = client_to_server) ",
+        "@quantize(min = -1.0, max = 1.0, bits = 12) ",
     ]);
     prop::collection::vec(tokens, 0..32).prop_map(|parts| parts.concat())
 }

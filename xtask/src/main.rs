@@ -35,6 +35,7 @@ const WORKSPACE_CRATES_ENTRYPOINTS: &[(&str, &str)] = &[
     ("stratac-bin", "crates/stratac/src/main.rs"),
     ("strata_docs", "crates/strata_docs/src/lib.rs"),
     ("strata_bench", "benches/strata_bench/src/main.rs"),
+    ("strata_profile", "benches/strata_profile/src/lib.rs"),
     ("xtask", "xtask/src/main.rs"),
 ];
 
@@ -57,7 +58,6 @@ const KANI_TARGETS: &[(&str, &[&str])] = &[
     ("strata_lsp", &[]),
 ];
 
-const PINNED_WIRE_REV: &str = "7a32b7bd329167c8dda82259659b3da54a5ab748";
 const BENCH_START: &str = "<!-- BENCHMARK_REPORT_START -->";
 const BENCH_END: &str = "<!-- BENCHMARK_REPORT_END -->";
 
@@ -710,6 +710,102 @@ fn cmd_bench(
     Ok(())
 }
 
+fn is_valid_git_rev(s: &str) -> bool {
+    !s.is_empty() && s.len() >= 7 && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn extract_locked_wire_source(lock: &str) -> Result<Option<String>, String> {
+    let mut in_pkg = false;
+    let mut pkg_name: Option<&str> = None;
+    let mut pkg_source: Option<&str> = None;
+
+    let check = |name: Option<&str>, source: Option<&str>| -> Option<Option<String>> {
+        if name == Some("bamabi_sys") {
+            return Some(source.map(str::to_owned));
+        }
+        None
+    };
+
+    for raw in lock.lines() {
+        let line = raw.trim();
+        if line == "[[package]]" {
+            if in_pkg && let Some(res) = check(pkg_name, pkg_source) {
+                return Ok(res);
+            }
+            in_pkg = true;
+            pkg_name = None;
+            pkg_source = None;
+            continue;
+        }
+        if in_pkg && let Some((k, v)) = line.split_once('=') {
+            let k = k.trim();
+            let v = v.trim().trim_matches('"');
+            if k == "name" {
+                pkg_name = Some(v);
+            } else if k == "source" {
+                pkg_source = Some(v);
+            }
+        }
+    }
+    if in_pkg && let Some(res) = check(pkg_name, pkg_source) {
+        return Ok(res);
+    }
+    Err("Cargo.lock does not contain a `bamabi_sys` package entry".to_owned())
+}
+
+fn verify_wire_lock_parity(ws: &Path, abi_lock: &str, lock: &str) -> Result<(), String> {
+    let locked_source = extract_locked_wire_source(lock)?;
+    let locked_rev = locked_source
+        .as_deref()
+        .filter(|s| s.contains("bamabi-wire.git"))
+        .and_then(|s| s.split_once('#').map(|(_, r)| r))
+        .map(|r| r.split(['"', '&', ' ']).next().unwrap_or(""));
+
+    if let Some(expected_rev) = parse_quoted_kv(abi_lock, "wire_rev") {
+        if !is_valid_git_rev(expected_rev) {
+            return Err(format!(
+                "invalid `wire_rev` in abi-lock.toml: `{expected_rev}`"
+            ));
+        }
+        if let Some(actual_rev) = locked_rev {
+            if actual_rev != expected_rev {
+                return Err(format!(
+                    "Cargo.lock bamabi_sys commit `{actual_rev}` != abi-lock.toml wire_rev `{expected_rev}`"
+                ));
+            }
+            return Ok(());
+        }
+        let sibling_wire = ws.join("..").join("bamabi-wire");
+        if sibling_wire.join("crates/bamabi_sys/Cargo.toml").is_file() {
+            return Ok(());
+        }
+        return Err(format!(
+            "Cargo.lock does not reference pinned bamabi-wire commit `{expected_rev}`"
+        ));
+    }
+
+    if let Some(actual_rev) = locked_rev {
+        if !is_valid_git_rev(actual_rev) {
+            return Err(format!(
+                "invalid bamabi_sys git revision `{actual_rev}` in Cargo.lock"
+            ));
+        }
+        return Ok(());
+    }
+
+    // Active local `[patch]` overlay (`Cargo.lock` records path-patched `bamabi_sys` without `source`).
+    let sibling_sys = ws
+        .join("..")
+        .join("bamabi-wire")
+        .join("crates")
+        .join("bamabi_sys")
+        .join("Cargo.toml");
+    if sibling_sys.is_file() {
+        return Ok(());
+    }
+    Err("Cargo.lock `bamabi_sys` has no git `source` and no sibling `../bamabi-wire` checkout was found".to_owned())
+}
+
 fn cmd_audit(ws: &Path, skip_typos: bool, skip_deny: bool) -> Result<(), String> {
     let abi_lock =
         fs::read_to_string(ws.join("abi-lock.toml")).map_err(|e| format!("abi-lock.toml: {e}"))?;
@@ -733,11 +829,7 @@ fn cmd_audit(ws: &Path, skip_typos: bool, skip_deny: bool) -> Result<(), String>
         }
     }
 
-    if !lock.contains(PINNED_WIRE_REV) {
-        return Err(format!(
-            "Cargo.lock does not reference pinned bamabi-wire commit `{PINNED_WIRE_REV}`"
-        ));
-    }
+    verify_wire_lock_parity(ws, &abi_lock, &lock)?;
     println!("==> abi-lock.toml and Cargo.lock parity verified.");
 
     if !skip_typos {
@@ -944,6 +1036,26 @@ mod tests {
         assert_eq!(
             has_non_bamabi_bevy_line(bad_tree).as_deref(),
             Some("bevy_ecs")
+        );
+    }
+
+    #[test]
+    fn wire_lock_parity_supports_git_rev_and_overlay_path_mode() {
+        let ws = workspace_root();
+        let abi_lock = fs::read_to_string(ws.join("abi-lock.toml")).unwrap();
+        let cargo_lock = fs::read_to_string(ws.join("Cargo.lock")).unwrap();
+        verify_wire_lock_parity(&ws, &abi_lock, &cargo_lock).unwrap();
+
+        let git_lock = "[[package]]\nname = \"bamabi_sys\"\nversion = \"0.3.0\"\nsource = \"git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#0e8a9f8ef120c4712fd8af4b4c9442fdcb09e476\"\n";
+        verify_wire_lock_parity(&ws, &abi_lock, git_lock).unwrap();
+        assert!(verify_wire_lock_parity(&ws, "wire_rev = \"not-hex\"\n", git_lock).is_err());
+        assert!(
+            verify_wire_lock_parity(
+                &ws,
+                "wire_rev = \"0123456789abcdef0123456789abcdef01234567\"\n",
+                git_lock
+            )
+            .is_err()
         );
     }
 }

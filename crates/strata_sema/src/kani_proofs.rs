@@ -93,3 +93,123 @@ fn po_s7_theorem01_disjointness_and_conflict_symmetry() {
         ));
     }
 }
+
+/// **PO-S11**: Proves algebraic lattice laws (associative, commutative, idempotent, identity,
+/// monotone) for [`crate::authority::AuthoritySet`] and [`crate::authority::PlaceOrigin`], plus
+/// symbolic soundness and precision of copy-vs-borrow decay across storage constructors.
+#[kani::proof]
+fn po_s11_authority_lattice_and_place_origin_soundness() {
+    use crate::authority::{AuthoritySet, PlaceOrigin};
+
+    let a = AuthoritySet(kani::any::<u8>() & 0x03);
+    let b = AuthoritySet(kani::any::<u8>() & 0x03);
+    let c = AuthoritySet(kani::any::<u8>() & 0x03);
+
+    // 1. AuthoritySet join-semilattice axioms
+    assert_eq!(a.join(b).join(c), a.join(b.join(c)));
+    assert_eq!(a.join(b), b.join(a));
+    assert_eq!(a.join(a), a);
+    assert_eq!(a.join(AuthoritySet::EMPTY), a);
+    assert!(a.is_subset_of(a.join(b)));
+    assert!(b.is_subset_of(a.join(b)));
+    if a.is_subset_of(c) && b.is_subset_of(c) {
+        assert!(a.join(b).is_subset_of(c));
+    }
+
+    // 2. PlaceOrigin join-semilattice axioms
+    let mk_origin = |is_ecs: bool, auth: AuthoritySet| -> PlaceOrigin {
+        if is_ecs {
+            PlaceOrigin::EcsPlace(auth)
+        } else {
+            PlaceOrigin::TempValue
+        }
+    };
+    let p1 = mk_origin(kani::any(), a);
+    let p2 = mk_origin(kani::any(), b);
+    let p3 = mk_origin(kani::any(), c);
+
+    assert_eq!(p1.join(p2).join(p3), p1.join(p2.join(p3)));
+    assert_eq!(p1.join(p2), p2.join(p1));
+    assert_eq!(p1.join(p1), p1);
+    assert_eq!(p1.join(PlaceOrigin::TempValue), p1);
+    assert!(p1.authority().is_subset_of(p1.join(p2).authority()));
+    assert!(p2.authority().is_subset_of(p1.join(p2).authority()));
+
+    // 3. Copy-vs-borrow decay soundness & precision
+    let is_copy_scalar: bool = kani::any();
+    let decayed = p1.decay_on_storage_copy(is_copy_scalar);
+    if is_copy_scalar {
+        assert_eq!(decayed, PlaceOrigin::TempValue);
+        assert!(!decayed.authority().contains_server());
+    } else {
+        assert_eq!(decayed, p1);
+        assert_eq!(decayed.authority(), p1.authority());
+    }
+}
+
+/// **PO-S12**: Proves `Ty::Option`, `Ty::Ref`, `Ty::Borrow`, and `Ty::Result` preserve inner
+/// types and mutability without erasure across `Ty::is_compatible_with`.
+#[kani::proof]
+#[kani::unwind(1)]
+fn po_s12_compound_ty_preservation_without_erasure() {
+    use crate::types::Ty;
+    use std::mem::ManuallyDrop;
+
+    let kind: u8 = kani::any();
+    let d1: u8 = kani::any();
+    let d2: u8 = kani::any();
+    kani::assume(kind < 5 && d1 < 4 && d2 < 4);
+    let m1: bool = kani::any();
+    let m2: bool = kani::any();
+
+    let mk_leaf = |d: u8| -> Ty {
+        match d {
+            0 => Ty::I32,
+            1 => Ty::F32,
+            2 => Ty::Bool,
+            _ => Ty::Unit,
+        }
+    };
+
+    let (lhs, rhs, expected): (ManuallyDrop<Ty>, ManuallyDrop<Ty>, bool) = match kind {
+        0 => (
+            ManuallyDrop::new(Ty::Option(Box::new(mk_leaf(d1)))),
+            ManuallyDrop::new(Ty::Option(Box::new(mk_leaf(d2)))),
+            d1 == d2,
+        ),
+        1 => (
+            ManuallyDrop::new(Ty::Option(Box::new(mk_leaf(d1)))),
+            ManuallyDrop::new(Ty::Unit),
+            false,
+        ),
+        2 => (
+            ManuallyDrop::new(Ty::Borrow {
+                mutable: m1,
+                inner: Box::new(mk_leaf(d1)),
+            }),
+            ManuallyDrop::new(Ty::Borrow {
+                mutable: m2,
+                inner: Box::new(mk_leaf(d2)),
+            }),
+            m1 == m2 && d1 == d2,
+        ),
+        3 => (
+            ManuallyDrop::new(Ty::Result {
+                ok: Box::new(mk_leaf(d1)),
+                err: Box::new(Ty::Bool),
+            }),
+            ManuallyDrop::new(Ty::Result {
+                ok: Box::new(mk_leaf(d2)),
+                err: Box::new(Ty::Bool),
+            }),
+            d1 == d2,
+        ),
+        _ => (
+            ManuallyDrop::new(Ty::Ref(String::new())),
+            ManuallyDrop::new(Ty::Ref(if m1 { String::new() } else { String::from("B") })),
+            m1,
+        ),
+    };
+
+    assert_eq!(lhs.is_compatible_with(&rhs), expected);
+}

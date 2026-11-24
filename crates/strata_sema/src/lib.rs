@@ -7,11 +7,13 @@
 //! This crate enforces `#![forbid(unsafe_code)]` and has ZERO `bevy*` dependencies.
 
 pub mod access;
+pub(crate) mod authority;
 pub mod checks;
 pub mod db;
 pub mod diagnostics;
 pub mod hir;
 pub mod hir_lower;
+pub(crate) mod infer;
 #[cfg(kani)]
 mod kani_proofs;
 pub mod layout;
@@ -23,9 +25,14 @@ pub use access::{
 pub use db::{SemaDb, SourceFile, analyze_source};
 pub use diagnostics::{Diagnostic, FixIt, Severity, Span, codes};
 pub use hir::{
-    AnalyzedModule, HirAssignOp, HirAtomic, HirBinOp, HirCall, HirCompInit, HirExpr, HirFn, HirFor,
-    HirForIter, HirFsmTransition, HirLValue, HirMatch, HirMatchArm, HirParam, HirParamKind,
-    HirQuery, HirQueryTerm, HirReduceEntry, HirSpawn, HirStmt, HirUnOp,
+    AnalyzedModule, AuthorityKind, HirAssignOp, HirAtomic, HirBinOp, HirCall, HirCompInit, HirExpr,
+    HirFn, HirFor, HirForIter, HirFsmTransition, HirLValue, HirMatch, HirMatchArm, HirNetConfig,
+    HirNetRpcMeta, HirNetSimTest, HirParam, HirParamKind, HirQuantizeSpec, HirQuery, HirQueryTerm,
+    HirReduceEntry, HirRpc, HirSpawn, HirStmt, HirUnOp, NetComponentMeta, NetDirection,
+    NetReliability,
 };
-pub use layout::{SolvedField, SolvedLayout, compute_wire_identity, solve_pod_layout};
-pub use types::{Ty, UnitDim};
+pub use layout::{
+    SolvedField, SolvedLayout, compute_net_schema_fingerprint, compute_wire_identity,
+    solve_pod_layout,
+};
+pub use types::{QueryRowTerm, Ty, UnitDim};

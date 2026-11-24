@@ -1,0 +1,165 @@
+// =========================================================================
+// COOKBOOK 7: VISUAL BOSS GRAPH (07_visual_boss_graph.strata)
+// Demonstrates: All 8 R1 Graph IR node kinds, @node_pure, @node_group, sim_test
+// =========================================================================
+module genres::visual_boss_graph @version(1.0.0);
+
+enum BossPhase {
+    Stalking = 0,
+    Enraged = 1,
+}
+
+resource SimClock {
+    dt : sec = 16.6667_ms,
+}
+
+resource BossArenaInput {
+    engage : bool = false,
+    trigger_charge : bool = false,
+    slam_count : u32 = 0,
+}
+
+@node_group("Boss/Core")
+component BossPos {
+    xy : vec2 = vec2::ZERO,
+}
+
+@node_group("Boss/Core")
+@summary_tick
+component BossHealth @require(BossPos) {
+    hp : f32 = 500.0,
+    max_hp : f32 = 500.0,
+    armor : f32 = 10.0,
+    rage : f32 = 0.0,
+    phase : BossPhase = BossPhase::Stalking,
+}
+
+@node_group("Boss/Core")
+component BossPhaseTag {
+    slam_count : u32 = 0,
+}
+
+event BossSlamImpact {
+    dmg : f32,
+}
+
+@node_group("Boss/Data")
+table BossPatternTable by BossPhase {
+    base_dmg : f32,
+    speed : f32,
+} = {
+    Stalking => { base_dmg : 25.0, speed : 4.5 },
+    Enraged => { base_dmg : 55.0, speed : 9.0 },
+};
+
+@node_group("Boss/Data")
+curve EnrageScaleCurve(f32 -> f32) = [
+    (0.0, 1.0),
+    (50.0, 1.5),
+    (100.0, 2.25),
+];
+
+@node_group("Boss/Math")
+@node_pure
+fn compute_rage_damage(base : f32, armor : f32, mult : f32) -> f32 {
+    let mitigated = max(1.0, base - armor * 0.25);
+    return mitigated * mult;
+}
+
+@node_group("Boss/AI")
+@sparse
+timeline BossSlamTimeline @rate(60_hz) @duration(12_f) {
+    window windup = 0_f..4_f;
+    window active = 4_f..8_f;
+    window recovery = 8_f..12_f;
+
+    at 4_f => trigger(self, BossSlamImpact { dmg : 45.0 });
+}
+
+@node_group("Boss/AI")
+fsm BossPhaseFsm(clk : &res SimClock) @require(BossHealth) {
+    initial Stalking;
+
+    state Stalking {
+        on_tick {
+            let _dt = clk.dt;
+        }
+        to Enraged when true;
+    }
+
+    state Enraged {
+        on_enter {
+            let _entered = 1;
+        }
+        on_tick {
+            let _dt = clk.dt;
+        }
+        to Stalking when false;
+    }
+}
+
+@node_group("Boss/AI")
+@sparse
+task BossChargeTask(mult : f32)
+on (h : &mut BossHealth)
+using (clk : &res SimClock)
+{
+    let scale = EnrageScaleCurve.sample(h.rage);
+    let dmg = compute_rage_damage(20.0, h.armor, mult * scale);
+    h.hp = max(0.0, h.hp - dmg);
+    yield_tick;
+    let _dt = clk.dt;
+    h.rage = min(100.0, h.rage + 15.0);
+}
+
+object ArenaBoss {
+    BossPos { xy : vec2(0.0, 0.0) },
+    BossHealth { hp : 500.0, max_hp : 500.0, armor : 10.0, rage : 0.0, phase : BossPhase::Stalking },
+    BossPhaseTag { slam_count : 0 },
+}
+
+@node_group("Boss/AI")
+sys tick_boss_ai(arena : &res BossArenaInput) {
+    if !arena.engage {
+        return;
+    }
+    if let Some(b) = query_one(hp : &mut?BossHealth, pos : &mut BossPos.xy).on(ArenaBoss) {
+        let spd = BossPatternTable[b.hp.phase].speed;
+        b.pos.x += spd * 0.1;
+        b.hp.rage = min(100.0, b.hp.rage + 10.0);
+        if b.hp.rage >= 30.0 {
+            b.hp.phase = BossPhase::Enraged;
+        }
+        if arena.trigger_charge {
+            insert @if_new(b.id, BossChargeTask::start(1.5));
+            insert @if_new(b.id, BossSlamTimeline::start());
+            insert @if_new(b.id, BossPhaseFsm::start());
+        }
+    }
+}
+
+obs on_boss_slam(trg : &Trigger<BossSlamImpact>, arena : &mut res BossArenaInput) {
+    let ev = trg.payload;
+    if ev.dmg > 0.0 {
+        arena.slam_count += 1_u32;
+    }
+}
+
+@node_group("Boss/Schedule")
+schedule FixedUpdate {
+    seq BossFrame {
+        set BossAI { tick_boss_ai, BossSlamTimeline, BossPhaseFsm, BossChargeTask }
+    }
+}
+
+sim_test "boss_phase_and_rage_graph" {
+    res_mut<BossArenaInput>().engage = true;
+    res_mut<BossArenaInput>().trigger_charge = true;
+    step_fixed(8);
+    let b = query_one(hp : &BossHealth, pos : &BossPos.xy).on(ArenaBoss).unwrap();
+    assert(b.hp.rage > 20.0);
+    assert(b.hp.hp < 500.0);
+    assert(b.pos.x > 5.0);
+    assert_eq(b.hp.phase, BossPhase::Enraged);
+    assert(res<BossArenaInput>().slam_count >= 1_u32);
+}

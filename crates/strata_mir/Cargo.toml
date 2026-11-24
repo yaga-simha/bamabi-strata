@@ -8,6 +8,11 @@ authors.workspace = true
 repository.workspace = true
 description = "Backend-neutral SSA CFG MIR and lowering passes for Strata v2.0"
 
+[features]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+
 [dependencies]
 bamabi_sys.workspace = true
 indexmap.workspace = true
@@ -18,7 +23,13 @@ strata_syntax.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+hotpath.workspace = true
 proptest.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "mir_bench"
+harness = false

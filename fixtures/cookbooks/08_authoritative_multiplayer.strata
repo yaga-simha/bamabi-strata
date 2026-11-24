@@ -1,0 +1,99 @@
+// =========================================================================
+// COOKBOOK 8: AUTHORITATIVE MULTIPLAYER (08_authoritative_multiplayer.strata)
+// Demonstrates: @authority, @predicted, @net, @quantize, @net_rpc, &mut?, sim_test, net_sim_test
+// =========================================================================
+module genres::authoritative_multiplayer @version(1.0.0);
+
+@authority(server)
+@net(unreliable, rate = 30Hz, channel = 1)
+component AuthTransform {
+    @quantize(min = -256.0, max = 256.0, bits = 16)
+    pos : vec2 = vec2(0.0, 0.0),
+    @quantize(min = -3.1416, max = 3.1416, bits = 12)
+    yaw : f32 = 0.0,
+}
+
+@authority(server)
+@net(reliable, rate = 20Hz, channel = 0)
+component AuthVitals {
+    @quantize(min = 0.0, max = 100.0, bits = 12)
+    hp : f32 = 100.0,
+    seq : u32 = 0,
+}
+
+@predicted
+component PredictedMotion {
+    pred_pos : vec2 = vec2(0.0, 0.0),
+    last_seq : u32 = 0,
+}
+
+@net_rpc(direction = client_to_server, reliability = reliable, channel = 0)
+rpc MoveCmd {
+    @quantize(min = -1.0, max = 1.0, bits = 8)
+    dx : f32,
+    @quantize(min = -1.0, max = 1.0, bits = 8)
+    dy : f32,
+    seq : u32,
+}
+
+object MatchPlayer {
+    AuthTransform { pos : vec2(0.0, 0.0), yaw : 0.0 },
+    AuthVitals { hp : 100.0, seq : 0 },
+    PredictedMotion { pred_pos : vec2(0.0, 0.0), last_seq : 0 },
+}
+
+@authority(server)
+sys server_step_match() {
+    for p in query(xform : &mut?AuthTransform, vitals : &mut?AuthVitals) {
+        if p.vitals.seq < 4_u32 {
+            p.vitals.seq += 1_u32;
+            p.xform.pos += vec2(1.5, 0.5);
+            p.xform.yaw = 0.5;
+            p.vitals.hp = max(0.0, p.vitals.hp - 2.5);
+        }
+    }
+}
+
+@predicted
+sys client_predict_motion() {
+    for p in query(pred : &mut?PredictedMotion) {
+        if p.pred.last_seq < 4_u32 {
+            p.pred.last_seq += 1_u32;
+            p.pred.pred_pos += vec2(1.5, 0.5);
+        }
+    }
+}
+
+@authority(client)
+sys client_reconcile() {
+    for p in query(auth : &AuthTransform, vitals : &AuthVitals, pred : &mut?PredictedMotion) {
+        if p.vitals.seq > 0_u32 {
+            p.pred.pred_pos = p.auth.pos;
+            p.pred.last_seq = p.vitals.seq;
+        }
+    }
+}
+
+schedule FixedUpdate {
+    seq NetTick {
+        server_step_match
+        client_predict_motion
+        client_reconcile
+    }
+}
+
+sim_test "authoritative_tick_and_reconciliation" {
+    step_fixed(4);
+    let row = query_one(xform : &AuthTransform, vitals : &AuthVitals, pred : &PredictedMotion).on(MatchPlayer).unwrap();
+    assert_eq(row.vitals.seq, 4_u32);
+    assert(row.vitals.hp < 91.0);
+    assert(row.pred.pred_pos.x > 5.0);
+}
+
+net_sim_test "replicated_state_converges_under_loss_and_jitter"(latency : 40ms, jitter : 10ms, loss : 0.05, seed : 42, clients : 2) {
+    send_rpc(0, MoveCmd { dx : 1.0, dy : 0.0, seq : 1 });
+    step_net(35);
+    assert_converged();
+    let c0_seq = client_query(0, v : &AuthVitals).on(MatchPlayer).unwrap().v.seq;
+    assert_eq(c0_seq, 4_u32);
+}

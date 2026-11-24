@@ -14,9 +14,10 @@ pub mod passes;
 pub mod verify;
 
 pub use ir::{
-    BasicBlock, BlockId, Inst, LocalId, MirConstVal, MirFnKind, MirFunction, MirLocal, MirModule,
-    MirParam, MirQueryBinding, MirQueryTermBinding, MirResourceBinding, MirStmt, MirType,
-    Terminator,
+    BasicBlock, BlockId, Inst, LocalId, MirChangedTerm, MirConstVal, MirFnKind, MirFunction,
+    MirLocal, MirModule, MirNetComponent, MirNetFieldSpec, MirNetHandshake, MirNetSimTest,
+    MirParam, MirQuantizeSpec, MirQueryBinding, MirQueryTermBinding, MirResourceBinding, MirRpc,
+    MirStmt, MirStreamOp, MirStreamOpKind, MirType, Terminator,
 };
 pub use lower::lower_to_mir;
 pub use passes::spatial_csr::csr_cell_range;

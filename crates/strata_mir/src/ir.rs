@@ -8,8 +8,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use strata_sema::access::{QueryAccessDesc, TermAccessMode};
 use strata_sema::hir::{
-    HirConst, HirCurve, HirFsm, HirMigration, HirObject, HirParamKind, HirRelation, HirSchedule,
-    HirSimTest, HirSpatialIndex, HirTable, HirTask, HirTimeline,
+    AuthorityKind, HirConst, HirCurve, HirFsm, HirMigration, HirObject, HirParamKind, HirRelation,
+    HirSchedule, HirSimTest, HirSpatialIndex, HirStmt, HirTable, HirTask, HirTimeline,
+    NetDirection, NetReliability,
 };
 use strata_sema::layout::{EnumDef, SolvedLayout};
 
@@ -43,6 +44,9 @@ pub enum MirType {
     Vec2,
     Vec3,
     Vec4,
+    IVec2,
+    IVec3,
+    UVec2,
     Entity,
     Ptr,
     MutPtr,
@@ -144,6 +148,9 @@ pub struct MirParam {
     pub kind: HirParamKind,
     /// Bound entry SSA local if applicable.
     pub local: Option<LocalId>,
+    /// Canonical component/struct layout key for `&T` / `&mut T` / `&res T` parameters.
+    #[serde(default)]
+    pub layout_key: Option<String>,
 }
 
 /// Singleton resource borrow bound in a [`MirFunction`].
@@ -282,6 +289,13 @@ pub enum Inst {
         base: LocalId,
         index: LocalId,
     },
+    /// Writes `val` at element `index` of an array slot or array field pointer `base_ptr`.
+    ArrayStore {
+        base_ptr: LocalId,
+        index: LocalId,
+        val: LocalId,
+        elem_ty: MirType,
+    },
     /// Computes the typed pointer to a field inside a component/resource/struct pointer.
     FieldPtr {
         base_ptr: LocalId,
@@ -370,10 +384,16 @@ pub enum Inst {
     IterCount {
         query_idx: u32,
     },
-    /// Breadth-first hierarchy cascade (`BamHostApi::iter_up_cascade`, Slot 58).
+    /// Walks ancestor relationship chain upward from `entity` for `term_idx` (`BamHostApi::iter_up_cascade`, Slot 58).
     IterUpCascade {
         query_idx: u32,
         relation: String,
+        entity: LocalId,
+        term_idx: u32,
+    },
+    /// Resets query iterator `query_idx` to chunk 0 (`BamHostApi::iter_reset`, Slot 10).
+    IterReset {
+        query_idx: u32,
     },
     /// Work-stealing parallel chunk dispatch (`BamHostApi::par_for_each_chunk`, Slot 27).
     ParForEachChunk {
@@ -582,6 +602,25 @@ pub enum Inst {
         entity: LocalId,
         target: LocalId,
     },
+    /// Advances spatial ring cursor and zeroes `cell_offsets[0..=cell_count]` and `count` for active frame.
+    SpatialCsrBegin {
+        index_name: String,
+    },
+    /// Pass 1: Quantizes `pos` to `(cx, cy)` cell and increments `cell_offsets[cell + 1]`.
+    SpatialCsrCount {
+        index_name: String,
+        pos: LocalId,
+    },
+    /// Computes exclusive prefix sum over `cell_offsets[0..=cell_count]` and initializes `write_cursors`.
+    SpatialCsrPrefixSum {
+        index_name: String,
+    },
+    /// Pass 2: Scatters `(entity, pos)` into `entities[slot]` & `positions[slot]` using `write_cursors[cell]++`.
+    SpatialCsrScatter {
+        index_name: String,
+        entity: LocalId,
+        pos: LocalId,
+    },
     /// 2-pass counting-sort CSR spatial grid / history rebuild descriptor.
     SpatialRebuildCsr {
         index_name: String,
@@ -718,6 +757,212 @@ pub struct BasicBlock {
     pub terminator: Terminator,
 }
 
+/// Records a `.changed()` / `.changed<T>()` filter bound to a query term.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MirChangedTerm {
+    /// Query index within [`MirFunction::query_bindings`].
+    pub query_idx: u32,
+    /// Term index within `MirQueryBinding::terms`.
+    pub term_idx: u32,
+    /// Logical storage key (`"Pos3D"` or `"Body::hot"`).
+    pub storage_key: String,
+    /// Canonical component layout name.
+    pub canonical_component: String,
+}
+
+/// `Messages<M>` host ABI stream operation kind (Slots 30–32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MirStreamOpKind {
+    /// `msg_read_batch` (Slot 30).
+    StreamRead,
+    /// `msg_send` (Slot 31).
+    StreamSend,
+    /// `msg_write_batch` (Slot 32).
+    StreamWriteBatch,
+}
+
+/// Host `Messages<M>` stream operation contract attached to a function or network module.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MirStreamOp {
+    /// ABI stream operation kind (Slots 30–32).
+    pub kind: MirStreamOpKind,
+    /// Short stream or packet message name (e.g. `"StrataNetPacket"`).
+    pub stream: String,
+    /// Canonical stream or packet message name.
+    pub canonical_stream: String,
+    /// `true` when this op MUST execute outside `@par` chunk callbacks (Slots 30/32).
+    pub requires_outside_par: bool,
+    /// Optional network transport channel index.
+    pub channel: Option<u8>,
+}
+
+/// Bit-packed quantization specification for a scalar or vector component/RPC field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirQuantizeSpec {
+    /// Field identifier.
+    pub field_name: String,
+    /// Number of scalar lanes (`1` for scalar, `2` for vec2, `3` for vec3, `4` for vec4).
+    pub lane_count: u8,
+    /// Bit width per lane (`1..=32`).
+    pub bits: u8,
+    /// Minimum representable value.
+    pub min: f64,
+    /// Maximum representable value.
+    pub max: f64,
+    /// Optional explicit quantization step (`> 0.0`).
+    pub step: Option<f64>,
+    /// Starting bit offset within the packed network wire frame.
+    pub bit_offset: u32,
+    /// Total packed bits for this field (`u32::from(bits) * u32::from(lane_count)`).
+    pub total_bits: u32,
+    /// Byte offset of this field inside the solved `#[repr(C)]` struct.
+    pub field_byte_offset: u32,
+    /// MIR type of the field.
+    pub field_ty: MirType,
+}
+
+impl MirQuantizeSpec {
+    /// Returns the maximum unsigned integer quantized level `(1u64 << bits) - 1`.
+    #[must_use]
+    pub fn max_quantized_u64(&self) -> u64 {
+        if self.bits == 0 {
+            0
+        } else {
+            (1u64 << self.bits.min(32)) - 1
+        }
+    }
+
+    /// Returns the effective quantization step size (explicit `step` or `(max - min) / max_level`).
+    #[must_use]
+    pub fn effective_step(&self) -> f64 {
+        self.step.unwrap_or_else(|| {
+            let levels = self.max_quantized_u64().max(1) as f64;
+            (self.max - self.min) / levels
+        })
+    }
+}
+
+/// Wire field descriptor (either quantized or raw bit-packed) in a [`MirNetComponent`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirNetFieldSpec {
+    /// Field identifier.
+    pub field_name: String,
+    /// Byte offset in the solved `#[repr(C)]` struct.
+    pub byte_offset: u32,
+    /// Byte size in the solved `#[repr(C)]` struct.
+    pub byte_size: u32,
+    /// MIR field type.
+    pub ty: MirType,
+    /// Quantization specification if `@quantize(...)` applies to this field.
+    pub quantize: Option<MirQuantizeSpec>,
+    /// Starting bit offset within the packed network wire frame.
+    pub bit_offset: u32,
+    /// Total packed bit width for this field.
+    pub total_bits: u32,
+}
+
+/// Lowered network replication, authority, and quantized bit-packing metadata for a component/resource.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirNetComponent {
+    /// Short component or resource name.
+    pub name: String,
+    /// Canonical namespaced name (`"mod::Comp"`).
+    pub canonical_name: String,
+    /// `true` for singleton `resource`, `false` for `component`.
+    pub is_resource: bool,
+    /// `true` when `@net(...)` is attached.
+    pub is_replicated: bool,
+    /// Packet reliability (`Reliable` / `Unreliable`).
+    pub reliability: NetReliability,
+    /// Optional send rate in Hz (`> 0.0`).
+    pub rate_hz: Option<f64>,
+    /// Optional send interval in ticks (`> 0`).
+    pub interval_ticks: Option<u32>,
+    /// Transport channel index (`0..=255`).
+    pub channel: u8,
+    /// Network authority ownership (`@authority(...)` / `@predicted`).
+    pub authority: AuthorityKind,
+    /// `true` when `@predicted` (or `@authority(predicted)`) is active.
+    pub is_predicted: bool,
+    /// Deterministic 64-bit FNV-1a schema fingerprint copied from `SolvedLayout`.
+    pub schema_fingerprint: u64,
+    /// Deterministic 128-bit `ComponentUuid` bytes copied from `SolvedLayout`.
+    pub uuid_bytes: [u8; 16],
+    /// Quantization specifications for quantized fields.
+    pub quantize_specs: Vec<MirQuantizeSpec>,
+    /// Ordered non-padding wire fields with bit offsets.
+    pub wire_fields: Vec<MirNetFieldSpec>,
+    /// Total packed bit count of all wire fields.
+    pub packed_bits: u32,
+    /// Total packed byte count (`packed_bits.div_ceil(8)`).
+    pub packed_bytes: u32,
+}
+
+/// Lowered `rpc` declaration with wire ID, fingerprint, and payload field offsets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirRpc {
+    /// Short RPC name.
+    pub name: String,
+    /// Canonical namespaced RPC name (`"mod::MoveInput"`).
+    pub canonical_name: String,
+    /// RPC direction (`ClientToServer`, `ServerToClient`, `Bidirectional`).
+    pub direction: NetDirection,
+    /// Packet reliability (`Reliable`, `Unreliable`).
+    pub reliability: NetReliability,
+    /// Transport channel index (`0..=255`).
+    pub channel: u8,
+    /// Explicit authority classification if annotated.
+    pub authority: AuthorityKind,
+    /// Deterministic 64-bit FNV-1a RPC identifier.
+    pub rpc_id: u64,
+    /// Deterministic 64-bit FNV-1a schema fingerprint of the RPC payload and metadata.
+    pub schema_fingerprint: u64,
+    /// Ordered non-padding payload fields `(name, mir_ty, byte_offset, byte_size)`.
+    pub fields: Vec<(String, MirType, u32, u32)>,
+    /// Quantization specs for RPC fields (if any).
+    pub quantize_specs: Vec<MirQuantizeSpec>,
+    /// Ordered non-padding wire fields with bit offsets (quantized or raw).
+    pub wire_fields: Vec<MirNetFieldSpec>,
+    /// Total packed bit count of all wire fields.
+    pub packed_bits: u32,
+    /// Total packed byte count (`packed_bits.div_ceil(8)`).
+    pub packed_bytes: u32,
+    /// Total `#[repr(C)]` payload size in bytes.
+    pub payload_bytes: u32,
+}
+
+/// Lowered `net_sim_test` virtual network simulation scenario.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirNetSimTest {
+    /// Test case name.
+    pub name: String,
+    /// Simulated one-way latency in milliseconds (`>= 0.0`).
+    pub latency_ms: f64,
+    /// Simulated jitter in milliseconds (`>= 0.0`).
+    pub jitter_ms: f64,
+    /// Packet loss probability in `0.0..=1.0`.
+    pub loss: f64,
+    /// Deterministic PRNG seed.
+    pub seed: u64,
+    /// Number of simulated clients (`>= 1`).
+    pub clients: u32,
+    /// Lowered test body statements.
+    pub body: Vec<HirStmt>,
+    /// Raw test body source text.
+    pub body_source: String,
+}
+
+/// Deterministic network handshake fingerprint table emitted for connection validation.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MirNetHandshake {
+    /// Combined FNV-1a module network fingerprint (`0` when module has no net items/RPCs).
+    pub module_net_fingerprint: u64,
+    /// Sorted `(canonical_name, schema_fingerprint)` pairs for all [`MirNetComponent`]s.
+    pub component_fingerprints: Vec<(String, u64)>,
+    /// Sorted `(canonical_name, schema_fingerprint)` pairs for all [`MirRpc`]s.
+    pub rpc_fingerprints: Vec<(String, u64)>,
+}
+
 /// Lowered MIR function representing a user `sys`, `obs`, `fn`, `migrate`, or synthesized system.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MirFunction {
@@ -751,6 +996,24 @@ pub struct MirFunction {
     pub queries: Vec<QueryAccessDesc>,
     /// Original source body retained for downstream backend compatibility.
     pub source_body: String,
+    /// Explicit `@authority(...)` / `@predicted` classification.
+    #[serde(default)]
+    pub authority: AuthorityKind,
+    /// `true` when `@predicted` (or `@authority(predicted)`) is active.
+    #[serde(default)]
+    pub is_predicted: bool,
+    /// `true` when `@node_pure` is attached to a helper `fn`.
+    #[serde(default)]
+    pub is_node_pure: bool,
+    /// Optional `@node_group("...")` label.
+    #[serde(default)]
+    pub node_group: Option<String>,
+    /// `.changed()` / `.changed<T>()` filters bound to query terms.
+    #[serde(default)]
+    pub changed_terms: Vec<MirChangedTerm>,
+    /// Host `Messages<M>` stream operations used by this function.
+    #[serde(default)]
+    pub stream_ops: Vec<MirStreamOp>,
 }
 
 impl MirFunction {
@@ -776,6 +1039,12 @@ impl MirFunction {
             blocks: Vec::new(),
             queries: Vec::new(),
             source_body: String::new(),
+            authority: AuthorityKind::Unspecified,
+            is_predicted: false,
+            is_node_pure: false,
+            node_group: None,
+            changed_terms: Vec::new(),
+            stream_ops: Vec::new(),
         }
     }
 
@@ -844,6 +1113,21 @@ pub struct MirModule {
     pub sim_tests: Vec<HirSimTest>,
     /// Evaluated field defaults keyed by canonical layout name -> field name -> constant value.
     pub field_defaults: IndexMap<String, IndexMap<String, MirConstVal>>,
+    /// Declared `rpc` definitions with payload layouts and wire IDs.
+    #[serde(default)]
+    pub rpcs: Vec<MirRpc>,
+    /// Networked/authority/quantized component & resource descriptors.
+    #[serde(default)]
+    pub net_components: Vec<MirNetComponent>,
+    /// Embedded `net_sim_test` scenarios.
+    #[serde(default)]
+    pub net_sim_tests: Vec<MirNetSimTest>,
+    /// Deterministic handshake fingerprint table.
+    #[serde(default)]
+    pub net_handshake: MirNetHandshake,
+    /// Module-level `Messages<StrataNetPacket>` stream contracts (Slots 30/32).
+    #[serde(default)]
+    pub net_stream_ops: Vec<MirStreamOp>,
 }
 
 #[cfg(test)]
