@@ -456,12 +456,10 @@ pub(crate) fn lower_literal_token(tok: &SyntaxToken) -> Option<HirExpr> {
             }
             let raw = parse_radix_u128(&cleaned)?;
             let value = i64::try_from(raw).unwrap_or(raw as i64);
-            let ty = suffix_ty.unwrap_or_else(|| {
-                if raw > u32::MAX as u128 {
-                    Ty::I64
-                } else {
-                    Ty::I32
-                }
+            let ty = suffix_ty.unwrap_or(if raw > u32::MAX as u128 {
+                Ty::I64
+            } else {
+                Ty::I32
             });
             Some(HirExpr::IntLit { value, ty })
         }
