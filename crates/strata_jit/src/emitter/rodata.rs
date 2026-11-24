@@ -132,11 +132,11 @@ pub(super) fn define_layout_rodata(
         structs::COMP_STRUCT_SIZE,
         structs::COMPONENT_DESC_SIZE as u32,
     );
-    write_u32_le(
-        &mut cbytes,
-        structs::COMP_FLAGS,
-        layout.component_flags & crate::abi_offsets::COMPONENT_KNOWN_FLAGS,
-    );
+    let mut comp_flags = layout.component_flags & crate::abi_offsets::COMPONENT_KNOWN_FLAGS;
+    if layout.item_kind == SchemaItemKind::Stream {
+        comp_flags |= crate::emitter::STORAGE_FLAG_MESSAGE;
+    }
+    write_u32_le(&mut cbytes, structs::COMP_FLAGS, comp_flags);
     cbytes[structs::COMP_UUID..structs::COMP_UUID + 16].copy_from_slice(&layout.uuid_bytes);
     write_usize_le(&mut cbytes, structs::COMP_SIZE, layout.size, ptr_bytes);
     write_usize_le(
@@ -180,30 +180,36 @@ pub(super) fn define_layout_rodata(
         .define_data(comp_desc_id, &cdesc)
         .map_err(|e| JitError::Codegen(e.to_string()))?;
 
-    let default_blob_id = if layout.size > 0
-        && let Some(defaults) = mir.field_defaults.get(&layout.canonical_name).or_else(|| {
+    let default_blob_id = if layout.size > 0 {
+        let mut blob = vec![0u8; layout.size];
+        fill_layout_defaults(&mut blob, layout, mir, 0);
+        if let Some(defaults) = mir.field_defaults.get(&layout.canonical_name).or_else(|| {
             layout
                 .canonical_name
                 .rsplit("::")
                 .next()
                 .and_then(|s| mir.field_defaults.get(s))
         }) {
-        let mut blob = vec![0u8; layout.size];
-        for (fname, cval) in defaults {
-            if let Some(sf) = layout.fields.iter().find(|f| f.name == *fname) {
-                write_const_val_to_buf(&mut blob, sf, cval, mir);
+            for (fname, cval) in defaults {
+                if let Some(sf) = layout.fields.iter().find(|f| f.name == *fname) {
+                    write_const_val_to_buf(&mut blob, sf, cval, mir);
+                }
             }
         }
-        let bid = module
-            .declare_anonymous_data(false, false)
-            .map_err(|e| JitError::Codegen(e.to_string()))?;
-        let mut bd = DataDescription::new();
-        bd.define(blob.into_boxed_slice());
-        bd.set_align(layout.align.max(1) as u64);
-        module
-            .define_data(bid, &bd)
-            .map_err(|e| JitError::Codegen(e.to_string()))?;
-        Some(bid)
+        if blob.iter().any(|&b| b != 0) {
+            let bid = module
+                .declare_anonymous_data(false, false)
+                .map_err(|e| JitError::Codegen(e.to_string()))?;
+            let mut bd = DataDescription::new();
+            bd.define(blob.into_boxed_slice());
+            bd.set_align(layout.align.max(1) as u64);
+            module
+                .define_data(bid, &bd)
+                .map_err(|e| JitError::Codegen(e.to_string()))?;
+            Some(bid)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -285,6 +291,70 @@ pub(super) fn find_solved_layout<'a>(mir: &'a MirModule, key: &str) -> Option<&'
                 .iter()
                 .find(|l| l.canonical_name.rsplit("::").next() == Some(short))
         })
+}
+
+pub(super) fn fill_ty_defaults(buf: &mut [u8], ty: &Ty, mir: &MirModule, depth: usize) {
+    if depth > 16 {
+        return;
+    }
+    match ty {
+        Ty::Named(n) => {
+            if let Some(sub) = find_solved_layout(mir, n)
+                && buf.len() >= sub.size
+            {
+                fill_layout_defaults(&mut buf[..sub.size], sub, mir, depth + 1);
+            }
+        }
+        Ty::Array { elem, len } if *len > 0 => {
+            if let Some(stride) = buf.len().checked_div(*len)
+                && stride > 0
+            {
+                for i in 0..*len {
+                    let start = i * stride;
+                    fill_ty_defaults(&mut buf[start..start + stride], elem, mir, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn fill_layout_defaults(
+    buf: &mut [u8],
+    layout: &SolvedLayout,
+    mir: &MirModule,
+    depth: usize,
+) {
+    if depth > 16 || buf.len() < layout.size {
+        return;
+    }
+    for sf in layout.fields.iter().filter(|f| !f.is_padding) {
+        if sf
+            .offset
+            .checked_add(sf.size)
+            .is_some_and(|e| e <= buf.len())
+        {
+            fill_ty_defaults(
+                &mut buf[sf.offset..sf.offset + sf.size],
+                &sf.ty,
+                mir,
+                depth + 1,
+            );
+        }
+    }
+    if let Some(defaults) = mir.field_defaults.get(&layout.canonical_name).or_else(|| {
+        layout
+            .canonical_name
+            .rsplit("::")
+            .next()
+            .and_then(|s| mir.field_defaults.get(s))
+    }) {
+        for (fname, dval) in defaults {
+            if let Some(sf) = layout.fields.iter().find(|f| f.name == *fname) {
+                write_const_val_to_buf(buf, sf, dval, mir);
+            }
+        }
+    }
 }
 
 pub(super) fn write_const_val_to_buf(
@@ -431,6 +501,83 @@ pub(super) fn write_const_val_to_buf_at(
             }
         }
         MirConstVal::Array(elems) => match ty {
+            Ty::Mat3 => {
+                let mut flat = [0.0f32; 9];
+                if elems.len() == 3 && matches!(elems.first(), Some(MirConstVal::Vec3(_))) {
+                    for (ci, ev) in elems.iter().enumerate() {
+                        if let MirConstVal::Vec3(v) = ev {
+                            flat[ci * 3] = v[0] as f32;
+                            flat[ci * 3 + 1] = v[1] as f32;
+                            flat[ci * 3 + 2] = v[2] as f32;
+                        }
+                    }
+                } else {
+                    for (i, ev) in elems.iter().take(9).enumerate() {
+                        flat[i] = match ev {
+                            MirConstVal::Float(f) => *f as f32,
+                            MirConstVal::Int(v) => *v as f32,
+                            _ => 0.0,
+                        };
+                    }
+                }
+                for (i, &f) in flat.iter().enumerate() {
+                    if (i + 1) * 4 <= sz {
+                        buf[off + i * 4..off + (i + 1) * 4].copy_from_slice(&f.to_le_bytes());
+                    }
+                }
+            }
+            Ty::Mat4 => {
+                let mut flat = [0.0f32; 16];
+                if elems.len() == 4 && matches!(elems.first(), Some(MirConstVal::Vec4(_))) {
+                    for (ci, ev) in elems.iter().enumerate() {
+                        if let MirConstVal::Vec4(v) = ev {
+                            for k in 0..4 {
+                                flat[ci * 4 + k] = v[k] as f32;
+                            }
+                        }
+                    }
+                } else {
+                    for (i, ev) in elems.iter().take(16).enumerate() {
+                        flat[i] = match ev {
+                            MirConstVal::Float(f) => *f as f32,
+                            MirConstVal::Int(v) => *v as f32,
+                            _ => 0.0,
+                        };
+                    }
+                }
+                for (i, &f) in flat.iter().enumerate() {
+                    if (i + 1) * 4 <= sz {
+                        buf[off + i * 4..off + (i + 1) * 4].copy_from_slice(&f.to_le_bytes());
+                    }
+                }
+            }
+            Ty::SmallVec { elem, cap } => {
+                if sz >= 8 {
+                    let mut enums_map: HashMap<String, EnumDef> =
+                        HashMap::with_capacity(mir.enums.len() * 2);
+                    for e in &mir.enums {
+                        enums_map.insert(e.canonical_name.clone(), e.clone());
+                        if let Some(short) = e.canonical_name.rsplit("::").next() {
+                            enums_map
+                                .entry(short.to_owned())
+                                .or_insert_with(|| e.clone());
+                        }
+                    }
+                    let (es, ea) = ty_size_and_align(elem, mir, &enums_map, 8);
+                    let stride = align_up(es, ea.max(1));
+                    let len = elems.len().min(*cap);
+                    buf[off..off + sz].fill(0);
+                    buf[off..off + 4].copy_from_slice(&(len as u32).to_le_bytes());
+                    if stride > 0 {
+                        for (idx, elem_val) in elems.iter().take(len).enumerate() {
+                            let elem_off = off + 8 + idx * stride;
+                            if elem_off + es <= off + sz {
+                                write_const_val_to_buf_at(buf, elem_off, es, elem, elem_val, mir);
+                            }
+                        }
+                    }
+                }
+            }
             Ty::Array { elem, len } => {
                 if let Some(elem_stride) = sz.checked_div(*len)
                     && elem_stride > 0
@@ -480,21 +627,7 @@ pub(super) fn write_const_val_to_buf_at(
                     find_solved_layout(mir, tn).or_else(|| find_solved_layout(mir, name))
             {
                 let sub_buf = &mut buf[off..off + sz];
-                if let Some(defaults) =
-                    mir.field_defaults.get(&nested.canonical_name).or_else(|| {
-                        nested
-                            .canonical_name
-                            .rsplit("::")
-                            .next()
-                            .and_then(|s| mir.field_defaults.get(s))
-                    })
-                {
-                    for (fname, dval) in defaults {
-                        if let Some(sf) = nested.fields.iter().find(|f| f.name == *fname) {
-                            write_const_val_to_buf(sub_buf, sf, dval, mir);
-                        }
-                    }
-                }
+                fill_layout_defaults(sub_buf, nested, mir, 0);
                 for (fname, fval) in fields {
                     if let Some(sf) = nested.fields.iter().find(|f| f.name == *fname) {
                         write_const_val_to_buf(sub_buf, sf, fval, mir);
@@ -593,10 +726,21 @@ pub(super) fn define_relation_rodata(
     })
 }
 
+#[cfg(test)]
 pub(super) fn eval_const_hir_expr(
     expr: &HirExpr,
     enums: &HashMap<String, EnumDef>,
     consts: &HashMap<String, HirConst>,
+) -> Option<MirConstVal> {
+    eval_const_hir_expr_for_ty(expr, None, enums, consts, &[])
+}
+
+pub(super) fn eval_const_hir_expr_for_ty(
+    expr: &HirExpr,
+    expected_ty: Option<&Ty>,
+    enums: &HashMap<String, EnumDef>,
+    consts: &HashMap<String, HirConst>,
+    layouts: &[SolvedLayout],
 ) -> Option<MirConstVal> {
     let as_f64 = |v: &MirConstVal| -> Option<f64> {
         match v {
@@ -632,7 +776,7 @@ pub(super) fn eval_const_hir_expr(
                 .or_else(|| name.rsplit("::").next().and_then(|s| consts.get(s)))
                 && let Some(ref c_expr) = c.expr
             {
-                return eval_const_hir_expr(c_expr, enums, consts);
+                return eval_const_hir_expr_for_ty(c_expr, Some(&c.ty), enums, consts, layouts);
             }
             match name.as_str() {
                 "vec2::ZERO" | "ivec2::ZERO" | "uvec2::ZERO" => {
@@ -660,6 +804,27 @@ pub(super) fn eval_const_hir_expr(
                 "vec4::Y" => return Some(MirConstVal::Vec4([0.0, 1.0, 0.0, 0.0])),
                 "vec4::Z" => return Some(MirConstVal::Vec4([0.0, 0.0, 1.0, 0.0])),
                 "vec4::W" => return Some(MirConstVal::Vec4([0.0, 0.0, 0.0, 1.0])),
+                "mat3::ZERO" => {
+                    return Some(MirConstVal::Array(vec![MirConstVal::Float(0.0); 9]));
+                }
+                "mat3::IDENTITY" => {
+                    let id = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+                    return Some(MirConstVal::Array(
+                        id.into_iter().map(MirConstVal::Float).collect(),
+                    ));
+                }
+                "mat4::ZERO" => {
+                    return Some(MirConstVal::Array(vec![MirConstVal::Float(0.0); 16]));
+                }
+                "mat4::IDENTITY" => {
+                    let id = [
+                        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+                        1.0,
+                    ];
+                    return Some(MirConstVal::Array(
+                        id.into_iter().map(MirConstVal::Float).collect(),
+                    ));
+                }
                 _ => {}
             }
             if let Some((enum_n, var_n)) = name.rsplit_once("::")
@@ -672,7 +837,10 @@ pub(super) fn eval_const_hir_expr(
         }
         HirExpr::Unary {
             op, expr: inner, ..
-        } => match (op, eval_const_hir_expr(inner, enums, consts)?) {
+        } => match (
+            op,
+            eval_const_hir_expr_for_ty(inner, expected_ty, enums, consts, layouts)?,
+        ) {
             (HirUnOp::Neg, MirConstVal::Int(i)) => Some(MirConstVal::Int(i.wrapping_neg())),
             (HirUnOp::Neg, MirConstVal::Float(f)) => Some(MirConstVal::Float(-f)),
             (HirUnOp::Neg, MirConstVal::Vec2([x, y])) => Some(MirConstVal::Vec2([-x, -y])),
@@ -685,8 +853,8 @@ pub(super) fn eval_const_hir_expr(
             _ => None,
         },
         HirExpr::Binary { op, lhs, rhs, .. } => {
-            let l = eval_const_hir_expr(lhs, enums, consts)?;
-            let r = eval_const_hir_expr(rhs, enums, consts)?;
+            let l = eval_const_hir_expr_for_ty(lhs, expected_ty, enums, consts, layouts)?;
+            let r = eval_const_hir_expr_for_ty(rhs, expected_ty, enums, consts, layouts)?;
             match (l, r) {
                 (MirConstVal::Int(a), MirConstVal::Int(b)) => match op {
                     HirBinOp::Add => Some(MirConstVal::Int(a.wrapping_add(b))),
@@ -718,7 +886,7 @@ pub(super) fn eval_const_hir_expr(
             expr: inner,
             target_ty,
         } => {
-            let v = eval_const_hir_expr(inner, enums, consts)?;
+            let v = eval_const_hir_expr_for_ty(inner, None, enums, consts, layouts)?;
             let src_fix = match inner.ty() {
                 Ty::Fix32 => Some(false),
                 Ty::Fix64 => Some(true),
@@ -847,7 +1015,7 @@ pub(super) fn eval_const_hir_expr(
         }) => {
             let mut evaluated = Vec::with_capacity(args.len());
             for a in args {
-                evaluated.push(eval_const_hir_expr(a, enums, consts)?);
+                evaluated.push(eval_const_hir_expr_for_ty(a, None, enums, consts, layouts)?);
             }
             match callee.rsplit("::").next().unwrap_or(callee) {
                 "vec2" | "Vec2" if evaluated.len() == 2 => Some(MirConstVal::Vec2([
@@ -898,8 +1066,66 @@ pub(super) fn eval_const_hir_expr(
                     as_u32_f64(&evaluated[2])?,
                     as_u32_f64(&evaluated[3])?,
                 ])),
+                "mat3" | "Mat3" => {
+                    let mut out = vec![MirConstVal::Float(0.0); 9];
+                    if evaluated.is_empty() {
+                        out[0] = MirConstVal::Float(1.0);
+                        out[4] = MirConstVal::Float(1.0);
+                        out[8] = MirConstVal::Float(1.0);
+                    } else if evaluated.len() == 1 && !matches!(evaluated[0], MirConstVal::Vec3(_))
+                    {
+                        let s = MirConstVal::Float(as_f64(&evaluated[0])?);
+                        out[0] = s.clone();
+                        out[4] = s.clone();
+                        out[8] = s;
+                    } else if evaluated.len() == 3
+                        && evaluated.iter().all(|v| matches!(v, MirConstVal::Vec3(_)))
+                    {
+                        for (ci, v) in evaluated.iter().enumerate() {
+                            if let MirConstVal::Vec3(c) = v {
+                                out[ci * 3] = MirConstVal::Float(c[0]);
+                                out[ci * 3 + 1] = MirConstVal::Float(c[1]);
+                                out[ci * 3 + 2] = MirConstVal::Float(c[2]);
+                            }
+                        }
+                    } else {
+                        for (i, v) in evaluated.iter().take(9).enumerate() {
+                            out[i] = MirConstVal::Float(as_f64(v)?);
+                        }
+                    }
+                    Some(MirConstVal::Array(out))
+                }
+                "mat4" | "Mat4" => {
+                    let mut out = vec![MirConstVal::Float(0.0); 16];
+                    if evaluated.is_empty() {
+                        for d in [0, 5, 10, 15] {
+                            out[d] = MirConstVal::Float(1.0);
+                        }
+                    } else if evaluated.len() == 1 && !matches!(evaluated[0], MirConstVal::Vec4(_))
+                    {
+                        let s = MirConstVal::Float(as_f64(&evaluated[0])?);
+                        for d in [0, 5, 10, 15] {
+                            out[d] = s.clone();
+                        }
+                    } else if evaluated.len() == 4
+                        && evaluated.iter().all(|v| matches!(v, MirConstVal::Vec4(_)))
+                    {
+                        for (ci, v) in evaluated.iter().enumerate() {
+                            if let MirConstVal::Vec4(c) = v {
+                                for k in 0..4 {
+                                    out[ci * 4 + k] = MirConstVal::Float(c[k]);
+                                }
+                            }
+                        }
+                    } else {
+                        for (i, v) in evaluated.iter().take(16).enumerate() {
+                            out[i] = MirConstVal::Float(as_f64(v)?);
+                        }
+                    }
+                    Some(MirConstVal::Array(out))
+                }
                 "bits" => {
-                    if matches!(ty, Ty::BitSet(_)) {
+                    if matches!(expected_ty.unwrap_or(ty), Ty::BitSet(_)) {
                         Some(MirConstVal::Array(evaluated))
                     } else {
                         let mut mask = 0u64;
@@ -922,17 +1148,57 @@ pub(super) fn eval_const_hir_expr(
                 _ => None,
             }
         }
-        HirExpr::ArrayLit { elems, .. } => {
+        HirExpr::ArrayLit { elems, ty } => {
+            let elem_expected = match expected_ty.unwrap_or(ty) {
+                Ty::Array { elem, .. } | Ty::SmallVec { elem, .. }
+                    if !matches!(**elem, Ty::Unknown) =>
+                {
+                    Some(elem.as_ref())
+                }
+                _ => None,
+            };
             let mut out = Vec::with_capacity(elems.len());
             for el in elems {
-                out.push(eval_const_hir_expr(el, enums, consts)?);
+                out.push(eval_const_hir_expr_for_ty(
+                    el,
+                    elem_expected,
+                    enums,
+                    consts,
+                    layouts,
+                )?);
             }
             Some(MirConstVal::Array(out))
         }
         HirExpr::StructLit { name, fields, .. } => {
+            let short = name.rsplit("::").next().unwrap_or(name.as_str());
+            let layout_opt = layouts
+                .iter()
+                .find(|l| {
+                    l.canonical_name == *name || l.canonical_name.rsplit("::").next() == Some(short)
+                })
+                .or_else(|| match expected_ty {
+                    Some(Ty::Named(k)) => {
+                        let ks = k.rsplit("::").next().unwrap_or(k.as_str());
+                        layouts.iter().find(|l| {
+                            l.canonical_name == *k
+                                || l.canonical_name.rsplit("::").next() == Some(ks)
+                        })
+                    }
+                    _ => None,
+                });
             let mut out = Vec::with_capacity(fields.len());
             for (fname, fexpr) in fields {
-                out.push((fname.clone(), eval_const_hir_expr(fexpr, enums, consts)?));
+                let declared_fty = layout_opt.and_then(|l| {
+                    l.fields
+                        .iter()
+                        .find(|sf| !sf.is_padding && sf.name == *fname)
+                        .map(|sf| sf.ty.clone())
+                });
+                let fty_opt = declared_fty.as_ref().filter(|t| !matches!(t, Ty::Unknown));
+                out.push((
+                    fname.clone(),
+                    eval_const_hir_expr_for_ty(fexpr, fty_opt, enums, consts, layouts)?,
+                ));
             }
             Some(MirConstVal::Struct {
                 name: name.clone(),
@@ -957,50 +1223,32 @@ pub(super) fn define_table_rodata(
     let mut ordered_fields = Vec::with_capacity(table.fields.len());
     for (fname, fty) in &table.fields {
         let mty = mir_type_from_ty(fty);
-        let (sz, al) = match mty {
-            MirType::Bool | MirType::U8 | MirType::I8 => (1, 1),
-            MirType::U16 | MirType::I16 => (2, 2),
-            MirType::U32 | MirType::I32 | MirType::F32 | MirType::Sym | MirType::Fix32 => (4, 4),
-            MirType::U64 | MirType::I64 | MirType::F64 | MirType::Fix64 | MirType::Entity => (8, 8),
-            MirType::Vec2 | MirType::IVec2 | MirType::UVec2 => (8, 4),
-            MirType::Vec3 | MirType::IVec3 => (12, 4),
-            MirType::Vec4 => (16, 4),
-            _ => (ptr_bytes.max(8), 8),
-        };
-        cursor = align_up(cursor, al);
+        let (sz, al) = ty_size_and_align(fty, mir, enums, ptr_bytes);
+        cursor = align_up(cursor, al.max(1));
         fields.insert(fname.clone(), (cursor, mty));
         ordered_fields.push((fname.clone(), cursor, sz, fty.clone()));
         cursor += sz;
     }
     let row_stride = align_up(cursor.max(8), 8);
     let enum_def = enums.get(&table.key_enum);
-    let mut max_idx = table.typed_rows.len().max(table.rows.len());
-    if let Some(ed) = enum_def {
-        for (_, d) in &ed.variants {
-            if *d >= 0 {
-                max_idx = max_idx.max(*d as usize + 1);
-            }
-        }
-    }
-    let row_count = max_idx.max(1);
-    let mut bytes = vec![0u8; row_count * row_stride];
+    let key_is_signed =
+        enum_def.is_some_and(|ed| ed.is_signed || ed.variants.iter().any(|(_, d)| *d < 0));
 
+    let mut rows_by_key: BTreeMap<i64, Vec<u8>> = BTreeMap::new();
     for (ri, (vname, fexprs)) in table.typed_rows.iter().enumerate() {
-        let row_idx = enum_def
+        let key_val = enum_def
             .and_then(|ed| {
                 ed.variants
                     .iter()
                     .find(|(v, _)| v == vname)
-                    .map(|(_, d)| *d as usize)
+                    .map(|(_, d)| *d)
             })
-            .unwrap_or(ri);
-        if row_idx >= row_count {
-            continue;
-        }
-        let base = row_idx * row_stride;
+            .unwrap_or(ri as i64);
+        let mut row_buf = vec![0u8; row_stride];
         for (fname, fexpr) in fexprs {
             if let Some((_, off, sz, fty)) = ordered_fields.iter().find(|(n, _, _, _)| n == fname)
-                && let Some(cval) = eval_const_hir_expr(fexpr, enums, consts)
+                && let Some(cval) =
+                    eval_const_hir_expr_for_ty(fexpr, Some(fty), enums, consts, &mir.layouts)
             {
                 let sf = SolvedField {
                     name: fname.clone(),
@@ -1012,9 +1260,22 @@ pub(super) fn define_table_rodata(
                     bam_field_kind: 0,
                     type_tag: String::new(),
                 };
-                write_const_val_to_buf(&mut bytes[base..base + row_stride], &sf, &cval, mir);
+                write_const_val_to_buf(&mut row_buf, &sf, &cval, mir);
             }
         }
+        rows_by_key.insert(key_val, row_buf);
+    }
+    if rows_by_key.is_empty() {
+        rows_by_key.insert(0, vec![0u8; row_stride]);
+    }
+
+    let row_count = rows_by_key.len();
+    let is_dense_iota = rows_by_key.keys().enumerate().all(|(i, &k)| k == i as i64);
+    let mut bytes = Vec::with_capacity(row_count * row_stride);
+    let mut key_bytes = Vec::with_capacity(row_count * 8);
+    for (&k, row_buf) in &rows_by_key {
+        key_bytes.extend_from_slice(&k.to_le_bytes());
+        bytes.extend_from_slice(row_buf);
     }
 
     let data_id = module
@@ -1032,8 +1293,30 @@ pub(super) fn define_table_rodata(
         .define_data(data_id, &desc)
         .map_err(|e| JitError::Codegen(e.to_string()))?;
 
+    let keys_data_id = if is_dense_iota {
+        None
+    } else {
+        let kid = module
+            .declare_data(
+                &format!("strata_tbl_keys_{idx}_{}", sanitize_ident(&table.name)),
+                Linkage::Local,
+                false,
+                false,
+            )
+            .map_err(|e| JitError::Codegen(e.to_string()))?;
+        let mut kdesc = DataDescription::new();
+        kdesc.define(key_bytes.into_boxed_slice());
+        kdesc.set_align(8);
+        module
+            .define_data(kid, &kdesc)
+            .map_err(|e| JitError::Codegen(e.to_string()))?;
+        Some(kid)
+    };
+
     Ok(TableRodata {
         data_id,
+        keys_data_id,
+        key_is_signed,
         row_count,
         row_stride,
         fields,

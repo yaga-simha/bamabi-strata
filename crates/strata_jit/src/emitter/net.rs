@@ -117,8 +117,9 @@ pub(super) fn emit_net_primitives(ctx: &mut ModuleContext<'_>) -> Result<NetPrim
             let max_q_nz = b.ins().icmp_imm_s(IntCC::NotEqual, max_q, 0);
             let denom_i = b.ins().select(max_q_nz, max_q, one64);
             let denom_f = b.ins().fcvt_from_uint(types::F64, denom_i);
-            let span = b.ins().fsub(max_v, min_v);
-            let def_step = b.ins().fdiv(span, denom_f);
+            let max_step = b.ins().fdiv(max_v, denom_f);
+            let min_step = b.ins().fdiv(min_v, denom_f);
+            let def_step = b.ins().fsub(max_step, min_step);
 
             let hs_nz = b.ins().icmp_imm_s(IntCC::NotEqual, has_step, 0);
             let step_abs = b.ins().fabs(step_v);
@@ -145,7 +146,13 @@ pub(super) fn emit_net_primitives(ctx: &mut ModuleContext<'_>) -> Result<NetPrim
             let clamped = b.ins().select(is_nan, min_v, c2);
 
             let diff = b.ins().fsub(clamped, min_v);
-            let scaled = b.ins().fdiv(diff, eff_step);
+            let diff_abs = b.ins().fabs(diff);
+            let diff_fin = b.ins().fcmp(FloatCC::LessThan, diff_abs, inf);
+            let direct_scaled = b.ins().fdiv(diff, eff_step);
+            let c_over = b.ins().fdiv(clamped, eff_step);
+            let m_over = b.ins().fdiv(min_v, eff_step);
+            let safe_scaled = b.ins().fsub(c_over, m_over);
+            let scaled = b.ins().select(diff_fin, direct_scaled, safe_scaled);
             let rref = ctx.obj_mod.declare_func_in_func(round_fid, b.func);
             let rcall = b.ins().call(rref, &[scaled]);
             let rounded = b.func.dfg.inst_results(rcall)[0];
@@ -238,8 +245,9 @@ pub(super) fn emit_net_primitives(ctx: &mut ModuleContext<'_>) -> Result<NetPrim
             let max_q_nz = b.ins().icmp_imm_s(IntCC::NotEqual, max_q, 0);
             let denom_i = b.ins().select(max_q_nz, max_q, one64);
             let denom_f = b.ins().fcvt_from_uint(types::F64, denom_i);
-            let span = b.ins().fsub(max_v, min_v);
-            let def_step = b.ins().fdiv(span, denom_f);
+            let max_step = b.ins().fdiv(max_v, denom_f);
+            let min_step = b.ins().fdiv(min_v, denom_f);
+            let def_step = b.ins().fsub(max_step, min_step);
 
             let hs_nz = b.ins().icmp_imm_s(IntCC::NotEqual, has_step, 0);
             let step_abs = b.ins().fabs(step_v);
@@ -260,7 +268,14 @@ pub(super) fn emit_net_primitives(ctx: &mut ModuleContext<'_>) -> Result<NetPrim
             b.seal_block(dequant_bb);
             let q_f = b.ins().fcvt_from_uint(types::F64, q);
             let prod = b.ins().fmul(q_f, eff_step);
-            let out = b.ins().fadd(min_v, prod);
+            let prod_abs = b.ins().fabs(prod);
+            let prod_fin = b.ins().fcmp(FloatCC::LessThan, prod_abs, inf);
+            let direct_out = b.ins().fadd(min_v, prod);
+            let rem_f = b.ins().fsub(denom_f, q_f);
+            let rem_prod = b.ins().fmul(rem_f, eff_step);
+            let from_max_out = b.ins().fsub(max_v, rem_prod);
+            let custom_or_fin = b.ins().bor(use_custom, prod_fin);
+            let out = b.ins().select(custom_or_fin, direct_out, from_max_out);
             let lt_min = b.ins().fcmp(FloatCC::LessThan, out, min_v);
             let gt_max = b.ins().fcmp(FloatCC::GreaterThan, out, max_v);
             let c1 = b.ins().select(lt_min, min_v, out);
@@ -838,14 +853,26 @@ pub(super) fn net_quant_f64_to_lane(
         (MirType::I8, _) | (_, Some(Ty::I8)) => {
             let rv = round_val(b, val_f64);
             let iv = b.ins().fcvt_to_sint_sat(types::I32, rv);
-            let v8 = b.ins().ireduce(types::I8, iv);
+            let lo = b.ins().iconst(types::I32, i64::from(i8::MIN));
+            let hi = b.ins().iconst(types::I32, i64::from(i8::MAX));
+            let lt_lo = b.ins().icmp(IntCC::SignedLessThan, iv, lo);
+            let gt_hi = b.ins().icmp(IntCC::SignedGreaterThan, iv, hi);
+            let c1 = b.ins().select(lt_lo, lo, iv);
+            let clamped = b.ins().select(gt_hi, hi, c1);
+            let v8 = b.ins().ireduce(types::I8, clamped);
             b.ins()
                 .store(MemFlagsData::new(), v8, dst_ptr, byte_off as i32);
         }
         (MirType::I16, _) | (_, Some(Ty::I16)) => {
             let rv = round_val(b, val_f64);
             let iv = b.ins().fcvt_to_sint_sat(types::I32, rv);
-            let v16 = b.ins().ireduce(types::I16, iv);
+            let lo = b.ins().iconst(types::I32, i64::from(i16::MIN));
+            let hi = b.ins().iconst(types::I32, i64::from(i16::MAX));
+            let lt_lo = b.ins().icmp(IntCC::SignedLessThan, iv, lo);
+            let gt_hi = b.ins().icmp(IntCC::SignedGreaterThan, iv, hi);
+            let c1 = b.ins().select(lt_lo, lo, iv);
+            let clamped = b.ins().select(gt_hi, hi, c1);
+            let v16 = b.ins().ireduce(types::I16, clamped);
             b.ins()
                 .store(MemFlagsData::new(), v16, dst_ptr, byte_off as i32);
         }
@@ -877,17 +904,33 @@ pub(super) fn net_quant_f64_to_lane(
             b.ins()
                 .store(MemFlagsData::new(), iv, dst_ptr, byte_off as i32);
         }
-        (MirType::U8 | MirType::Bool, _) | (_, Some(Ty::U8 | Ty::Bool)) => {
+        (MirType::Bool, _) | (_, Some(Ty::Bool)) => {
             let rv = round_val(b, val_f64);
             let uv = b.ins().fcvt_to_uint_sat(types::I32, rv);
-            let v8 = b.ins().ireduce(types::I8, uv);
+            let hi = b.ins().iconst(types::I32, 1);
+            let gt_hi = b.ins().icmp(IntCC::UnsignedGreaterThan, uv, hi);
+            let clamped = b.ins().select(gt_hi, hi, uv);
+            let v8 = b.ins().ireduce(types::I8, clamped);
+            b.ins()
+                .store(MemFlagsData::new(), v8, dst_ptr, byte_off as i32);
+        }
+        (MirType::U8, _) | (_, Some(Ty::U8)) => {
+            let rv = round_val(b, val_f64);
+            let uv = b.ins().fcvt_to_uint_sat(types::I32, rv);
+            let hi = b.ins().iconst(types::I32, i64::from(u8::MAX));
+            let gt_hi = b.ins().icmp(IntCC::UnsignedGreaterThan, uv, hi);
+            let clamped = b.ins().select(gt_hi, hi, uv);
+            let v8 = b.ins().ireduce(types::I8, clamped);
             b.ins()
                 .store(MemFlagsData::new(), v8, dst_ptr, byte_off as i32);
         }
         (MirType::U16, _) | (_, Some(Ty::U16)) => {
             let rv = round_val(b, val_f64);
             let uv = b.ins().fcvt_to_uint_sat(types::I32, rv);
-            let v16 = b.ins().ireduce(types::I16, uv);
+            let hi = b.ins().iconst(types::I32, i64::from(u16::MAX));
+            let gt_hi = b.ins().icmp(IntCC::UnsignedGreaterThan, uv, hi);
+            let clamped = b.ins().select(gt_hi, hi, uv);
+            let v16 = b.ins().ireduce(types::I16, clamped);
             b.ins()
                 .store(MemFlagsData::new(), v16, dst_ptr, byte_off as i32);
         }
@@ -911,23 +954,89 @@ pub(super) fn net_quant_f64_to_lane(
     }
 }
 
+pub(super) fn net_comp_stratum_lidxs(
+    ctx: &ModuleContext<'_>,
+    nc: &MirNetComponent,
+) -> Result<Vec<usize>, JitError> {
+    let Some(root_lidx) = lookup_name_in_map(&ctx.layout_map, &nc.canonical_name) else {
+        return Err(JitError::Codegen(format!(
+            "net component `{}` missing solved layout in JIT module",
+            nc.canonical_name
+        )));
+    };
+    let mut strata = vec![root_lidx];
+    for wf in &nc.wire_fields {
+        if let Some(ref sl_name) = wf.stratum_layout {
+            let Some(sl_lidx) = lookup_name_in_map(&ctx.layout_map, sl_name) else {
+                return Err(JitError::Codegen(format!(
+                    "net component `{}` missing solved stratum layout `{sl_name}` in JIT module",
+                    nc.canonical_name
+                )));
+            };
+            if !strata.contains(&sl_lidx) {
+                strata.push(sl_lidx);
+            }
+        }
+    }
+    Ok(strata)
+}
+
+fn resolve_net_wire_fields<'a>(
+    ctx: &ModuleContext<'_>,
+    nc: &'a MirNetComponent,
+    strata: &[usize],
+) -> Result<Vec<(&'a MirNetFieldSpec, Ty, usize)>, JitError> {
+    let mut out = Vec::with_capacity(nc.wire_fields.len());
+    for wf in &nc.wire_fields {
+        let sl_name = wf.stratum_layout.as_deref().unwrap_or(&nc.canonical_name);
+        let Some(sl_lidx) = lookup_name_in_map(&ctx.layout_map, sl_name) else {
+            return Err(JitError::Codegen(format!(
+                "net component `{}` missing solved stratum layout `{sl_name}` in JIT module",
+                nc.canonical_name
+            )));
+        };
+        let Some(sf) = ctx.mir_layouts_sorted[sl_lidx]
+            .fields
+            .iter()
+            .find(|sf| sf.name == wf.field_name)
+        else {
+            return Err(JitError::Codegen(format!(
+                "net component `{}` wire field `{}` missing from solved layout `{}`",
+                nc.canonical_name, wf.field_name, ctx.mir_layouts_sorted[sl_lidx].canonical_name
+            )));
+        };
+        let stratum_slot = strata
+            .iter()
+            .position(|&idx| idx == sl_lidx)
+            .ok_or_else(|| {
+                JitError::Codegen(format!(
+                    "net component `{}` stratum `{sl_name}` missing from stratum group",
+                    nc.canonical_name
+                ))
+            })?;
+        out.push((wf, sf.ty.clone(), stratum_slot));
+    }
+    Ok(out)
+}
+
 pub(super) fn emit_net_component_encoder(
     ctx: &mut ModuleContext<'_>,
     prims: &NetPrimitives,
     nc: &MirNetComponent,
-    lidx: usize,
+    _lidx: usize,
     mod_fp: u64,
     chunk_idx: usize,
     nc_idx: usize,
 ) -> Result<FuncId, JitError> {
     let ptr_ty = ctx.ptr_ty;
+    let ptr_bytes = ctx.ptr_bytes;
     let cc = ctx.call_conv;
     let sym = format!(
         "strata_net_encode_{chunk_idx}_{nc_idx}_{}",
         sanitize_ident(&nc.name)
     );
     let mut sig = Signature::new(cc);
-    sig.params.push(AbiParam::new(ptr_ty)); // src_ptr
+    sig.params.push(AbiParam::new(ptr_ty)); // src_ptrs: *const *const u8
     sig.params.push(AbiParam::new(types::I64)); // entity_bits
     sig.params.push(AbiParam::new(types::I32)); // tick_or_seq
     sig.params.push(AbiParam::new(types::I8)); // client_id
@@ -937,7 +1046,8 @@ pub(super) fn emit_net_component_encoder(
         .declare_function(&sym, Linkage::Local, &sig)
         .map_err(|e| JitError::Codegen(e.to_string()))?;
 
-    let layout_fields = ctx.mir_layouts_sorted[lidx].fields.clone();
+    let strata = net_comp_stratum_lidxs(ctx, nc)?;
+    let resolved_fields = resolve_net_wire_fields(ctx, nc, &strata)?;
     let target_id = fnv1a_64_str(&nc.canonical_name);
     let kind_val = if nc.is_resource {
         PACKET_KIND_RESOURCE_DELTA
@@ -957,7 +1067,7 @@ pub(super) fn emit_net_component_encoder(
         b.seal_block(entry);
 
         let ps = b.block_params(entry).to_vec();
-        let (src_ptr, entity_bits, tick_or_seq, client_id, out_pkt) =
+        let (src_ptrs, entity_bits, tick_or_seq, client_id, out_pkt) =
             (ps[0], ps[1], ps[2], ps[3], ps[4]);
 
         let pkt_nz = b.ins().icmp_imm_s(IntCC::NotEqual, out_pkt, 0);
@@ -1068,25 +1178,51 @@ pub(super) fn emit_net_component_encoder(
             packet_offsets::CLIENT_ID as i32,
         );
 
-        let src_nz = b.ins().icmp_imm_s(IntCC::NotEqual, src_ptr, 0);
+        let src_ptrs_nz = b.ins().icmp_imm_s(IntCC::NotEqual, src_ptrs, 0);
+        let chk_src0_bb = b.create_block();
+        b.ins().brif(src_ptrs_nz, chk_src0_bb, &[], ret_bb, &[]);
+
+        b.switch_to_block(chk_src0_bb);
+        b.seal_block(chk_src0_bb);
+        let src0 = b.ins().load(ptr_ty, MemFlagsData::new(), src_ptrs, 0);
+        let src0_nz = b.ins().icmp_imm_s(IntCC::NotEqual, src0, 0);
         let encode_bb = b.create_block();
-        b.ins().brif(src_nz, encode_bb, &[], ret_bb, &[]);
+        b.ins().brif(src0_nz, encode_bb, &[], ret_bb, &[]);
 
         b.switch_to_block(encode_bb);
         b.seal_block(encode_bb);
+        let mut stratum_ptrs = Vec::with_capacity(strata.len());
+        stratum_ptrs.push(src0);
+        for si in 1..strata.len() {
+            let sp = b.ins().load(
+                ptr_ty,
+                MemFlagsData::new(),
+                src_ptrs,
+                (si * ptr_bytes) as i32,
+            );
+            stratum_ptrs.push(sp);
+        }
+
         let payload_ptr = b.ins().iadd_imm_s(out_pkt, packet_offsets::PAYLOAD as i64);
         let payload_len = b.ins().iconst(ptr_ty, STRATA_NET_MAX_PAYLOAD_BYTES as i64);
         let quant_ref = ctx.obj_mod.declare_func_in_func(prims.quantize_fn, b.func);
         let pack_ref = ctx.obj_mod.declare_func_in_func(prims.pack_bits_fn, b.func);
         let eight_32 = b.ins().iconst(types::I32, 8);
 
-        for wf in &nc.wire_fields {
-            let Some(sf) = layout_fields.iter().find(|sf| sf.name == wf.field_name) else {
-                return Err(JitError::Codegen(format!(
-                    "net component `{}` wire field `{}` missing from solved layout `{}`",
-                    nc.canonical_name, wf.field_name, ctx.mir_layouts_sorted[lidx].canonical_name
-                )));
+        for &(wf, ref sf_ty, stratum_slot) in &resolved_fields {
+            let s_ptr = stratum_ptrs[stratum_slot];
+            let wf_done_bb = if stratum_slot > 0 {
+                let wf_bb = b.create_block();
+                let done_bb = b.create_block();
+                let sp_nz = b.ins().icmp_imm_s(IntCC::NotEqual, s_ptr, 0);
+                b.ins().brif(sp_nz, wf_bb, &[], done_bb, &[]);
+                b.switch_to_block(wf_bb);
+                b.seal_block(wf_bb);
+                Some(done_bb)
+            } else {
+                None
             };
+
             if let Some(ref q) = wf.quantize {
                 let min_v = b.ins().f64const(q.min);
                 let max_v = b.ins().f64const(q.max);
@@ -1106,10 +1242,10 @@ pub(super) fn emit_net_component_encoder(
                     let boff = wf.bit_offset + u32::from(li) * u32::from(q.bits);
                     let fval = net_quant_lane_to_f64(
                         &mut b,
-                        src_ptr,
+                        s_ptr,
                         moff,
                         &wf.ty,
-                        Some(&sf.ty),
+                        Some(sf_ty),
                         q.lane_count,
                         wf.byte_size,
                     );
@@ -1126,7 +1262,7 @@ pub(super) fn emit_net_component_encoder(
                     let byte_v = b.ins().load(
                         types::I8,
                         MemFlagsData::new(),
-                        src_ptr,
+                        s_ptr,
                         (wf.byte_offset + bi) as i32,
                     );
                     let byte64 = b.ins().uextend(types::I64, byte_v);
@@ -1138,6 +1274,12 @@ pub(super) fn emit_net_component_encoder(
                         &[payload_ptr, payload_len, boff_v, eight_32, byte64],
                     );
                 }
+            }
+
+            if let Some(done_bb) = wf_done_bb {
+                b.ins().jump(done_bb, &[]);
+                b.switch_to_block(done_bb);
+                b.seal_block(done_bb);
             }
         }
         b.ins().jump(ret_bb, &[]);
@@ -1155,12 +1297,13 @@ pub(super) fn emit_net_component_decoder(
     ctx: &mut ModuleContext<'_>,
     prims: &NetPrimitives,
     nc: &MirNetComponent,
-    lidx: usize,
+    _lidx: usize,
     mod_fp: u64,
     chunk_idx: usize,
     nc_idx: usize,
 ) -> Result<FuncId, JitError> {
     let ptr_ty = ctx.ptr_ty;
+    let ptr_bytes = ctx.ptr_bytes;
     let cc = ctx.call_conv;
     let sym = format!(
         "strata_net_decode_{chunk_idx}_{nc_idx}_{}",
@@ -1168,14 +1311,15 @@ pub(super) fn emit_net_component_decoder(
     );
     let mut sig = Signature::new(cc);
     sig.params.push(AbiParam::new(ptr_ty)); // pkt
-    sig.params.push(AbiParam::new(ptr_ty)); // out_val
+    sig.params.push(AbiParam::new(ptr_ty)); // out_ptrs: *const *mut u8
     sig.returns.push(AbiParam::new(types::I8));
     let fid = ctx
         .obj_mod
         .declare_function(&sym, Linkage::Local, &sig)
         .map_err(|e| JitError::Codegen(e.to_string()))?;
 
-    let layout_fields = ctx.mir_layouts_sorted[lidx].fields.clone();
+    let strata = net_comp_stratum_lidxs(ctx, nc)?;
+    let resolved_fields = resolve_net_wire_fields(ctx, nc, &strata)?;
     let target_id = fnv1a_64_str(&nc.canonical_name);
     let kind_val = if nc.is_resource {
         PACKET_KIND_RESOURCE_DELTA
@@ -1194,12 +1338,12 @@ pub(super) fn emit_net_component_decoder(
         b.seal_block(entry);
 
         let pkt = b.block_params(entry)[0];
-        let out_val = b.block_params(entry)[1];
+        let out_ptrs = b.block_params(entry)[1];
 
         let fail_bb = b.create_block();
         let hs_bb = b.create_block();
         let pkt_nz = b.ins().icmp_imm_s(IntCC::NotEqual, pkt, 0);
-        let out_nz = b.ins().icmp_imm_s(IntCC::NotEqual, out_val, 0);
+        let out_nz = b.ins().icmp_imm_s(IntCC::NotEqual, out_ptrs, 0);
         let both_nz = b.ins().band(pkt_nz, out_nz);
         b.ins().brif(both_nz, hs_bb, &[], fail_bb, &[]);
 
@@ -1209,6 +1353,8 @@ pub(super) fn emit_net_component_decoder(
 
         b.switch_to_block(hs_bb);
         b.seal_block(hs_bb);
+        let out0 = b.ins().load(ptr_ty, MemFlagsData::new(), out_ptrs, 0);
+        let out0_nz = b.ins().icmp_imm_s(IntCC::NotEqual, out0, 0);
         let hs_ref = ctx
             .obj_mod
             .declare_func_in_func(prims.verify_handshake_fn, b.func);
@@ -1249,12 +1395,25 @@ pub(super) fn emit_net_component_decoder(
         );
         let v0 = b.ins().band(ok_hs, ok_tgt);
         let v1 = b.ins().band(ok_kind, ok_pbytes);
-        let valid = b.ins().band(v0, v1);
+        let v01 = b.ins().band(v0, v1);
+        let valid = b.ins().band(v01, out0_nz);
         let decode_bb = b.create_block();
         b.ins().brif(valid, decode_bb, &[], fail_bb, &[]);
 
         b.switch_to_block(decode_bb);
         b.seal_block(decode_bb);
+        let mut stratum_ptrs = Vec::with_capacity(strata.len());
+        stratum_ptrs.push(out0);
+        for si in 1..strata.len() {
+            let dp = b.ins().load(
+                ptr_ty,
+                MemFlagsData::new(),
+                out_ptrs,
+                (si * ptr_bytes) as i32,
+            );
+            stratum_ptrs.push(dp);
+        }
+
         let payload_ptr = b.ins().iadd_imm_s(pkt, packet_offsets::PAYLOAD as i64);
         let payload_len = b.ins().iconst(ptr_ty, STRATA_NET_MAX_PAYLOAD_BYTES as i64);
         let unpack_ref = ctx
@@ -1266,13 +1425,20 @@ pub(super) fn emit_net_component_decoder(
         let round_ref = ctx.obj_mod.declare_func_in_func(prims.round_fn, b.func);
         let eight_32 = b.ins().iconst(types::I32, 8);
 
-        for wf in &nc.wire_fields {
-            let Some(sf) = layout_fields.iter().find(|sf| sf.name == wf.field_name) else {
-                return Err(JitError::Codegen(format!(
-                    "net component `{}` wire field `{}` missing from solved layout `{}`",
-                    nc.canonical_name, wf.field_name, ctx.mir_layouts_sorted[lidx].canonical_name
-                )));
+        for &(wf, ref sf_ty, stratum_slot) in &resolved_fields {
+            let d_ptr = stratum_ptrs[stratum_slot];
+            let wf_done_bb = if stratum_slot > 0 {
+                let wf_bb = b.create_block();
+                let done_bb = b.create_block();
+                let dp_nz = b.ins().icmp_imm_s(IntCC::NotEqual, d_ptr, 0);
+                b.ins().brif(dp_nz, wf_bb, &[], done_bb, &[]);
+                b.switch_to_block(wf_bb);
+                b.seal_block(wf_bb);
+                Some(done_bb)
+            } else {
+                None
             };
+
             if let Some(ref q) = wf.quantize {
                 let min_v = b.ins().f64const(q.min);
                 let max_v = b.ins().f64const(q.max);
@@ -1302,11 +1468,11 @@ pub(super) fn emit_net_component_decoder(
                     net_quant_f64_to_lane(
                         &mut b,
                         round_ref,
-                        out_val,
+                        d_ptr,
                         moff,
                         fval,
                         &wf.ty,
-                        Some(&sf.ty),
+                        Some(sf_ty),
                         q.lane_count,
                         wf.byte_size,
                     );
@@ -1321,13 +1487,15 @@ pub(super) fn emit_net_component_decoder(
                         .call(unpack_ref, &[payload_ptr, payload_len, boff_v, eight_32]);
                     let raw64 = b.func.dfg.inst_results(ucall)[0];
                     let b8 = b.ins().ireduce(types::I8, raw64);
-                    b.ins().store(
-                        MemFlagsData::new(),
-                        b8,
-                        out_val,
-                        (wf.byte_offset + bi) as i32,
-                    );
+                    b.ins()
+                        .store(MemFlagsData::new(), b8, d_ptr, (wf.byte_offset + bi) as i32);
                 }
+            }
+
+            if let Some(done_bb) = wf_done_bb {
+                b.ins().jump(done_bb, &[]);
+                b.switch_to_block(done_bb);
+                b.seal_block(done_bb);
             }
         }
         let t_v = b.ins().iconst(types::I8, 1);
@@ -1493,15 +1661,24 @@ pub(super) fn emit_net_rx_system(
         let q_it_out = b.ins().stack_addr(ptr_ty, q_it_slot, 0);
         let clen_slot = alloc_zero_slot(&mut b, ptr_bytes, ptr_ty);
         let clen_ptr = b.ins().stack_addr(ptr_ty, clen_slot, 0);
-        let max_comp_sz = chunk
-            .iter()
-            .filter_map(|nc| lookup_name_in_map(&ctx.layout_map, &nc.canonical_name))
-            .map(|lidx| ctx.layouts[lidx].size)
-            .max()
-            .unwrap_or(8)
-            .max(8);
+        let mut max_comp_sz = 8usize;
+        let mut max_strata_count = 1usize;
+        for nc in chunk {
+            let Ok(strata) = net_comp_stratum_lidxs(ctx, nc) else {
+                continue;
+            };
+            max_strata_count = max_strata_count.max(strata.len());
+            let mut sum = 0usize;
+            for &s_lidx in &strata {
+                let s_sz = ctx.layouts[s_lidx].size;
+                sum = sum.saturating_add((s_sz + 7) & !7);
+            }
+            max_comp_sz = max_comp_sz.max(sum);
+        }
         let tmp_slot = alloc_zero_slot(&mut b, max_comp_sz, ptr_ty);
         let tmp_ptr = b.ins().stack_addr(ptr_ty, tmp_slot, 0);
+        let ptrs_slot = alloc_zero_slot(&mut b, max_strata_count * ptr_bytes, ptr_ty);
+        let ptrs_ptr = b.ins().stack_addr(ptr_ty, ptrs_slot, 0);
 
         let batch_hdr_bb = b.create_block();
         let dispatch_bb = b.create_block();
@@ -1531,9 +1708,10 @@ pub(super) fn emit_net_rx_system(
 
         let mut entity_q_idx = 1usize;
         for nc in chunk {
-            let Some(lidx) = lookup_name_in_map(&ctx.layout_map, &nc.canonical_name) else {
+            let Ok(strata) = net_comp_stratum_lidxs(ctx, nc) else {
                 continue;
             };
+            let lidx = strata[0];
             let Some(&(_, dec_fid)) = codecs.get(&nc.canonical_name) else {
                 continue;
             };
@@ -1658,7 +1836,8 @@ pub(super) fn emit_net_rx_system(
                 if sz > 0 {
                     emit_memcpy(&mut b, tmp_ptr, rptr, sz);
                 }
-                let dcall = b.ins().call(dec_ref, &[last_pkt, tmp_ptr]);
+                b.ins().store(MemFlagsData::new(), tmp_ptr, ptrs_ptr, 0);
+                let dcall = b.ins().call(dec_ref, &[last_pkt, ptrs_ptr]);
                 let dec_ok = b.func.dfg.inst_results(dcall)[0];
                 let eq = emit_bytes_equal(&mut b, tmp_ptr, rptr, sz, ptr_ty);
                 let dec_nz = b.ins().icmp_imm_s(IntCC::NotEqual, dec_ok, 0);
@@ -1690,9 +1869,18 @@ pub(super) fn emit_net_rx_system(
             } else {
                 let qi = entity_q_idx;
                 entity_q_idx += 1;
-                let is_sparse = (ctx.mir_layouts_sorted[lidx].component_flags
-                    & BAM_COMPONENT_FLAG_SPARSE_SET)
-                    != 0;
+                let mut tmp_offsets = Vec::with_capacity(strata.len());
+                let mut cur_off = 0usize;
+                let mut strata_meta = Vec::with_capacity(strata.len());
+                for &s_lidx in strata.iter().take(QUERY_TERM_CAP) {
+                    let s_sz = ctx.layouts[s_lidx].size;
+                    let s_sparse = (ctx.mir_layouts_sorted[s_lidx].component_flags
+                        & BAM_COMPONENT_FLAG_SPARSE_SET)
+                        != 0;
+                    tmp_offsets.push(cur_off);
+                    cur_off += (s_sz + 7) & !7;
+                    strata_meta.push((s_sz, s_sparse));
+                }
                 let after_nc_bb = b.create_block();
 
                 // Quick scan: does any packet in `0..got` target this component?
@@ -1808,25 +1996,30 @@ pub(super) fn emit_net_rx_system(
                     cc,
                     &[q_it],
                 );
-                let col_slot = if is_sparse {
-                    api_slots::ITER_COLUMN_ROWS_MUTABLE
-                } else {
-                    api_slots::ITER_COLUMN_MUTABLE_UNTRACKED
-                };
-                let col = call_vtable(
-                    &ctx.obj_mod,
-                    &mut b,
-                    api_ptr,
-                    col_slot,
-                    &[ptr_ty, ptr_ty],
-                    Some(ptr_ty),
-                    ptr_ty,
-                    cc,
-                    &[q_it, z_ptr],
-                );
+                let mut cols = Vec::with_capacity(strata_meta.len());
+                for (si, &(_, s_sparse)) in strata_meta.iter().enumerate() {
+                    let col_slot = if s_sparse {
+                        api_slots::ITER_COLUMN_ROWS_MUTABLE
+                    } else {
+                        api_slots::ITER_COLUMN_MUTABLE_UNTRACKED
+                    };
+                    let term_v = b.ins().iconst(ptr_ty, si as i64);
+                    let col = call_vtable(
+                        &ctx.obj_mod,
+                        &mut b,
+                        api_ptr,
+                        col_slot,
+                        &[ptr_ty, ptr_ty],
+                        Some(ptr_ty),
+                        ptr_ty,
+                        cc,
+                        &[q_it, term_v],
+                    );
+                    cols.push(col);
+                }
                 let ents_nz = b.ins().icmp_imm_s(IntCC::NotEqual, ents, 0);
-                let col_nz = b.ins().icmp_imm_s(IntCC::NotEqual, col, 0);
-                let col_ok = b.ins().band(ents_nz, col_nz);
+                let col0_nz = b.ins().icmp_imm_s(IntCC::NotEqual, cols[0], 0);
+                let col_ok = b.ins().band(ents_nz, col0_nz);
                 let row_hdr = b.create_block();
                 b.append_block_param(row_hdr, ptr_ty);
                 b.ins()
@@ -1907,49 +2100,109 @@ pub(super) fn emit_net_rx_system(
 
                 b.switch_to_block(get_elem_bb);
                 b.seal_block(get_elem_bb);
-                let elem_ptr = if is_sparse {
-                    let r_off = b.ins().imul_imm_s(row, ptr_bytes as i64);
-                    let r_slot = b.ins().iadd(col, r_off);
-                    b.ins().load(ptr_ty, MemFlagsData::new(), r_slot, 0)
-                } else {
-                    let e_off = b.ins().imul_imm_s(row, sz as i64);
-                    b.ins().iadd(col, e_off)
-                };
-                let elem_nz = b.ins().icmp_imm_s(IntCC::NotEqual, elem_ptr, 0);
+                let mut elem_ptrs = Vec::with_capacity(strata_meta.len());
+                for (si, &(s_sz, s_sparse)) in strata_meta.iter().enumerate() {
+                    let ep = emit_load_stratum_elem_ptr(
+                        &mut b,
+                        cols[si],
+                        row,
+                        s_sz,
+                        s_sparse,
+                        si > 0,
+                        ptr_ty,
+                        ptr_bytes,
+                    );
+                    elem_ptrs.push(ep);
+                }
+                let elem0_nz = b.ins().icmp_imm_s(IntCC::NotEqual, elem_ptrs[0], 0);
                 let dec_comp_bb = b.create_block();
-                b.ins().brif(elem_nz, dec_comp_bb, &[], row_step, &[]);
+                b.ins().brif(elem0_nz, dec_comp_bb, &[], row_step, &[]);
 
                 b.switch_to_block(dec_comp_bb);
                 b.seal_block(dec_comp_bb);
-                if sz > 0 {
-                    emit_memcpy(&mut b, tmp_ptr, elem_ptr, sz);
+                let mut tmp_ptrs = Vec::with_capacity(strata_meta.len());
+                for (si, &(s_sz, _)) in strata_meta.iter().enumerate() {
+                    let tp = if tmp_offsets[si] == 0 {
+                        tmp_ptr
+                    } else {
+                        b.ins().iadd_imm_s(tmp_ptr, tmp_offsets[si] as i64)
+                    };
+                    tmp_ptrs.push(tp);
+                    if si == 0 {
+                        if s_sz > 0 {
+                            emit_memcpy(&mut b, tp, elem_ptrs[0], s_sz);
+                        }
+                        b.ins().store(MemFlagsData::new(), tp, ptrs_ptr, 0);
+                    } else {
+                        let cp_bb = b.create_block();
+                        let cp_done_bb = b.create_block();
+                        b.append_block_param(cp_done_bb, ptr_ty);
+                        let ep_nz = b.ins().icmp_imm_s(IntCC::NotEqual, elem_ptrs[si], 0);
+                        b.ins()
+                            .brif(ep_nz, cp_bb, &[], cp_done_bb, &[BlockArg::Value(z_ptr)]);
+                        b.switch_to_block(cp_bb);
+                        b.seal_block(cp_bb);
+                        if s_sz > 0 {
+                            emit_memcpy(&mut b, tp, elem_ptrs[si], s_sz);
+                        }
+                        b.ins().jump(cp_done_bb, &[BlockArg::Value(tp)]);
+                        b.switch_to_block(cp_done_bb);
+                        b.seal_block(cp_done_bb);
+                        let stored_tp = b.block_params(cp_done_bb)[0];
+                        b.ins().store(
+                            MemFlagsData::new(),
+                            stored_tp,
+                            ptrs_ptr,
+                            (si * ptr_bytes) as i32,
+                        );
+                    }
                 }
-                let dcall = b.ins().call(dec_ref, &[elast, tmp_ptr]);
+                let dcall = b.ins().call(dec_ref, &[elast, ptrs_ptr]);
                 let dec_ok = b.func.dfg.inst_results(dcall)[0];
-                let eq = emit_bytes_equal(&mut b, tmp_ptr, elem_ptr, sz, ptr_ty);
                 let dec_nz = b.ins().icmp_imm_s(IntCC::NotEqual, dec_ok, 0);
-                let changed = b.ins().icmp_imm_s(IntCC::Equal, eq, 0);
-                let do_write = b.ins().band(dec_nz, changed);
-                let write_comp_bb = b.create_block();
-                b.ins().brif(do_write, write_comp_bb, &[], row_step, &[]);
+                let apply_changes_bb = b.create_block();
+                b.ins().brif(dec_nz, apply_changes_bb, &[], row_step, &[]);
 
-                b.switch_to_block(write_comp_bb);
-                b.seal_block(write_comp_bb);
-                if sz > 0 {
-                    emit_memcpy(&mut b, elem_ptr, tmp_ptr, sz);
+                b.switch_to_block(apply_changes_bb);
+                b.seal_block(apply_changes_bb);
+                for (si, &(s_sz, _)) in strata_meta.iter().enumerate() {
+                    if s_sz == 0 {
+                        continue;
+                    }
+                    let next_s_bb = b.create_block();
+                    if si > 0 {
+                        let cmp_s_bb = b.create_block();
+                        let ep_nz = b.ins().icmp_imm_s(IntCC::NotEqual, elem_ptrs[si], 0);
+                        b.ins().brif(ep_nz, cmp_s_bb, &[], next_s_bb, &[]);
+                        b.switch_to_block(cmp_s_bb);
+                        b.seal_block(cmp_s_bb);
+                    }
+                    let eq = emit_bytes_equal(&mut b, tmp_ptrs[si], elem_ptrs[si], s_sz, ptr_ty);
+                    let changed = b.ins().icmp_imm_s(IntCC::Equal, eq, 0);
+                    let write_s_bb = b.create_block();
+                    b.ins().brif(changed, write_s_bb, &[], next_s_bb, &[]);
+
+                    b.switch_to_block(write_s_bb);
+                    b.seal_block(write_s_bb);
+                    emit_memcpy(&mut b, elem_ptrs[si], tmp_ptrs[si], s_sz);
+                    let si_p = b.ins().iconst(ptr_ty, si as i64);
+                    let one_p = b.ins().iconst(ptr_ty, 1);
+                    let _mrc = call_vtable(
+                        &ctx.obj_mod,
+                        &mut b,
+                        api_ptr,
+                        api_slots::ITER_MARK_CHANGED_RANGE,
+                        &[ptr_ty, ptr_ty, ptr_ty, ptr_ty],
+                        Some(types::I32),
+                        ptr_ty,
+                        cc,
+                        &[q_it, si_p, row, one_p],
+                    );
+                    b.ins().jump(next_s_bb, &[]);
+
+                    b.switch_to_block(next_s_bb);
+                    b.seal_block(next_s_bb);
                 }
-                let one_p = b.ins().iconst(ptr_ty, 1);
-                let _mrc = call_vtable(
-                    &ctx.obj_mod,
-                    &mut b,
-                    api_ptr,
-                    api_slots::ITER_MARK_CHANGED_RANGE,
-                    &[ptr_ty, ptr_ty, ptr_ty, ptr_ty],
-                    Some(types::I32),
-                    ptr_ty,
-                    cc,
-                    &[q_it, z_ptr, row, one_p],
-                );
                 b.ins().jump(row_step, &[]);
 
                 b.switch_to_block(row_step);
@@ -1976,6 +2229,52 @@ pub(super) fn emit_net_rx_system(
         &mut fn_ctx,
         &format!("strata_sys_net_rx_{chunk_idx}"),
     )
+}
+
+fn emit_load_stratum_elem_ptr(
+    b: &mut FunctionBuilder<'_>,
+    col: Value,
+    row: Value,
+    sz: usize,
+    is_sparse: bool,
+    optional_null_guard: bool,
+    ptr_ty: Type,
+    ptr_bytes: usize,
+) -> Value {
+    let z_ptr = b.ins().iconst(ptr_ty, 0);
+    if !optional_null_guard {
+        if is_sparse {
+            let r_off = b.ins().imul_imm_s(row, ptr_bytes as i64);
+            let r_slot = b.ins().iadd(col, r_off);
+            b.ins().load(ptr_ty, MemFlagsData::new(), r_slot, 0)
+        } else {
+            let e_off = b.ins().imul_imm_s(row, sz as i64);
+            b.ins().iadd(col, e_off)
+        }
+    } else if is_sparse {
+        let load_bb = b.create_block();
+        let done_bb = b.create_block();
+        b.append_block_param(done_bb, ptr_ty);
+        let col_nz = b.ins().icmp_imm_s(IntCC::NotEqual, col, 0);
+        b.ins()
+            .brif(col_nz, load_bb, &[], done_bb, &[BlockArg::Value(z_ptr)]);
+
+        b.switch_to_block(load_bb);
+        b.seal_block(load_bb);
+        let r_off = b.ins().imul_imm_s(row, ptr_bytes as i64);
+        let r_slot = b.ins().iadd(col, r_off);
+        let ep = b.ins().load(ptr_ty, MemFlagsData::new(), r_slot, 0);
+        b.ins().jump(done_bb, &[BlockArg::Value(ep)]);
+
+        b.switch_to_block(done_bb);
+        b.seal_block(done_bb);
+        b.block_params(done_bb)[0]
+    } else {
+        let col_nz = b.ins().icmp_imm_s(IntCC::NotEqual, col, 0);
+        let e_off = b.ins().imul_imm_s(row, sz as i64);
+        let ep = b.ins().iadd(col, e_off);
+        b.ins().select(col_nz, ep, z_ptr)
+    }
 }
 
 pub(super) fn emit_net_tx_system(
@@ -2070,8 +2369,26 @@ pub(super) fn emit_net_tx_system(
         let out_n_var = b.declare_var(ptr_ty);
         b.def_var(out_n_var, z_ptr);
 
+        let mut max_strata_count = 1usize;
+        for nc in chunk {
+            if let Ok(strata) = net_comp_stratum_lidxs(ctx, nc) {
+                max_strata_count = max_strata_count.max(strata.len());
+            }
+        }
+        let ptrs_slot = alloc_zero_slot(&mut b, max_strata_count * ptr_bytes, ptr_ty);
+        let ptrs_ptr = b.ins().stack_addr(ptr_ty, ptrs_slot, 0);
+
         let ticks_slot = alloc_zero_slot(&mut b, structs::CHANGE_TICKS_SIZE, ptr_ty);
         let ticks_ptr = b.ins().stack_addr(ptr_ty, ticks_slot, 0);
+        let col_add_slot = alloc_zero_slot(&mut b, ptr_bytes, ptr_ty);
+        let col_add_out = b.ins().stack_addr(ptr_ty, col_add_slot, 0);
+        let col_chg_slot = alloc_zero_slot(&mut b, ptr_bytes, ptr_ty);
+        let col_chg_out = b.ins().stack_addr(ptr_ty, col_chg_slot, 0);
+        let col_last_slot = alloc_zero_slot(&mut b, 4, ptr_ty);
+        let col_last_out = b.ins().stack_addr(ptr_ty, col_last_slot, 0);
+        let col_this_slot = alloc_zero_slot(&mut b, 4, ptr_ty);
+        let col_this_out = b.ins().stack_addr(ptr_ty, col_this_slot, 0);
+
         let q_it_slot = alloc_zero_slot(&mut b, ptr_bytes, ptr_ty);
         let q_it_out = b.ins().stack_addr(ptr_ty, q_it_slot, 0);
         let clen_slot = alloc_zero_slot(&mut b, ptr_bytes, ptr_ty);
@@ -2080,12 +2397,14 @@ pub(super) fn emit_net_tx_system(
         let z64 = b.ins().iconst(types::I64, 0);
         let z32 = b.ins().iconst(types::I32, 0);
         let z8 = b.ins().iconst(types::I8, 0);
+        let one8 = b.ins().iconst(types::I8, 1);
 
         let mut entity_q_idx = 1usize;
         for nc in chunk {
-            let Some(lidx) = lookup_name_in_map(&ctx.layout_map, &nc.canonical_name) else {
+            let Ok(strata) = net_comp_stratum_lidxs(ctx, nc) else {
                 continue;
             };
+            let lidx = strata[0];
             let Some(&(enc_fid, _)) = codecs.get(&nc.canonical_name) else {
                 continue;
             };
@@ -2201,7 +2520,8 @@ pub(super) fn emit_net_tx_system(
                 let cur_n = b.use_var(out_n_var);
                 let dst_off = b.ins().imul_imm_s(cur_n, STRATA_NET_PACKET_SIZE as i64);
                 let dst_pkt = b.ins().iadd(out_pkts_ptr, dst_off);
-                b.ins().call(enc_ref, &[src_ptr, z64, tick_v, z8, dst_pkt]);
+                b.ins().store(MemFlagsData::new(), src_ptr, ptrs_ptr, 0);
+                b.ins().call(enc_ref, &[ptrs_ptr, z64, tick_v, z8, dst_pkt]);
                 let nxt_n = b.ins().iadd_imm_s(cur_n, 1);
                 b.def_var(out_n_var, nxt_n);
                 let full = b.ins().icmp_imm_s(IntCC::Equal, nxt_n, batch_cap as i64);
@@ -2229,9 +2549,15 @@ pub(super) fn emit_net_tx_system(
             } else {
                 let qi = entity_q_idx;
                 entity_q_idx += 1;
-                let is_sparse = (ctx.mir_layouts_sorted[lidx].component_flags
-                    & BAM_COMPONENT_FLAG_SPARSE_SET)
-                    != 0;
+                let mut strata_meta = Vec::with_capacity(strata.len());
+                for &s_lidx in strata.iter().take(QUERY_TERM_CAP) {
+                    let s_sz = ctx.layouts[s_lidx].size;
+                    let s_sparse = (ctx.mir_layouts_sorted[s_lidx].component_flags
+                        & BAM_COMPONENT_FLAG_SPARSE_SET)
+                        != 0;
+                    strata_meta.push((s_sz, s_sparse));
+                }
+                let is_soa_multi = strata_meta.len() > 1;
                 let after_nc_bb = b.create_block();
                 let qi_v = b.ins().iconst(ptr_ty, qi as i64);
                 b.ins().store(MemFlagsData::trusted(), z_ptr, q_it_out, 0);
@@ -2302,29 +2628,155 @@ pub(super) fn emit_net_tx_system(
                     cc,
                     &[q_it],
                 );
-                let col_slot = if is_sparse {
-                    api_slots::ITER_COLUMN_ROWS_READONLY
-                } else {
-                    api_slots::ITER_COLUMN_READONLY
-                };
-                let col = call_vtable(
-                    &ctx.obj_mod,
-                    &mut b,
-                    api_ptr,
-                    col_slot,
-                    &[ptr_ty, ptr_ty],
-                    Some(ptr_ty),
-                    ptr_ty,
-                    cc,
-                    &[q_it, z_ptr],
-                );
+                let mut cols = Vec::with_capacity(strata_meta.len());
+                for (si, &(_, s_sparse)) in strata_meta.iter().enumerate() {
+                    let col_slot = if s_sparse {
+                        api_slots::ITER_COLUMN_ROWS_READONLY
+                    } else {
+                        api_slots::ITER_COLUMN_READONLY
+                    };
+                    let term_v = b.ins().iconst(ptr_ty, si as i64);
+                    let col = call_vtable(
+                        &ctx.obj_mod,
+                        &mut b,
+                        api_ptr,
+                        col_slot,
+                        &[ptr_ty, ptr_ty],
+                        Some(ptr_ty),
+                        ptr_ty,
+                        cc,
+                        &[q_it, term_v],
+                    );
+                    cols.push(col);
+                }
                 let ents_nz = b.ins().icmp_imm_s(IntCC::NotEqual, ents, 0);
-                let col_nz = b.ins().icmp_imm_s(IntCC::NotEqual, col, 0);
-                let col_ok = b.ins().band(ents_nz, col_nz);
+                let col0_nz = b.ins().icmp_imm_s(IntCC::NotEqual, cols[0], 0);
+                let col_ok = b.ins().band(ents_nz, col0_nz);
+
+                let ticks_setup_bb = if is_soa_multi {
+                    Some(b.create_block())
+                } else {
+                    None
+                };
                 let row_hdr = b.create_block();
                 b.append_block_param(row_hdr, ptr_ty);
-                b.ins()
-                    .brif(col_ok, row_hdr, &[BlockArg::Value(z_ptr)], chunk_hdr, &[]);
+                if let Some(ts_bb) = ticks_setup_bb {
+                    b.ins().brif(col_ok, ts_bb, &[], chunk_hdr, &[]);
+                } else {
+                    b.ins()
+                        .brif(col_ok, row_hdr, &[BlockArg::Value(z_ptr)], chunk_hdr, &[]);
+                }
+
+                // For `@soa` multi-stratum TX, query per-stratum change/added tick arrays so
+                // mutations in either `hot` or any `cold` stratum trigger replication.
+                let mut ticks_info: Vec<(Value, Value, Value, Value, Value)> = Vec::new();
+                let mut any_untracked = z8;
+                if let Some(ts_bb) = ticks_setup_bb {
+                    b.switch_to_block(ts_bb);
+                    b.seal_block(ts_bb);
+                    let ticks_fn = b.ins().load(
+                        ptr_ty,
+                        MemFlagsData::trusted(),
+                        api_ptr,
+                        (api_slots::ITER_COLUMN_TICKS * ptr_bytes) as i32,
+                    );
+                    let ticks_fn_nz = b.ins().icmp_imm_s(IntCC::NotEqual, ticks_fn, 0);
+                    for (si, &(_, s_sparse)) in strata_meta.iter().enumerate() {
+                        if s_sparse {
+                            let col_nz = b.ins().icmp_imm_s(IntCC::NotEqual, cols[si], 0);
+                            let inc = b.ins().select(col_nz, one8, z8);
+                            any_untracked = b.ins().bor(any_untracked, inc);
+                            ticks_info.push((z8, z_ptr, z_ptr, z32, z32));
+                            continue;
+                        }
+                        let try_bb = b.create_block();
+                        let done_bb = b.create_block();
+                        b.append_block_param(done_bb, types::I8); // has_t
+                        b.append_block_param(done_bb, ptr_ty); // add_arr
+                        b.append_block_param(done_bb, ptr_ty); // chg_arr
+                        b.append_block_param(done_bb, types::I32); // last_run
+                        b.append_block_param(done_bb, types::I32); // this_run
+                        b.append_block_param(done_bb, types::I8); // untracked_inc
+                        let col_nz = b.ins().icmp_imm_s(IntCC::NotEqual, cols[si], 0);
+                        let can_call = b.ins().band(ticks_fn_nz, col_nz);
+                        let fallback_inc = b.ins().select(col_nz, one8, z8);
+                        b.ins().brif(
+                            can_call,
+                            try_bb,
+                            &[],
+                            done_bb,
+                            &[
+                                BlockArg::Value(z8),
+                                BlockArg::Value(z_ptr),
+                                BlockArg::Value(z_ptr),
+                                BlockArg::Value(z32),
+                                BlockArg::Value(z32),
+                                BlockArg::Value(fallback_inc),
+                            ],
+                        );
+
+                        b.switch_to_block(try_bb);
+                        b.seal_block(try_bb);
+                        b.ins()
+                            .store(MemFlagsData::trusted(), z_ptr, col_add_out, 0);
+                        b.ins()
+                            .store(MemFlagsData::trusted(), z_ptr, col_chg_out, 0);
+                        b.ins().store(MemFlagsData::trusted(), z32, col_last_out, 0);
+                        b.ins().store(MemFlagsData::trusted(), z32, col_this_out, 0);
+                        let si_v = b.ins().iconst(ptr_ty, si as i64);
+                        let trc = call_vtable(
+                            &ctx.obj_mod,
+                            &mut b,
+                            api_ptr,
+                            api_slots::ITER_COLUMN_TICKS,
+                            &[ptr_ty, ptr_ty, ptr_ty, ptr_ty, ptr_ty, ptr_ty],
+                            Some(types::I32),
+                            ptr_ty,
+                            cc,
+                            &[
+                                q_it,
+                                si_v,
+                                col_add_out,
+                                col_chg_out,
+                                col_last_out,
+                                col_this_out,
+                            ],
+                        );
+                        let trc_ok = b.ins().icmp_imm_s(IntCC::Equal, trc, 0);
+                        let add_arr = b
+                            .ins()
+                            .load(ptr_ty, MemFlagsData::trusted(), col_add_out, 0);
+                        let chg_arr = b
+                            .ins()
+                            .load(ptr_ty, MemFlagsData::trusted(), col_chg_out, 0);
+                        let last_r =
+                            b.ins()
+                                .load(types::I32, MemFlagsData::trusted(), col_last_out, 0);
+                        let this_r =
+                            b.ins()
+                                .load(types::I32, MemFlagsData::trusted(), col_this_out, 0);
+                        let has_t = b.ins().select(trc_ok, one8, z8);
+                        let u_inc = b.ins().select(trc_ok, z8, one8);
+                        b.ins().jump(
+                            done_bb,
+                            &[
+                                BlockArg::Value(has_t),
+                                BlockArg::Value(add_arr),
+                                BlockArg::Value(chg_arr),
+                                BlockArg::Value(last_r),
+                                BlockArg::Value(this_r),
+                                BlockArg::Value(u_inc),
+                            ],
+                        );
+
+                        b.switch_to_block(done_bb);
+                        b.seal_block(done_bb);
+                        let dp = b.block_params(done_bb).to_vec();
+                        any_untracked = b.ins().bor(any_untracked, dp[5]);
+                        ticks_info.push((dp[0], dp[1], dp[2], dp[3], dp[4]));
+                    }
+                    b.ins().jump(row_hdr, &[BlockArg::Value(z_ptr)]);
+                }
 
                 b.switch_to_block(row_hdr);
                 let row = b.block_params(row_hdr)[0];
@@ -2334,22 +2786,95 @@ pub(super) fn emit_net_tx_system(
 
                 b.switch_to_block(row_body);
                 b.seal_block(row_body);
+                let row_step = b.create_block();
+
+                let mut src_ptrs = Vec::with_capacity(strata_meta.len());
+                for (si, &(s_sz, s_sparse)) in strata_meta.iter().enumerate() {
+                    let sp = emit_load_stratum_elem_ptr(
+                        &mut b,
+                        cols[si],
+                        row,
+                        s_sz,
+                        s_sparse,
+                        si > 0,
+                        ptr_ty,
+                        ptr_bytes,
+                    );
+                    src_ptrs.push(sp);
+                }
+
                 let ent_off = b.ins().imul_imm_s(row, 8);
                 let ent_ptr = b.ins().iadd(ents, ent_off);
                 let ebits = b.ins().load(types::I64, MemFlagsData::new(), ent_ptr, 0);
-                let src_ptr = if is_sparse {
-                    let r_off = b.ins().imul_imm_s(row, ptr_bytes as i64);
-                    let r_slot = b.ins().iadd(col, r_off);
-                    b.ins().load(ptr_ty, MemFlagsData::new(), r_slot, 0)
-                } else {
-                    let e_off = b.ins().imul_imm_s(row, sz as i64);
-                    b.ins().iadd(col, e_off)
-                };
 
-                let row_step = b.create_block();
+                if is_soa_multi {
+                    let mut should_send = any_untracked;
+                    let tick_off = b.ins().imul_imm_s(row, 4);
+                    let max_age = b
+                        .ins()
+                        .iconst(types::I32, i64::from(bamabi_sys::BAM_MAX_CHANGE_AGE));
+                    for &(has_t, add_arr, chg_arr, last_r, this_r) in &ticks_info {
+                        let chk_bb = b.create_block();
+                        let next_bb = b.create_block();
+                        b.append_block_param(next_bb, types::I8);
+                        let ht_nz = b.ins().icmp_imm_s(IntCC::NotEqual, has_t, 0);
+                        b.ins()
+                            .brif(ht_nz, chk_bb, &[], next_bb, &[BlockArg::Value(should_send)]);
+
+                        b.switch_to_block(chk_bb);
+                        b.seal_block(chk_bb);
+                        let d_last = b.ins().isub(this_r, last_r);
+                        let last_lt = b.ins().icmp(IntCC::UnsignedLessThan, d_last, max_age);
+                        let clamped_last = b.ins().select(last_lt, d_last, max_age);
+
+                        let mut stratum_hit = z8;
+                        for &arr in &[chg_arr, add_arr] {
+                            let arr_bb = b.create_block();
+                            let arr_done = b.create_block();
+                            b.append_block_param(arr_done, types::I8);
+                            let arr_nz = b.ins().icmp_imm_s(IntCC::NotEqual, arr, 0);
+                            b.ins().brif(
+                                arr_nz,
+                                arr_bb,
+                                &[],
+                                arr_done,
+                                &[BlockArg::Value(stratum_hit)],
+                            );
+
+                            b.switch_to_block(arr_bb);
+                            b.seal_block(arr_bb);
+                            let tp = b.ins().iadd(arr, tick_off);
+                            let tv = b.ins().load(types::I32, MemFlagsData::new(), tp, 0);
+                            let dt = b.ins().isub(this_r, tv);
+                            let dt_lt = b.ins().icmp(IntCC::UnsignedLessThan, dt, max_age);
+                            let clamped_dt = b.ins().select(dt_lt, dt, max_age);
+                            let newer =
+                                b.ins()
+                                    .icmp(IntCC::UnsignedGreaterThan, clamped_last, clamped_dt);
+                            let hit_s = b.ins().bor(stratum_hit, newer);
+                            b.ins().jump(arr_done, &[BlockArg::Value(hit_s)]);
+
+                            b.switch_to_block(arr_done);
+                            b.seal_block(arr_done);
+                            stratum_hit = b.block_params(arr_done)[0];
+                        }
+                        let upd_send = b.ins().bor(should_send, stratum_hit);
+                        b.ins().jump(next_bb, &[BlockArg::Value(upd_send)]);
+
+                        b.switch_to_block(next_bb);
+                        b.seal_block(next_bb);
+                        should_send = b.block_params(next_bb)[0];
+                    }
+                    let enc_gate_bb = b.create_block();
+                    let send_nz = b.ins().icmp_imm_s(IntCC::NotEqual, should_send, 0);
+                    b.ins().brif(send_nz, enc_gate_bb, &[], row_step, &[]);
+                    b.switch_to_block(enc_gate_bb);
+                    b.seal_block(enc_gate_bb);
+                }
+
                 let enc_row_bb = b.create_block();
-                if is_sparse {
-                    let src_nz = b.ins().icmp_imm_s(IntCC::NotEqual, src_ptr, 0);
+                if strata_meta[0].1 {
+                    let src_nz = b.ins().icmp_imm_s(IntCC::NotEqual, src_ptrs[0], 0);
                     b.ins().brif(src_nz, enc_row_bb, &[], row_step, &[]);
                 } else {
                     b.ins().jump(enc_row_bb, &[]);
@@ -2357,10 +2882,14 @@ pub(super) fn emit_net_tx_system(
 
                 b.switch_to_block(enc_row_bb);
                 b.seal_block(enc_row_bb);
+                for (si, &sp) in src_ptrs.iter().enumerate() {
+                    b.ins()
+                        .store(MemFlagsData::new(), sp, ptrs_ptr, (si * ptr_bytes) as i32);
+                }
                 let cur_n = b.use_var(out_n_var);
                 let dst_off = b.ins().imul_imm_s(cur_n, STRATA_NET_PACKET_SIZE as i64);
                 let dst_pkt = b.ins().iadd(out_pkts_ptr, dst_off);
-                b.ins().call(enc_ref, &[src_ptr, ebits, z32, z8, dst_pkt]);
+                b.ins().call(enc_ref, &[ptrs_ptr, ebits, z32, z8, dst_pkt]);
                 let nxt_n = b.ins().iadd_imm_s(cur_n, 1);
                 b.def_var(out_n_var, nxt_n);
                 let full = b.ins().icmp_imm_s(IntCC::Equal, nxt_n, batch_cap as i64);

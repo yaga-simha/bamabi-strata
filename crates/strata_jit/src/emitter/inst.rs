@@ -100,10 +100,12 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             }
             Inst::ConstString { value } => {
                 if let Some(d) = dst {
-                    let cstr_id = self.ctx.intern_cstr(value)?;
-                    let (raw_id, raw_len) = self.ctx.intern_bytes(value)?;
-                    self.const_strings.insert(d.0, (raw_id, raw_len));
-                    let gv = self.ctx.obj_mod.declare_data_in_func(cstr_id, self.b.func);
+                    let cap = value.len().max(16);
+                    let blob_id = self.ctx.intern_inline_str_blob(value, cap)?;
+                    self.const_string_texts.insert(d.0, value.clone());
+                    self.ptr_pointee_tys
+                        .insert(d.0, MirType::Named(format!("InlineStr<{cap}>")));
+                    let gv = self.ctx.obj_mod.declare_data_in_func(blob_id, self.b.func);
                     let addr = self.b.ins().symbol_value(ptr_ty, gv);
                     self.def_scalar_typed(d, addr);
                 }
@@ -123,6 +125,12 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                     if let Some(len) = self.array_ptr_lens.get(&val.0).copied() {
                         self.array_ptr_lens.insert(d.0, len);
                     }
+                    if let Some(et) = self.ptr_elem_tys.get(&val.0).cloned() {
+                        self.ptr_elem_tys.insert(d.0, et);
+                    }
+                    if let Some(pt) = self.ptr_pointee_tys.get(&val.0).cloned() {
+                        self.ptr_pointee_tys.insert(d.0, pt);
+                    }
                 }
             }
             Inst::SlotAlloc { .. } => {
@@ -139,8 +147,29 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                     if let Some(schema) = self.batch_schemas.get(&slot.0).cloned() {
                         self.batch_schemas.insert(d.0, schema);
                     }
-                    if let Some(len) = self.array_ptr_lens.get(&slot.0).copied() {
+                    if let Some(len) = self
+                        .array_ptr_lens
+                        .get(&slot.0)
+                        .or_else(|| self.slot_array_lens.get(&slot.0))
+                        .copied()
+                    {
                         self.array_ptr_lens.insert(d.0, len);
+                    }
+                    if let Some(et) = self
+                        .ptr_elem_tys
+                        .get(&slot.0)
+                        .or_else(|| self.slot_ptr_elem_tys.get(&slot.0))
+                        .cloned()
+                    {
+                        self.ptr_elem_tys.insert(d.0, et);
+                    }
+                    if let Some(pt) = self
+                        .ptr_pointee_tys
+                        .get(&slot.0)
+                        .or_else(|| self.slot_ptr_pointee_tys.get(&slot.0))
+                        .cloned()
+                    {
+                        self.ptr_pointee_tys.insert(d.0, pt);
                     }
                 }
             }
@@ -166,6 +195,15 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                     }
                     if let Some(schema) = self.batch_schemas.get(&val.0).cloned() {
                         self.batch_schemas.insert(slot.0, schema);
+                    }
+                    if let Some(len) = self.array_ptr_lens.get(&val.0).copied() {
+                        self.slot_array_lens.insert(slot.0, len);
+                    }
+                    if let Some(et) = self.ptr_elem_tys.get(&val.0).cloned() {
+                        self.slot_ptr_elem_tys.insert(slot.0, et);
+                    }
+                    if let Some(pt) = self.ptr_pointee_tys.get(&val.0).cloned() {
+                        self.slot_ptr_pointee_tys.insert(slot.0, pt);
                     }
                 }
                 // Update any strength-reduced row pointers bound to `slot`.
@@ -290,27 +328,49 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                 offset_bytes,
             } => {
                 if let Some(d) = dst {
-                    if let (_, Some(MirType::Array { len, .. })) =
-                        self.ctx.resolve_field_offset_and_ty(layout_key, field)
-                    {
-                        self.array_ptr_lens.insert(d.0, len);
+                    let (resolved_off, resolved_ty) =
+                        self.ctx.resolve_field_offset_and_ty(layout_key, field);
+                    let eff_off = if resolved_ty.is_some() {
+                        resolved_off
+                    } else {
+                        *offset_bytes as usize
+                    };
+                    if let Some(rt) = resolved_ty {
+                        self.ptr_pointee_tys.insert(d.0, rt.clone());
+                        if let MirType::Array { elem, len } = rt {
+                            self.array_ptr_lens.insert(d.0, len);
+                            self.ptr_elem_tys.insert(d.0, *elem);
+                        }
+                    } else if layout_key == "SmallVec" && field == "data" {
+                        let sv_mty = self
+                            .ptr_pointee_tys
+                            .get(&base_ptr.0)
+                            .cloned()
+                            .unwrap_or_else(|| self.effective_local_mir_ty(*base_ptr).clone());
+                        if let MirType::Named(ref sv_name) = sv_mty
+                            && let Some((sv_elem, sv_cap)) = parse_smallvec_mir_name(sv_name)
+                        {
+                            self.array_ptr_lens.insert(d.0, sv_cap);
+                            self.ptr_elem_tys.insert(d.0, sv_elem);
+                        }
                     }
                     let bp = self.use_scalar(*base_ptr);
                     let zero_p = self.b.ins().iconst(ptr_ty, 0);
                     let is_null = self.b.ins().icmp_imm_s(IntCC::Equal, bp, 0);
-                    let added = self.b.ins().iadd_imm_s(bp, i64::from(*offset_bytes));
+                    let added = self.b.ins().iadd_imm_s(bp, eff_off as i64);
                     let res = self.b.ins().select(is_null, zero_p, added);
                     self.def_scalar_typed(d, res);
                 }
             }
             Inst::FieldLoad {
                 base_ptr,
+                layout_key,
+                field,
                 offset_bytes,
                 field_ty,
-                ..
             } => {
                 if let Some(d) = dst {
-                    self.lower_field_load(d, *base_ptr, *offset_bytes, field_ty);
+                    self.lower_field_load(d, *base_ptr, layout_key, field, *offset_bytes, field_ty);
                 }
             }
             Inst::FieldStore {
@@ -423,36 +483,45 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             Inst::IterColRead {
                 query_idx,
                 term_idx,
-                ..
+                storage_key,
             } => {
                 if let Some(d) = dst {
-                    let p =
-                        self.call_iter_col(*query_idx, *term_idx, api_slots::ITER_COLUMN_READONLY);
+                    let slot = if self.is_query_term_sparse(*query_idx, *term_idx, storage_key) {
+                        api_slots::ITER_COLUMN_ROWS_READONLY
+                    } else {
+                        api_slots::ITER_COLUMN_READONLY
+                    };
+                    let p = self.call_iter_col(*query_idx, *term_idx, slot);
                     self.def_scalar_typed(d, p);
                 }
             }
             Inst::IterColWrite {
                 query_idx,
                 term_idx,
-                ..
+                storage_key,
             } => {
                 if let Some(d) = dst {
-                    let p =
-                        self.call_iter_col(*query_idx, *term_idx, api_slots::ITER_COLUMN_MUTABLE);
+                    let slot = if self.is_query_term_sparse(*query_idx, *term_idx, storage_key) {
+                        api_slots::ITER_COLUMN_ROWS_MUTABLE
+                    } else {
+                        api_slots::ITER_COLUMN_MUTABLE
+                    };
+                    let p = self.call_iter_col(*query_idx, *term_idx, slot);
                     self.def_scalar_typed(d, p);
                 }
             }
             Inst::IterColWriteUntracked {
                 query_idx,
                 term_idx,
-                ..
+                storage_key,
             } => {
                 if let Some(d) = dst {
-                    let p = self.call_iter_col(
-                        *query_idx,
-                        *term_idx,
-                        api_slots::ITER_COLUMN_MUTABLE_UNTRACKED,
-                    );
+                    let slot = if self.is_query_term_sparse(*query_idx, *term_idx, storage_key) {
+                        api_slots::ITER_COLUMN_ROWS_MUTABLE
+                    } else {
+                        api_slots::ITER_COLUMN_MUTABLE_UNTRACKED
+                    };
+                    let p = self.call_iter_col(*query_idx, *term_idx, slot);
                     self.def_scalar_typed(d, p);
                 }
             }
@@ -558,15 +627,55 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                     "+"
                 } else if op == "prod" || op == "mul" || op == "*" {
                     "*"
+                } else if op == "any" {
+                    "||"
+                } else if op == "all" {
+                    "&&"
                 } else {
                     op.as_str()
                 };
-                if eff_op == "min" || eff_op == "max" {
-                    let a = self.use_scalar(*acc);
-                    let v = self.use_scalar(*val);
-                    let ty = self.expected_cl_ty(d_target);
-                    let res = apply_min_max(self.b, ty, eff_op == "min", a, v);
+                if eff_op == "||" || eff_op == "&&" {
+                    let amty = self.effective_local_mir_ty(*acc).clone();
+                    let vmty = self.effective_local_mir_ty(*val).clone();
+                    let av = self.use_scalar(*acc);
+                    let vv = self.use_scalar(*val);
+                    let ab = cast_to_bool(self.b, av, &amty);
+                    let vb = cast_to_bool(self.b, vv, &vmty);
+                    let res = if eff_op == "||" {
+                        self.b.ins().bor(ab, vb)
+                    } else {
+                        self.b.ins().band(ab, vb)
+                    };
                     self.def_scalar_typed(d_target, res);
+                } else if eff_op == "min" || eff_op == "max" {
+                    let dmty = self.mir_fn.locals[d_target.0 as usize].ty.clone();
+                    if let Some(dims) = vec_dims(&dmty) {
+                        let av = self.use_vec_dims(*acc, dims);
+                        let vv = self.use_vec_dims(*val, dims);
+                        let is_int_v = is_ivec_mir_ty(&dmty);
+                        let signed_v = !matches!(dmty, MirType::UVec2);
+                        let lane_ty = if is_int_v { types::I32 } else { types::F32 };
+                        let z = zero_for_cl_type(self.b, lane_ty);
+                        let mut out = [z; 4];
+                        for i in 0..usize::from(dims) {
+                            out[i] = apply_min_max(
+                                self.b,
+                                lane_ty,
+                                eff_op == "min",
+                                signed_v,
+                                av[i],
+                                vv[i],
+                            );
+                        }
+                        self.def_vec(d_target, out);
+                    } else {
+                        let a = self.coerce_val_to_mir_ty(*acc, &dmty);
+                        let v = self.coerce_val_to_mir_ty(*val, &dmty);
+                        let ty = self.expected_cl_ty(d_target);
+                        let signed = is_signed_int_ty(&dmty);
+                        let res = apply_min_max(self.b, ty, eff_op == "min", signed, a, v);
+                        self.def_scalar_typed(d_target, res);
+                    }
                 } else {
                     self.lower_binop(d_target, eff_op, *acc, *val, false);
                 }
@@ -1038,6 +1147,17 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         if let Some((id, len)) = self.const_strings.get(&src.0).copied() {
             self.const_strings.insert(dst.0, (id, len));
         }
+        if let Some(txt) = self.const_string_texts.get(&src.0).cloned() {
+            self.const_string_texts.insert(dst.0, txt);
+        } else {
+            self.const_string_texts.remove(&dst.0);
+        }
+        if let Some(et) = self.ptr_elem_tys.get(&src.0).cloned() {
+            self.ptr_elem_tys.insert(dst.0, et);
+        }
+        if let Some(pt) = self.ptr_pointee_tys.get(&src.0).cloned() {
+            self.ptr_pointee_tys.insert(dst.0, pt);
+        }
         match (
             &self.local_reps[src.0 as usize],
             &self.local_reps[dst.0 as usize],
@@ -1079,10 +1199,111 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         rhs: LocalId,
         allow_fma: bool,
     ) {
-        let lty = &self.mir_fn.locals[lhs.0 as usize].ty;
-        let rty = &self.mir_fn.locals[rhs.0 as usize].ty;
-        let dst_ty = &self.mir_fn.locals[dst.0 as usize].ty;
+        let lty_owned = self.effective_local_mir_ty(lhs).clone();
+        let rty_owned = self.effective_local_mir_ty(rhs).clone();
+        let dst_ty_owned = self.effective_local_mir_ty(dst).clone();
+        let lty = &lty_owned;
+        let rty = &rty_owned;
+        let dst_ty = &dst_ty_owned;
         let ptr_ty = self.ctx.ptr_ty;
+
+        if op == "quat_mul" {
+            let l = self.use_vec(lhs);
+            let r = self.use_vec(rhs);
+            let (lx, ly, lz, lw) = (l[0], l[1], l[2], l[3]);
+            let (rx, ry, rz, rw) = (r[0], r[1], r[2], r[3]);
+            // Hamilton product for `(x, y, z, w)` quaternions.
+            let p0 = self.b.ins().fmul(lw, rx);
+            let p1 = self.b.ins().fmul(lx, rw);
+            let p2 = self.b.ins().fmul(ly, rz);
+            let p3 = self.b.ins().fmul(lz, ry);
+            let x0 = self.b.ins().fadd(p0, p1);
+            let x1 = self.b.ins().fsub(p2, p3);
+            let qx = self.b.ins().fadd(x0, x1);
+
+            let q0 = self.b.ins().fmul(lw, ry);
+            let q1 = self.b.ins().fmul(lx, rz);
+            let q2 = self.b.ins().fmul(ly, rw);
+            let q3 = self.b.ins().fmul(lz, rx);
+            let y0 = self.b.ins().fsub(q0, q1);
+            let y1 = self.b.ins().fadd(q2, q3);
+            let qy = self.b.ins().fadd(y0, y1);
+
+            let r0 = self.b.ins().fmul(lw, rz);
+            let r1 = self.b.ins().fmul(lx, ry);
+            let r2 = self.b.ins().fmul(ly, rx);
+            let r3 = self.b.ins().fmul(lz, rw);
+            let z0 = self.b.ins().fadd(r0, r1);
+            let z1 = self.b.ins().fsub(r3, r2);
+            let qz = self.b.ins().fadd(z0, z1);
+
+            let w0 = self.b.ins().fmul(lw, rw);
+            let w1 = self.b.ins().fmul(lx, rx);
+            let w2 = self.b.ins().fmul(ly, ry);
+            let w3 = self.b.ins().fmul(lz, rz);
+            let ww0 = self.b.ins().fsub(w0, w1);
+            let ww1 = self.b.ins().fadd(w2, w3);
+            let qw = self.b.ins().fsub(ww0, ww1);
+
+            self.def_vec(dst, [qx, qy, qz, qw]);
+            return;
+        }
+        if op == "quat_mul_vec3" {
+            let q = self.use_vec(lhs);
+            let v = self.use_vec_dims(rhs, 3);
+            let (qx, qy, qz, qw) = (q[0], q[1], q[2], q[3]);
+            let (vx, vy, vz) = (v[0], v[1], v[2]);
+            // v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
+            let cx_a = self.b.ins().fmul(qy, vz);
+            let cx_b = self.b.ins().fmul(qz, vy);
+            let cx0 = self.b.ins().fsub(cx_a, cx_b);
+            let qw_vx = self.b.ins().fmul(qw, vx);
+            let c1x = self.b.ins().fadd(cx0, qw_vx);
+
+            let cy_a = self.b.ins().fmul(qz, vx);
+            let cy_b = self.b.ins().fmul(qx, vz);
+            let cy0 = self.b.ins().fsub(cy_a, cy_b);
+            let qw_vy = self.b.ins().fmul(qw, vy);
+            let c1y = self.b.ins().fadd(cy0, qw_vy);
+
+            let cz_a = self.b.ins().fmul(qx, vy);
+            let cz_b = self.b.ins().fmul(qy, vx);
+            let cz0 = self.b.ins().fsub(cz_a, cz_b);
+            let qw_vz = self.b.ins().fmul(qw, vz);
+            let c1z = self.b.ins().fadd(cz0, qw_vz);
+
+            let c2x = {
+                let a = self.b.ins().fmul(qy, c1z);
+                let b = self.b.ins().fmul(qz, c1y);
+                self.b.ins().fsub(a, b)
+            };
+            let c2y = {
+                let a = self.b.ins().fmul(qz, c1x);
+                let b = self.b.ins().fmul(qx, c1z);
+                self.b.ins().fsub(a, b)
+            };
+            let c2z = {
+                let a = self.b.ins().fmul(qx, c1y);
+                let b = self.b.ins().fmul(qy, c1x);
+                self.b.ins().fsub(a, b)
+            };
+            let two = self.b.ins().f32const(2.0);
+            let ox = {
+                let t = self.b.ins().fmul(two, c2x);
+                self.b.ins().fadd(vx, t)
+            };
+            let oy = {
+                let t = self.b.ins().fmul(two, c2y);
+                self.b.ins().fadd(vy, t)
+            };
+            let oz = {
+                let t = self.b.ins().fmul(two, c2z);
+                self.b.ins().fadd(vz, t)
+            };
+            let zf = self.b.ins().f32const(0.0);
+            self.def_vec(dst, [ox, oy, oz, zf]);
+            return;
+        }
 
         // Handle vector arithmetic (`Vec + Vec`, `Vec * s`, `s * Vec`, `Vec == Vec`, and integer vectors).
         if let (Some(ld), Some(rd)) = (vec_dims(lty), vec_dims(rty)) {
@@ -1345,8 +1566,9 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
     pub(super) fn lower_cast(&mut self, dst: LocalId, val: LocalId, target_ty: &MirType) {
         let src_ty = self.effective_local_mir_ty(val).clone();
         if let Some(dims) = vec_dims(target_ty) {
-            let mut vs = self.use_vec(val);
-            let z = if is_ivec_mir_ty(target_ty) {
+            let is_ivec = is_ivec_mir_ty(target_ty);
+            let mut vs = self.vec_or_broadcast_arg(val, dims, is_ivec);
+            let z = if is_ivec {
                 self.b.ins().iconst(types::I32, 0)
             } else {
                 self.b.ins().f32const(0.0)
@@ -1361,6 +1583,12 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             || matches!(target_ty, MirType::Fix32 | MirType::Fix64 | MirType::F64)
         {
             let res = self.coerce_val_to_mir_ty(val, target_ty);
+            self.def_scalar_typed(dst, res);
+            return;
+        }
+        if *target_ty == MirType::Bool {
+            let sv = self.use_scalar(val);
+            let res = cast_to_bool(self.b, sv, &src_ty);
             self.def_scalar_typed(dst, res);
             return;
         }
@@ -1388,8 +1616,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             "vec2" | "Vec2" | "vec3" | "Vec3" | "vec3a" | "Vec3a" | "vec4" | "Vec4" | "quat"
             | "Quat" | "rgba" | "Rgba" => {
                 let mut lanes = [zero_f32; 4];
-                if args.len() == 1 && vec_dims(&self.mir_fn.locals[args[0].0 as usize].ty).is_some()
-                {
+                if args.len() == 1 && self.effective_vec_dims(args[0]).is_some() {
                     lanes = self.use_vec(args[0]);
                 } else {
                     for (i, &a) in args.iter().take(4).enumerate() {
@@ -1405,8 +1632,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             "ivec2" | "IVec2" | "ivec3" | "IVec3" | "uvec2" | "UVec2" => {
                 let zero_i32 = self.b.ins().iconst(types::I32, 0);
                 let mut lanes = [zero_i32; 4];
-                if args.len() == 1 && vec_dims(&self.mir_fn.locals[args[0].0 as usize].ty).is_some()
-                {
+                if args.len() == 1 && self.effective_vec_dims(args[0]).is_some() {
                     lanes = self.use_vec(args[0]);
                 } else {
                     for (i, &a) in args.iter().take(4).enumerate() {
@@ -1424,6 +1650,110 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                     }
                 }
                 self.def_vec(dst, lanes);
+                return Ok(());
+            }
+            "mat3" | "Mat3" => {
+                let slot = alloc_zero_slot(self.b, 36, ptr_ty);
+                let base_ptr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                if args.len() == 3 && self.effective_vec_dims(args[0]).is_some() {
+                    for (col, &arg) in args.iter().enumerate() {
+                        let v = self.use_vec_dims(arg, 3);
+                        for (row, &lane) in v.iter().take(3).enumerate() {
+                            self.b.ins().store(
+                                MemFlagsData::new(),
+                                lane,
+                                base_ptr,
+                                ((col * 3 + row) * 4) as i32,
+                            );
+                        }
+                    }
+                } else if args.len() == 1 {
+                    let amty = self.effective_local_mir_ty(args[0]).clone();
+                    if matches!(amty, MirType::Named(ref n) if n == "mat3") {
+                        let src_ptr = self.use_scalar(args[0]);
+                        emit_memcpy(self.b, base_ptr, src_ptr, 36);
+                    } else {
+                        let s = {
+                            let __tmp = self.use_scalar(args[0]);
+                            coerce_cl_val(self.b, __tmp, types::F32, ptr_ty)
+                        };
+                        for d in [0i32, 4, 8] {
+                            self.b.ins().store(MemFlagsData::new(), s, base_ptr, d * 4);
+                        }
+                    }
+                } else if args.is_empty() {
+                    let one = self.b.ins().f32const(1.0);
+                    for d in [0i32, 4, 8] {
+                        self.b
+                            .ins()
+                            .store(MemFlagsData::new(), one, base_ptr, d * 4);
+                    }
+                } else {
+                    for (i, &arg) in args.iter().take(9).enumerate() {
+                        let v = {
+                            let __tmp = self.use_scalar(arg);
+                            coerce_cl_val(self.b, __tmp, types::F32, ptr_ty)
+                        };
+                        self.b
+                            .ins()
+                            .store(MemFlagsData::new(), v, base_ptr, (i * 4) as i32);
+                    }
+                }
+                self.def_scalar_typed(dst, base_ptr);
+                self.ptr_pointee_tys
+                    .insert(dst.0, MirType::Named("mat3".to_owned()));
+                return Ok(());
+            }
+            "mat4" | "Mat4" => {
+                let slot = alloc_zero_slot(self.b, 64, ptr_ty);
+                let base_ptr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+                if args.len() == 4 && self.effective_vec_dims(args[0]).is_some() {
+                    for (col, &arg) in args.iter().enumerate() {
+                        let v = self.use_vec_dims(arg, 4);
+                        for (row, &lane) in v.iter().enumerate() {
+                            self.b.ins().store(
+                                MemFlagsData::new(),
+                                lane,
+                                base_ptr,
+                                ((col * 4 + row) * 4) as i32,
+                            );
+                        }
+                    }
+                } else if args.len() == 1 {
+                    let amty = self.effective_local_mir_ty(args[0]).clone();
+                    if matches!(amty, MirType::Named(ref n) if n == "mat4") {
+                        let src_ptr = self.use_scalar(args[0]);
+                        emit_memcpy(self.b, base_ptr, src_ptr, 64);
+                    } else {
+                        let s = {
+                            let __tmp = self.use_scalar(args[0]);
+                            coerce_cl_val(self.b, __tmp, types::F32, ptr_ty)
+                        };
+                        for d in [0i32, 5, 10, 15] {
+                            self.b.ins().store(MemFlagsData::new(), s, base_ptr, d * 4);
+                        }
+                    }
+                } else if args.is_empty() {
+                    let one = self.b.ins().f32const(1.0);
+                    for d in [0i32, 5, 10, 15] {
+                        self.b
+                            .ins()
+                            .store(MemFlagsData::new(), one, base_ptr, d * 4);
+                    }
+                } else {
+                    for (i, &arg) in args.iter().take(16).enumerate() {
+                        let v = {
+                            let __tmp = self.use_scalar(arg);
+                            coerce_cl_val(self.b, __tmp, types::F32, ptr_ty)
+                        };
+                        self.b
+                            .ins()
+                            .store(MemFlagsData::new(), v, base_ptr, (i * 4) as i32);
+                    }
+                }
+                self.def_scalar_typed(dst, base_ptr);
+                self.ptr_pointee_tys
+                    .insert(dst.0, MirType::Named("mat4".to_owned()));
                 return Ok(());
             }
             "dot" if args.len() >= 2 => {
@@ -1463,16 +1793,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                     }
                     self.def_scalar_typed(dst, acc);
                 } else {
-                    let s = self.use_scalar(args[0]);
-                    let sq = if matches!(
-                        self.mir_fn.locals[args[0].0 as usize].ty,
-                        MirType::F32 | MirType::F64
-                    ) {
-                        self.b.ins().fmul(s, s)
-                    } else {
-                        self.b.ins().imul(s, s)
-                    };
-                    self.def_scalar_typed(dst, sq);
+                    self.lower_binop(dst, "*", args[0], args[0], false);
                 }
                 return Ok(());
             }
@@ -1541,17 +1862,16 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                 return Ok(());
             }
             "lerp" if args.len() >= 3 => {
-                if let Some(dims) = vec_dims(&self.mir_fn.locals[dst.0 as usize].ty) {
-                    let a = self.use_vec(args[0]);
-                    let b = self.use_vec(args[1]);
-                    let t = {
-                        let __tmp = self.use_scalar(args[2]);
-                        coerce_cl_val(self.b, __tmp, types::F32, ptr_ty)
-                    };
+                let vec_ty_dims = vec_dims(&self.mir_fn.locals[dst.0 as usize].ty)
+                    .or_else(|| self.effective_vec_dims(args[0]));
+                if let Some(dims) = vec_ty_dims {
+                    let a = self.use_vec_dims(args[0], dims);
+                    let b = self.vec_or_broadcast_arg(args[1], dims, false);
+                    let t = self.vec_or_broadcast_arg(args[2], dims, false);
                     let mut out = [zero_f32; 4];
                     for i in 0..usize::from(dims) {
                         let d = self.b.ins().fsub(b[i], a[i]);
-                        let s = self.b.ins().fmul(d, t);
+                        let s = self.b.ins().fmul(d, t[i]);
                         out[i] = self.b.ins().fadd(a[i], s);
                     }
                     self.def_vec(dst, out);
@@ -1583,8 +1903,169 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             _ => {}
         }
 
-        // Scalar hardware or imported libm math.
+        // Elementwise vector math (`clamp`, `min`, `max`, `abs`, `floor`, `ceil`, `saturate`, `select`, ...).
         let dst_mty = self.mir_fn.locals[dst.0 as usize].ty.clone();
+        if let Some(dims) = vec_dims(&dst_mty) {
+            let is_ivec = is_ivec_mir_ty(&dst_mty);
+            let signed = !matches!(dst_mty, MirType::UVec2);
+            let n = usize::from(dims);
+            if is_ivec {
+                let z = self.b.ins().iconst(types::I32, 0);
+                let mut out = [z; 4];
+                match short {
+                    "abs" if !args.is_empty() => {
+                        let a = self.vec_or_broadcast_arg(args[0], dims, true);
+                        for i in 0..n {
+                            out[i] = if signed {
+                                self.b.ins().iabs(a[i])
+                            } else {
+                                a[i]
+                            };
+                        }
+                        self.def_vec(dst, out);
+                        return Ok(());
+                    }
+                    "min" | "max" if args.len() >= 2 => {
+                        let a = self.vec_or_broadcast_arg(args[0], dims, true);
+                        let b = self.vec_or_broadcast_arg(args[1], dims, true);
+                        for i in 0..n {
+                            out[i] = apply_min_max(
+                                self.b,
+                                types::I32,
+                                short == "min",
+                                signed,
+                                a[i],
+                                b[i],
+                            );
+                        }
+                        self.def_vec(dst, out);
+                        return Ok(());
+                    }
+                    "clamp" if args.len() >= 3 => {
+                        let a = self.vec_or_broadcast_arg(args[0], dims, true);
+                        let lo = self.vec_or_broadcast_arg(args[1], dims, true);
+                        let hi = self.vec_or_broadcast_arg(args[2], dims, true);
+                        for i in 0..n {
+                            let c1 = apply_min_max(self.b, types::I32, false, signed, a[i], lo[i]);
+                            out[i] = apply_min_max(self.b, types::I32, true, signed, c1, hi[i]);
+                        }
+                        self.def_vec(dst, out);
+                        return Ok(());
+                    }
+                    "select" if args.len() >= 3 => {
+                        let cond = self.use_scalar(args[0]);
+                        let tv = self.vec_or_broadcast_arg(args[1], dims, true);
+                        let fv = self.vec_or_broadcast_arg(args[2], dims, true);
+                        for i in 0..n {
+                            out[i] = self.b.ins().select(cond, tv[i], fv[i]);
+                        }
+                        self.def_vec(dst, out);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            } else {
+                let mut out = [zero_f32; 4];
+                match short {
+                    "sqrt" | "abs" | "floor" | "ceil" | "trunc" | "saturate" | "fract" | "sign"
+                    | "signum" | "round"
+                        if !args.is_empty() =>
+                    {
+                        let a = self.vec_or_broadcast_arg(args[0], dims, false);
+                        let one = self.b.ins().f32const(1.0);
+                        let m1 = self.b.ins().f32const(-1.0);
+                        let round_fref = if short == "round" {
+                            let fid = self.ctx.declare_extern_fn(
+                                "roundf",
+                                &[types::F32],
+                                Some(types::F32),
+                            )?;
+                            Some(self.ctx.obj_mod.declare_func_in_func(fid, self.b.func))
+                        } else {
+                            None
+                        };
+                        for i in 0..n {
+                            out[i] = match short {
+                                "sqrt" => self.b.ins().sqrt(a[i]),
+                                "abs" => self.b.ins().fabs(a[i]),
+                                "floor" => self.b.ins().floor(a[i]),
+                                "ceil" => self.b.ins().ceil(a[i]),
+                                "trunc" => self.b.ins().trunc(a[i]),
+                                "round" => {
+                                    let rf = round_fref.expect("roundf declared");
+                                    let c = self.b.ins().call(rf, &[a[i]]);
+                                    self.b.inst_results(c)[0]
+                                }
+                                "saturate" => {
+                                    let c1 = self.b.ins().fmax(a[i], zero_f32);
+                                    self.b.ins().fmin(c1, one)
+                                }
+                                "fract" => {
+                                    let fl = self.b.ins().floor(a[i]);
+                                    self.b.ins().fsub(a[i], fl)
+                                }
+                                _ => {
+                                    let gt =
+                                        self.b.ins().fcmp(FloatCC::GreaterThan, a[i], zero_f32);
+                                    let lt = self.b.ins().fcmp(FloatCC::LessThan, a[i], zero_f32);
+                                    let s1 = self.b.ins().select(lt, m1, zero_f32);
+                                    self.b.ins().select(gt, one, s1)
+                                }
+                            };
+                        }
+                        self.def_vec(dst, out);
+                        return Ok(());
+                    }
+                    "min" | "max" if args.len() >= 2 => {
+                        let a = self.vec_or_broadcast_arg(args[0], dims, false);
+                        let b = self.vec_or_broadcast_arg(args[1], dims, false);
+                        for i in 0..n {
+                            out[i] = if short == "min" {
+                                self.b.ins().fmin(a[i], b[i])
+                            } else {
+                                self.b.ins().fmax(a[i], b[i])
+                            };
+                        }
+                        self.def_vec(dst, out);
+                        return Ok(());
+                    }
+                    "clamp" if args.len() >= 3 => {
+                        let a = self.vec_or_broadcast_arg(args[0], dims, false);
+                        let lo = self.vec_or_broadcast_arg(args[1], dims, false);
+                        let hi = self.vec_or_broadcast_arg(args[2], dims, false);
+                        for i in 0..n {
+                            let c1 = self.b.ins().fmax(a[i], lo[i]);
+                            out[i] = self.b.ins().fmin(c1, hi[i]);
+                        }
+                        self.def_vec(dst, out);
+                        return Ok(());
+                    }
+                    "select" if args.len() >= 3 => {
+                        let cond = self.use_scalar(args[0]);
+                        let tv = self.vec_or_broadcast_arg(args[1], dims, false);
+                        let fv = self.vec_or_broadcast_arg(args[2], dims, false);
+                        for i in 0..n {
+                            out[i] = self.b.ins().select(cond, tv[i], fv[i]);
+                        }
+                        self.def_vec(dst, out);
+                        return Ok(());
+                    }
+                    "mul_add" | "fma" if args.len() >= 3 => {
+                        let a = self.vec_or_broadcast_arg(args[0], dims, false);
+                        let b = self.vec_or_broadcast_arg(args[1], dims, false);
+                        let c = self.vec_or_broadcast_arg(args[2], dims, false);
+                        for i in 0..n {
+                            out[i] = self.b.ins().fma(a[i], b[i], c[i]);
+                        }
+                        self.def_vec(dst, out);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Scalar hardware or imported libm math.
         let is_f64 = dst_mty == MirType::F64
             || args
                 .first()
@@ -1960,7 +2441,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let ptr_ty = self.ctx.ptr_ty;
         let hfn = self.ctx.mir.fns[hidx].clone();
         let use_out_ptr = helper_uses_out_ptr(&hfn.ret_ty);
-        let mut call_args = vec![self.state_ptr];
+        let mut call_args = vec![self.state_ptr, self.sys_ctx];
         let out_ptr = if use_out_ptr {
             let out_slot = alloc_zero_slot(self.b, 16, ptr_ty);
             let p = self.b.ins().stack_addr(ptr_ty, out_slot, 0);
@@ -2144,20 +2625,33 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             self.const_defs.insert(dst.0, MirConstVal::Array(arr_const));
         }
         let ptr_ty = self.ctx.ptr_ty;
-        let dst_elem_ty = match self.effective_local_mir_ty(dst) {
+        let dst_mty = self.effective_local_mir_ty(dst).clone();
+        let dst_elem_ty = match &dst_mty {
             MirType::Array { elem, .. } => (**elem).clone(),
             _ => elems
                 .first()
                 .map(|e| self.effective_local_mir_ty(*e).clone())
                 .unwrap_or(MirType::I32),
         };
-        let elem_sz = self.ctx.layout_size_of_mir_ty(&dst_elem_ty);
-        let total = (elems.len().max(1) * elem_sz.max(1)).max(8);
+        self.ptr_elem_tys.insert(dst.0, dst_elem_ty.clone());
+        self.ptr_pointee_tys.insert(dst.0, dst_mty);
+        let elem_stride = align_up(
+            self.ctx.layout_size_of_mir_ty(&dst_elem_ty),
+            self.ctx.mir_ty_align_of(&dst_elem_ty).max(1),
+        )
+        .max(1);
+        let total = (elems.len().max(1) * elem_stride).max(8);
         let slot = alloc_zero_slot(self.b, total, ptr_ty);
         let base_ptr = self.b.ins().stack_addr(ptr_ty, slot, 0);
         for (i, &el) in elems.iter().enumerate() {
             let ety = self.effective_local_mir_ty(el).clone();
-            self.store_typed_field_to_mem(el, &ety, &dst_elem_ty, base_ptr, (i * elem_sz) as i32);
+            self.store_typed_field_to_mem(
+                el,
+                &ety,
+                &dst_elem_ty,
+                base_ptr,
+                (i * elem_stride) as i32,
+            );
         }
         self.def_scalar_typed(dst, base_ptr);
     }
@@ -2169,21 +2663,88 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             let __tmp = self.use_scalar(index);
             coerce_cl_val(self.b, __tmp, ptr_ty, ptr_ty)
         };
-        let base_mty = &self.mir_fn.locals[base.0 as usize].ty;
-        let dty = self.mir_fn.locals[dst.0 as usize].ty.clone();
-        let stride = match base_mty {
-            MirType::Array { elem, .. } => self.ctx.layout_size_of_mir_ty(elem),
-            MirType::QueryIter => 8,
-            _ => self.ctx.layout_size_of_mir_ty(&dty),
+        let base_mty = self.effective_local_mir_ty(base).clone();
+        let dty = self.effective_local_mir_ty(dst).clone();
+        let elem_ty_opt = self.ptr_elem_tys.get(&base.0).cloned().or_else(|| {
+            if let MirType::Array { elem, .. } = &base_mty {
+                Some((**elem).clone())
+            } else if let Some(MirType::Array { elem, .. }) = self.ptr_pointee_tys.get(&base.0) {
+                Some((**elem).clone())
+            } else {
+                None
+            }
+        });
+        let stride = if matches!(base_mty, MirType::QueryIter) {
+            8
+        } else if let Some(ref et) = elem_ty_opt {
+            align_up(
+                self.ctx.layout_size_of_mir_ty(et),
+                self.ctx.mir_ty_align_of(et).max(1),
+            )
+            .max(1)
+        } else {
+            align_up(
+                self.ctx.layout_size_of_mir_ty(&dty),
+                self.ctx.mir_ty_align_of(&dty).max(1),
+            )
+            .max(1)
         };
         let off = self.b.ins().imul_imm_s(idx, stride as i64);
-        let addr = self.b.ins().iadd(bp, off);
+        let raw_addr = self.b.ins().iadd(bp, off);
+        let is_null = self.b.ins().icmp_imm_s(IntCC::Equal, bp, 0);
+        let zero_p = self.b.ins().iconst(ptr_ty, 0);
+        let addr = self.b.ins().select(is_null, zero_p, raw_addr);
+
+        if matches!(dty, MirType::Ptr | MirType::MutPtr) {
+            self.def_scalar_typed(dst, addr);
+            if let Some(et) = elem_ty_opt {
+                self.ptr_pointee_tys.insert(dst.0, et.clone());
+                if let MirType::Array { elem, len } = et {
+                    self.ptr_elem_tys.insert(dst.0, *elem);
+                    self.array_ptr_lens.insert(dst.0, len);
+                }
+            }
+            return;
+        }
         if let Some(scalar_mty) = self.ctx.enum_scalar_mir_ty(&dty) {
+            let load_bb = self.b.create_block();
+            let null_bb = self.b.create_block();
+            let merge_bb = self.b.create_block();
+            let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, bp, 0);
+            self.b.ins().brif(ok, load_bb, &[], null_bb, &[]);
+            self.b.switch_to_block(load_bb);
+            self.b.seal_block(load_bb);
             self.load_local_from_mem(dst, &scalar_mty, addr, 0);
+            self.b.ins().jump(merge_bb, &[]);
+            self.b.switch_to_block(null_bb);
+            self.b.seal_block(null_bb);
+            self.def_zero_for_local(dst);
+            self.b.ins().jump(merge_bb, &[]);
+            self.b.switch_to_block(merge_bb);
+            self.b.seal_block(merge_bb);
         } else if self.ctx.is_agg_mir_ty(&dty) {
             self.def_scalar_typed(dst, addr);
+            self.ptr_pointee_tys.insert(dst.0, dty.clone());
+            if let MirType::Array { elem, len } = dty {
+                self.ptr_elem_tys.insert(dst.0, *elem);
+                self.array_ptr_lens.insert(dst.0, len);
+            }
         } else {
+            let load_bb = self.b.create_block();
+            let null_bb = self.b.create_block();
+            let merge_bb = self.b.create_block();
+            let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, bp, 0);
+            self.b.ins().brif(ok, load_bb, &[], null_bb, &[]);
+            self.b.switch_to_block(load_bb);
+            self.b.seal_block(load_bb);
             self.load_local_from_mem(dst, &dty, addr, 0);
+            self.b.ins().jump(merge_bb, &[]);
+            self.b.switch_to_block(null_bb);
+            self.b.seal_block(null_bb);
+            self.def_zero_for_local(dst);
+            self.b.ins().jump(merge_bb, &[]);
+            self.b.switch_to_block(merge_bb);
+            self.b.seal_block(merge_bb);
         }
     }
 
@@ -2228,11 +2789,20 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
 
         self.b.switch_to_block(store_bb);
         self.b.seal_block(store_bb);
+        let raw_eff_elem = self
+            .ptr_elem_tys
+            .get(&base_ptr.0)
+            .cloned()
+            .unwrap_or_else(|| elem_ty.clone());
         let eff_elem_ty = self
             .ctx
-            .enum_scalar_mir_ty(elem_ty)
-            .unwrap_or_else(|| elem_ty.clone());
-        let stride = self.ctx.layout_size_of_mir_ty(&eff_elem_ty).max(1);
+            .enum_scalar_mir_ty(&raw_eff_elem)
+            .unwrap_or(raw_eff_elem);
+        let stride = align_up(
+            self.ctx.layout_size_of_mir_ty(&eff_elem_ty),
+            self.ctx.mir_ty_align_of(&eff_elem_ty).max(1),
+        )
+        .max(1);
         let idx_ptr = coerce_cl_val(self.b, idx_i64, ptr_ty, ptr_ty);
         let off = self.b.ins().imul_imm_s(idx_ptr, stride as i64);
         let addr = self.b.ins().iadd(bp, off);
@@ -2244,13 +2814,99 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         self.b.seal_block(skip_bb);
     }
 
+    fn vec_or_broadcast_arg(&mut self, arg: LocalId, dims: u8, is_ivec: bool) -> [Value; 4] {
+        if self.effective_vec_dims(arg).is_some() {
+            return self.use_vec_dims(arg, dims);
+        }
+        let lane_ty = if is_ivec { types::I32 } else { types::F32 };
+        let s = self.use_scalar(arg);
+        let coerced = coerce_cl_val(self.b, s, lane_ty, self.ctx.ptr_ty);
+        [coerced; 4]
+    }
+
     pub(super) fn lower_field_load(
         &mut self,
         dst: LocalId,
         base_ptr: LocalId,
+        layout_key: &str,
+        field: &str,
         offset_bytes: u32,
         field_ty: &MirType,
     ) {
+        let base_mty = self.effective_local_mir_ty(base_ptr).clone();
+        if vec_dims(&base_mty).is_some()
+            && let Some(lanes) = parse_swizzle_lanes(field)
+        {
+            let src = self.use_vec(base_ptr);
+            let is_ivec = is_ivec_mir_ty(&base_mty);
+            if lanes.len() == 1 {
+                self.def_scalar_typed(dst, src[usize::from(lanes[0])]);
+            } else {
+                let z = if is_ivec {
+                    self.b.ins().iconst(types::I32, 0)
+                } else {
+                    self.b.ins().f32const(0.0)
+                };
+                let mut out = [z; 4];
+                for (i, &l) in lanes.iter().take(4).enumerate() {
+                    out[i] = src[usize::from(l)];
+                }
+                self.def_vec(dst, out);
+            }
+            return;
+        }
+        if let Some((parent_field, swiz)) = field.rsplit_once('.')
+            && let Some(lanes) = parse_swizzle_lanes(swiz)
+            && let (parent_off, Some(parent_ty)) = self
+                .ctx
+                .resolve_field_offset_and_ty(layout_key, parent_field)
+            && vec_dims(&parent_ty).is_some()
+        {
+            let bp = self.use_scalar(base_ptr);
+            let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, bp, 0);
+            let load_bb = self.b.create_block();
+            let null_bb = self.b.create_block();
+            let merge_bb = self.b.create_block();
+            self.b.ins().brif(ok, load_bb, &[], null_bb, &[]);
+
+            self.b.switch_to_block(load_bb);
+            self.b.seal_block(load_bb);
+            let is_ivec = is_ivec_mir_ty(&parent_ty);
+            let lane_cl = if is_ivec { types::I32 } else { types::F32 };
+            let z = zero_for_cl_type(self.b, lane_cl);
+            let mut vals = [z; 4];
+            for (i, &l) in lanes.iter().take(4).enumerate() {
+                vals[i] = self.b.ins().load(
+                    lane_cl,
+                    MemFlagsData::new(),
+                    bp,
+                    parent_off as i32 + i32::from(l) * 4,
+                );
+            }
+            if lanes.len() == 1 {
+                self.def_scalar_typed(dst, vals[0]);
+            } else {
+                self.def_vec(dst, vals);
+            }
+            self.b.ins().jump(merge_bb, &[]);
+
+            self.b.switch_to_block(null_bb);
+            self.b.seal_block(null_bb);
+            self.def_zero_for_local(dst);
+            self.b.ins().jump(merge_bb, &[]);
+
+            self.b.switch_to_block(merge_bb);
+            self.b.seal_block(merge_bb);
+            return;
+        }
+        let (resolved_off, resolved_ty) = self.ctx.resolve_field_offset_and_ty(layout_key, field);
+        let eff_off = if resolved_ty.is_some() {
+            resolved_off
+        } else {
+            offset_bytes as usize
+        };
+        let eff_field_ty = resolved_ty.unwrap_or_else(|| field_ty.clone());
+
         let bp = self.use_scalar(base_ptr);
         let ptr_ty = self.ctx.ptr_ty;
         let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, bp, 0);
@@ -2261,13 +2917,18 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
 
         self.b.switch_to_block(load_bb);
         self.b.seal_block(load_bb);
-        if let Some(scalar_mty) = self.ctx.enum_scalar_mir_ty(field_ty) {
-            self.load_local_from_mem(dst, &scalar_mty, bp, offset_bytes as i32);
-        } else if self.ctx.is_agg_mir_ty(field_ty) {
-            let addr = self.b.ins().iadd_imm_s(bp, i64::from(offset_bytes));
+        if let Some(scalar_mty) = self.ctx.enum_scalar_mir_ty(&eff_field_ty) {
+            self.load_local_from_mem(dst, &scalar_mty, bp, eff_off as i32);
+        } else if self.ctx.is_agg_mir_ty(&eff_field_ty) {
+            let addr = self.b.ins().iadd_imm_s(bp, eff_off as i64);
             self.def_scalar_typed(dst, addr);
+            self.ptr_pointee_tys.insert(dst.0, eff_field_ty.clone());
+            if let MirType::Array { elem, len } = eff_field_ty {
+                self.array_ptr_lens.insert(dst.0, len);
+                self.ptr_elem_tys.insert(dst.0, *elem);
+            }
         } else {
-            self.load_local_from_mem(dst, field_ty, bp, offset_bytes as i32);
+            self.load_local_from_mem(dst, &eff_field_ty, bp, eff_off as i32);
         }
         self.b.ins().jump(merge_bb, &[]);
 
@@ -2281,6 +2942,138 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let _ = ptr_ty;
     }
 
+    fn emit_memzero(&mut self, dst: Value, size: usize) {
+        let mut off = 0usize;
+        if size >= 8 {
+            let z64 = self.b.ins().iconst(types::I64, 0);
+            while off + 8 <= size {
+                self.b
+                    .ins()
+                    .store(MemFlagsData::new(), z64, dst, off as i32);
+                off += 8;
+            }
+        }
+        if off + 4 <= size {
+            let z32 = self.b.ins().iconst(types::I32, 0);
+            while off + 4 <= size {
+                self.b
+                    .ins()
+                    .store(MemFlagsData::new(), z32, dst, off as i32);
+                off += 4;
+            }
+        }
+        if off < size {
+            let z8 = self.b.ins().iconst(types::I8, 0);
+            while off < size {
+                self.b.ins().store(MemFlagsData::new(), z8, dst, off as i32);
+                off += 1;
+            }
+        }
+    }
+
+    fn emit_copy_inline_str(&mut self, dst_addr: Value, dst_cap: usize, src_ptr: Value) {
+        let total = 4 + dst_cap.div_ceil(4) * 4;
+        self.emit_memzero(dst_addr, total);
+        let ptr_ty = self.ctx.ptr_ty;
+        let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, src_ptr, 0);
+        let copy_bb = self.b.create_block();
+        let utf8_hdr_bb = self.b.create_block();
+        let utf8_chk_bb = self.b.create_block();
+        let write_len_bb = self.b.create_block();
+        let cp_hdr_bb = self.b.create_block();
+        let cp_body_bb = self.b.create_block();
+        let done_bb = self.b.create_block();
+
+        self.b.append_block_param(utf8_hdr_bb, types::I32);
+        self.b.append_block_param(write_len_bb, types::I32);
+        self.b.append_block_param(cp_hdr_bb, types::I32);
+
+        self.b.ins().brif(ok, copy_bb, &[], done_bb, &[]);
+
+        self.b.switch_to_block(copy_bb);
+        self.b.seal_block(copy_bb);
+        let raw_len = self
+            .b
+            .ins()
+            .load(types::I32, MemFlagsData::new(), src_ptr, 0);
+        let cap_i32 = self.b.ins().iconst(types::I32, dst_cap as i64);
+        let needs_trunc = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, raw_len, cap_i32);
+        self.b.ins().brif(
+            needs_trunc,
+            utf8_hdr_bb,
+            &[BlockArg::Value(cap_i32)],
+            write_len_bb,
+            &[BlockArg::Value(raw_len)],
+        );
+
+        self.b.switch_to_block(utf8_hdr_bb);
+        let cur_len = self.b.block_params(utf8_hdr_bb)[0];
+        let gt0 = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, cur_len, 0);
+        self.b.ins().brif(
+            gt0,
+            utf8_chk_bb,
+            &[],
+            write_len_bb,
+            &[BlockArg::Value(cur_len)],
+        );
+
+        self.b.switch_to_block(utf8_chk_bb);
+        self.b.seal_block(utf8_chk_bb);
+        let cur_p = coerce_cl_val(self.b, cur_len, ptr_ty, ptr_ty);
+        let src_payload = self.b.ins().iadd_imm_s(src_ptr, 4);
+        let chk_addr = self.b.ins().iadd(src_payload, cur_p);
+        let ch_u8 = self
+            .b
+            .ins()
+            .load(types::I8, MemFlagsData::new(), chk_addr, 0);
+        let ch_i32 = self.b.ins().uextend(types::I32, ch_u8);
+        let masked = self.b.ins().band_imm_u(ch_i32, 0xC0);
+        let is_cont = self.b.ins().icmp_imm_s(IntCC::Equal, masked, 0x80);
+        let dec = self.b.ins().iadd_imm_s(cur_len, -1);
+        self.b.ins().brif(
+            is_cont,
+            utf8_hdr_bb,
+            &[BlockArg::Value(dec)],
+            write_len_bb,
+            &[BlockArg::Value(cur_len)],
+        );
+        self.b.seal_block(utf8_hdr_bb);
+
+        self.b.switch_to_block(write_len_bb);
+        self.b.seal_block(write_len_bb);
+        let final_len = self.b.block_params(write_len_bb)[0];
+        self.b
+            .ins()
+            .store(MemFlagsData::new(), final_len, dst_addr, 0);
+        let z32 = self.b.ins().iconst(types::I32, 0);
+        self.b.ins().jump(cp_hdr_bb, &[BlockArg::Value(z32)]);
+
+        self.b.switch_to_block(cp_hdr_bb);
+        let idx = self.b.block_params(cp_hdr_bb)[0];
+        let more = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, final_len);
+        self.b.ins().brif(more, cp_body_bb, &[], done_bb, &[]);
+
+        self.b.switch_to_block(cp_body_bb);
+        self.b.seal_block(cp_body_bb);
+        let idx_p = coerce_cl_val(self.b, idx, ptr_ty, ptr_ty);
+        let sa = self.b.ins().iadd(src_ptr, idx_p);
+        let da = self.b.ins().iadd(dst_addr, idx_p);
+        let byte = self.b.ins().load(types::I8, MemFlagsData::new(), sa, 4);
+        self.b.ins().store(MemFlagsData::new(), byte, da, 4);
+        let nxt = self.b.ins().iadd_imm_s(idx, 1);
+        self.b.ins().jump(cp_hdr_bb, &[BlockArg::Value(nxt)]);
+        self.b.seal_block(cp_hdr_bb);
+
+        self.b.switch_to_block(done_bb);
+        self.b.seal_block(done_bb);
+    }
+
     fn copy_coerced_array_to_mem(
         &mut self,
         src_ptr: Value,
@@ -2291,17 +3084,52 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         dst_len: usize,
     ) {
         let ptr_ty = self.ctx.ptr_ty;
-        let src_stride = self.ctx.layout_size_of_mir_ty(src_elem_ty);
-        let dst_stride = self.ctx.layout_size_of_mir_ty(dst_elem_ty);
+        let src_stride = align_up(
+            self.ctx.layout_size_of_mir_ty(src_elem_ty),
+            self.ctx.mir_ty_align_of(src_elem_ty).max(1),
+        )
+        .max(1);
+        let dst_stride = align_up(
+            self.ctx.layout_size_of_mir_ty(dst_elem_ty),
+            self.ctx.mir_ty_align_of(dst_elem_ty).max(1),
+        )
+        .max(1);
         let copy_len = dst_len.min(src_len);
         if src_len < dst_len {
             let total_dst = dst_len * dst_stride;
-            let zero_b = self.b.ins().iconst(types::I8, 0);
-            for off in 0..total_dst {
-                self.b
-                    .ins()
-                    .store(MemFlagsData::new(), zero_b, dst_ptr, off as i32);
+            self.emit_memzero(dst_ptr, total_dst);
+        }
+        if let MirType::Named(dst_n) = dst_elem_ty
+            && let Some(dst_cap) = inline_str_cap_from_name(dst_n)
+        {
+            for i in 0..copy_len {
+                let s_off = self.b.ins().iadd_imm_s(src_ptr, (i * src_stride) as i64);
+                let d_off = self.b.ins().iadd_imm_s(dst_ptr, (i * dst_stride) as i64);
+                self.emit_copy_inline_str(d_off, dst_cap, s_off);
             }
+            return;
+        }
+        if let Some(dst_bs_bytes) = bitset_bytes_from_mir_ty(dst_elem_ty) {
+            let src_bs_bytes = bitset_bytes_from_mir_ty(src_elem_ty);
+            for i in 0..copy_len {
+                let s_off = self.b.ins().iadd_imm_s(src_ptr, (i * src_stride) as i64);
+                let d_off = self.b.ins().iadd_imm_s(dst_ptr, (i * dst_stride) as i64);
+                self.emit_memzero(d_off, dst_bs_bytes);
+                if let Some(sb) = src_bs_bytes {
+                    emit_memcpy(self.b, d_off, s_off, sb.min(dst_bs_bytes));
+                } else {
+                    let src_cl = self.ctx.cl_type_for_mir_val(src_elem_ty);
+                    let raw = self.b.ins().load(src_cl, MemFlagsData::new(), s_off, 0);
+                    let store_cl = if dst_bs_bytes == 4 {
+                        types::I32
+                    } else {
+                        types::I64
+                    };
+                    let val = coerce_cl_val(self.b, raw, store_cl, ptr_ty);
+                    self.b.ins().store(MemFlagsData::new(), val, d_off, 0);
+                }
+            }
+            return;
         }
         if let (
             MirType::Array {
@@ -2365,13 +3193,134 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         dst_base: Value,
         offset: i32,
     ) {
+        if let MirType::Named(dst_name) = dst_mty
+            && let Some(dst_cap) = inline_str_cap_from_name(dst_name)
+        {
+            let dst_addr = self.b.ins().iadd_imm_s(dst_base, i64::from(offset));
+            let src_ptr = self.use_scalar(val);
+            self.emit_copy_inline_str(dst_addr, dst_cap, src_ptr);
+            return;
+        }
+        if let MirType::Named(dst_name) = dst_mty
+            && let Some((sv_elem_mty, sv_cap)) = parse_smallvec_mir_name(dst_name)
+        {
+            let es = self.ctx.layout_size_of_mir_ty(&sv_elem_mty);
+            let ea = self.ctx.mir_ty_align_of(&sv_elem_mty).max(1);
+            let elem_stride = align_up(es, ea).max(1);
+            let total_sv_bytes = 8 + elem_stride * sv_cap;
+            let dst_addr = self.b.ins().iadd_imm_s(dst_base, i64::from(offset));
+            self.emit_memzero(dst_addr, total_sv_bytes);
+            if let Some(elems) = self.array_elems.get(&val.0).cloned() {
+                let len_u32 = elems.len().min(sv_cap) as i64;
+                let len_v = self.b.ins().iconst(types::I32, len_u32);
+                self.b.ins().store(MemFlagsData::new(), len_v, dst_addr, 0);
+                for (i, &el) in elems.iter().take(sv_cap).enumerate() {
+                    let el_mty = self.effective_local_mir_ty(el).clone();
+                    self.store_typed_field_to_mem(
+                        el,
+                        &el_mty,
+                        &sv_elem_mty,
+                        dst_base,
+                        offset + 8 + (i * elem_stride) as i32,
+                    );
+                }
+                return;
+            }
+            if let MirType::Array {
+                elem: src_elem_ty,
+                len: src_len,
+            } = val_mty
+            {
+                let src_ptr = self.use_scalar(val);
+                let len_v = self
+                    .b
+                    .ins()
+                    .iconst(types::I32, (*src_len).min(sv_cap) as i64);
+                self.b.ins().store(MemFlagsData::new(), len_v, dst_addr, 0);
+                let data_dst = self.b.ins().iadd_imm_s(dst_addr, 8);
+                self.copy_coerced_array_to_mem(
+                    src_ptr,
+                    src_elem_ty,
+                    *src_len,
+                    data_dst,
+                    &sv_elem_mty,
+                    sv_cap,
+                );
+                return;
+            }
+            let src_ptr = self.use_scalar(val);
+            let src_pointee = self
+                .ptr_pointee_tys
+                .get(&val.0)
+                .cloned()
+                .unwrap_or_else(|| val_mty.clone());
+            let src_cap = match &src_pointee {
+                MirType::Named(sn) => parse_smallvec_mir_name(sn)
+                    .map(|(_, c)| c)
+                    .unwrap_or(sv_cap),
+                _ => sv_cap,
+            };
+            let copy_cap = src_cap.min(sv_cap);
+            emit_memcpy(self.b, dst_addr, src_ptr, 8 + copy_cap * elem_stride);
+            let raw_len = self
+                .b
+                .ins()
+                .load(types::I32, MemFlagsData::new(), src_ptr, 0);
+            let cap_v = self.b.ins().iconst(types::I32, sv_cap as i64);
+            let over = self
+                .b
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, raw_len, cap_v);
+            let clamped = self.b.ins().select(over, cap_v, raw_len);
+            self.b
+                .ins()
+                .store(MemFlagsData::new(), clamped, dst_addr, 0);
+            return;
+        }
+        if let Some(dst_bs_bytes) = bitset_bytes_from_mir_ty(dst_mty) {
+            let dst_addr = self.b.ins().iadd_imm_s(dst_base, i64::from(offset));
+            self.emit_memzero(dst_addr, dst_bs_bytes);
+            let val_is_agg_ptr = matches!(val_mty, MirType::Ptr | MirType::MutPtr)
+                || self.ctx.is_agg_mir_ty(val_mty)
+                || self.ptr_pointee_tys.contains_key(&val.0);
+            if val_is_agg_ptr {
+                let src_ptr = self.use_scalar(val);
+                let src_bs_bytes = bitset_bytes_from_mir_ty(val_mty).or_else(|| {
+                    self.ptr_pointee_tys
+                        .get(&val.0)
+                        .and_then(bitset_bytes_from_mir_ty)
+                });
+                let copy_sz = src_bs_bytes.unwrap_or(dst_bs_bytes).min(dst_bs_bytes);
+                emit_memcpy(self.b, dst_addr, src_ptr, copy_sz);
+            } else {
+                let raw = self.use_scalar(val);
+                let store_cl = if dst_bs_bytes == 4 {
+                    types::I32
+                } else {
+                    types::I64
+                };
+                let coerced = coerce_cl_val(self.b, raw, store_cl, self.ctx.ptr_ty);
+                self.b
+                    .ins()
+                    .store(MemFlagsData::new(), coerced, dst_addr, 0);
+            }
+            return;
+        }
         if let MirType::Array {
             elem: dst_elem_ty,
             len: dst_len,
         } = dst_mty
         {
+            let elem_stride = align_up(
+                self.ctx.layout_size_of_mir_ty(dst_elem_ty),
+                self.ctx.mir_ty_align_of(dst_elem_ty).max(1),
+            )
+            .max(1);
             if let Some(elems) = self.array_elems.get(&val.0).cloned() {
-                let elem_stride = self.ctx.layout_size_of_mir_ty(dst_elem_ty);
+                if elems.len() < *dst_len {
+                    let dst_addr = self.b.ins().iadd_imm_s(dst_base, i64::from(offset));
+                    self.emit_memzero(dst_addr, (*dst_len) * elem_stride);
+                }
                 for (i, &el) in elems.iter().take(*dst_len).enumerate() {
                     let el_mty = self.effective_local_mir_ty(el).clone();
                     self.store_typed_field_to_mem(
@@ -2388,7 +3337,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                 elem: src_elem_ty,
                 len: src_len,
             } = val_mty
-                && src_elem_ty != dst_elem_ty
+                && (src_elem_ty != dst_elem_ty || *src_len != *dst_len)
             {
                 let src_ptr = self.use_scalar(val);
                 let dst_addr = self.b.ins().iadd_imm_s(dst_base, i64::from(offset));
@@ -2403,8 +3352,9 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                 return;
             }
         }
-        let val_is_agg_ptr =
-            matches!(val_mty, MirType::Ptr | MirType::MutPtr) || self.ctx.is_agg_mir_ty(val_mty);
+        let val_is_agg_ptr = matches!(val_mty, MirType::Ptr | MirType::MutPtr)
+            || self.ctx.is_agg_mir_ty(val_mty)
+            || self.ptr_pointee_tys.contains_key(&val.0);
         if self.ctx.is_agg_mir_ty(dst_mty) && val_is_agg_ptr {
             let src_ptr = self.use_scalar(val);
             let sz = self.ctx.layout_size_of_mir_ty(dst_mty);
@@ -2428,6 +3378,85 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         offset_bytes: u32,
         val: LocalId,
     ) {
+        let base_mty = self.effective_local_mir_ty(base_ptr).clone();
+        if let Some(base_dims) = vec_dims(&base_mty)
+            && let Some(lanes) = parse_swizzle_lanes(field)
+        {
+            let is_ivec = is_ivec_mir_ty(&base_mty);
+            let rhs = self.vec_or_broadcast_arg(val, lanes.len().min(4) as u8, is_ivec);
+            let lane_cl = if is_ivec { types::I32 } else { types::F32 };
+            match self.local_reps[base_ptr.0 as usize] {
+                LocalRep::Vec(_) => {
+                    let mut cur = self.use_vec_dims(base_ptr, base_dims);
+                    for (i, &l) in lanes.iter().enumerate() {
+                        cur[usize::from(l)] =
+                            coerce_cl_val(self.b, rhs[i], lane_cl, self.ctx.ptr_ty);
+                    }
+                    self.def_vec(base_ptr, cur);
+                }
+                LocalRep::AggVar(v) => {
+                    let ptr = self.b.use_var(v);
+                    for (i, &l) in lanes.iter().enumerate() {
+                        let rv = coerce_cl_val(self.b, rhs[i], lane_cl, self.ctx.ptr_ty);
+                        self.b
+                            .ins()
+                            .store(MemFlagsData::new(), rv, ptr, i32::from(l) * 4);
+                    }
+                }
+                LocalRep::Scalar(v) => {
+                    let ptr = self.b.use_var(v);
+                    if matches!(base_mty, MirType::Ptr | MirType::MutPtr) {
+                        let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, ptr, 0);
+                        let store_bb = self.b.create_block();
+                        let skip_bb = self.b.create_block();
+                        self.b.ins().brif(ok, store_bb, &[], skip_bb, &[]);
+                        self.b.switch_to_block(store_bb);
+                        self.b.seal_block(store_bb);
+                        for (i, &l) in lanes.iter().enumerate() {
+                            let rv = coerce_cl_val(self.b, rhs[i], lane_cl, self.ctx.ptr_ty);
+                            self.b
+                                .ins()
+                                .store(MemFlagsData::new(), rv, ptr, i32::from(l) * 4);
+                        }
+                        self.b.ins().jump(skip_bb, &[]);
+                        self.b.switch_to_block(skip_bb);
+                        self.b.seal_block(skip_bb);
+                    }
+                }
+            }
+            return;
+        }
+        if let Some((parent_field, swiz)) = field.rsplit_once('.')
+            && let Some(lanes) = parse_swizzle_lanes(swiz)
+            && let (parent_off, Some(parent_ty)) = self
+                .ctx
+                .resolve_field_offset_and_ty(layout_key, parent_field)
+            && vec_dims(&parent_ty).is_some()
+        {
+            let bp = self.use_scalar(base_ptr);
+            let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, bp, 0);
+            let store_bb = self.b.create_block();
+            let skip_bb = self.b.create_block();
+            self.b.ins().brif(ok, store_bb, &[], skip_bb, &[]);
+            self.b.switch_to_block(store_bb);
+            self.b.seal_block(store_bb);
+            let is_ivec = is_ivec_mir_ty(&parent_ty);
+            let rhs = self.vec_or_broadcast_arg(val, lanes.len().min(4) as u8, is_ivec);
+            let lane_cl = if is_ivec { types::I32 } else { types::F32 };
+            for (i, &l) in lanes.iter().enumerate() {
+                let rv = coerce_cl_val(self.b, rhs[i], lane_cl, self.ctx.ptr_ty);
+                self.b.ins().store(
+                    MemFlagsData::new(),
+                    rv,
+                    bp,
+                    parent_off as i32 + i32::from(l) * 4,
+                );
+            }
+            self.b.ins().jump(skip_bb, &[]);
+            self.b.switch_to_block(skip_bb);
+            self.b.seal_block(skip_bb);
+            return;
+        }
         let bp = self.use_scalar(base_ptr);
         let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, bp, 0);
         let store_bb = self.b.create_block();
@@ -2677,23 +3706,36 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             let tmp = self.use_scalar(entity);
             coerce_cl_val(self.b, tmp, types::I64, ptr_ty)
         };
-        let rel_idx = self.ctx.relation_map.get(relation).copied().or_else(|| {
-            relation
-                .rsplit("::")
-                .next()
-                .and_then(|s| self.ctx.relation_map.get(s).copied())
-        });
-        let rel_v = if let Some(ri) = rel_idx {
+        let rel_v = if is_child_of_rel(relation) {
+            self.b
+                .ins()
+                .iconst(types::I32, i64::from(BAM_COMPONENT_INVALID))
+        } else if let Some(parent_lidx) = self.custom_rel_parent_layout_idx(relation) {
             self.b.ins().load(
                 types::I32,
                 MemFlagsData::trusted(),
                 self.state_ptr,
-                self.ctx.state_layout.rel_slot_offset(ri) as i32,
+                self.ctx.state_layout.comp_slot_offset(parent_lidx) as i32,
             )
         } else {
-            self.b
-                .ins()
-                .iconst(types::I32, i64::from(BAM_COMPONENT_INVALID))
+            let rel_idx = self.ctx.relation_map.get(relation).copied().or_else(|| {
+                relation
+                    .rsplit("::")
+                    .next()
+                    .and_then(|s| self.ctx.relation_map.get(s).copied())
+            });
+            if let Some(ri) = rel_idx {
+                self.b.ins().load(
+                    types::I32,
+                    MemFlagsData::trusted(),
+                    self.state_ptr,
+                    self.ctx.state_layout.rel_slot_offset(ri) as i32,
+                )
+            } else {
+                self.b
+                    .ins()
+                    .iconst(types::I32, i64::from(BAM_COMPONENT_INVALID))
+            }
         };
 
         let zero_p = self.b.ins().iconst(ptr_ty, 0);
@@ -4189,18 +5231,36 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
 
     pub(super) fn lower_cmd_despawn_all(&mut self, filter: &str) -> Result<(), JitError> {
         let ptr_ty = self.ctx.ptr_ty;
-        let mut comp_indices = Vec::new();
+        let mut filter_terms: Vec<(usize, u32, u16)> = Vec::new();
         for tok in filter.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let clean = tok
-                .strip_prefix("With<")
+            let (clean, mode_u, flags_u) = if let Some(inner) = tok
+                .strip_prefix("Without<")
                 .and_then(|s| s.strip_suffix('>'))
-                .unwrap_or(tok)
-                .trim();
+            {
+                (inner.trim(), AccessMode::WITHOUT.0, 0u16)
+            } else if let Some(inner) = tok.strip_prefix("With<").and_then(|s| s.strip_suffix('>'))
+            {
+                (inner.trim(), AccessMode::FILTER_ONLY.0, 0u16)
+            } else if let Some(inner) = tok.strip_prefix("Added<").and_then(|s| s.strip_suffix('>'))
+            {
+                (
+                    inner.trim(),
+                    AccessMode::FILTER_ONLY.0,
+                    bamabi_sys::BAM_TERM_FLAG_ADDED,
+                )
+            } else if let Some(inner) = tok
+                .strip_prefix("Changed<")
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                (inner.trim(), ACCESS_MODE_CHANGED, 0u16)
+            } else {
+                (tok.trim(), AccessMode::FILTER_ONLY.0, 0u16)
+            };
             if let Some(lidx) = lookup_name_in_map(&self.ctx.layout_map, clean) {
-                comp_indices.push(lidx);
+                filter_terms.push((lidx, mode_u, flags_u));
             }
         }
-        if comp_indices.is_empty() {
+        if filter_terms.is_empty() {
             return Ok(());
         }
         let cmds = self.ensure_commands();
@@ -4212,13 +5272,9 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         self.b.switch_to_block(do_bb);
         self.b.seal_block(do_bb);
         let terms_slot =
-            alloc_zero_slot(self.b, comp_indices.len() * structs::TERM_DESC_SIZE, ptr_ty);
+            alloc_zero_slot(self.b, filter_terms.len() * structs::TERM_DESC_SIZE, ptr_ty);
         let terms_ptr = self.b.ins().stack_addr(ptr_ty, terms_slot, 0);
-        let mode_filter = self
-            .b
-            .ins()
-            .iconst(types::I32, i64::from(AccessMode::FILTER_ONLY.0));
-        for (i, lidx) in comp_indices.iter().enumerate() {
+        for (i, (lidx, mode_u, flags_u)) in filter_terms.iter().enumerate() {
             let base = (i * structs::TERM_DESC_SIZE) as i32;
             let comp = self.b.ins().load(
                 types::I32,
@@ -4226,6 +5282,8 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                 self.state_ptr,
                 self.ctx.state_layout.comp_slot_offset(*lidx) as i32,
             );
+            let mode_v = self.b.ins().iconst(types::I32, i64::from(*mode_u));
+            let flags_v = self.b.ins().iconst(types::I16, i64::from(*flags_u));
             self.b.ins().store(
                 MemFlagsData::trusted(),
                 comp,
@@ -4234,12 +5292,18 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             );
             self.b.ins().store(
                 MemFlagsData::trusted(),
-                mode_filter,
+                mode_v,
                 terms_ptr,
                 base + structs::TERM_MODE as i32,
             );
+            self.b.ins().store(
+                MemFlagsData::trusted(),
+                flags_v,
+                terms_ptr,
+                base + structs::TERM_FLAGS as i32,
+            );
         }
-        let tc = self.b.ins().iconst(ptr_ty, comp_indices.len() as i64);
+        let tc = self.b.ins().iconst(ptr_ty, filter_terms.len() as i64);
         let _rc = call_vtable(
             &self.ctx.obj_mod,
             self.b,
@@ -4514,6 +5578,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                     || !wq.with_filters.is_empty()
                     || !wq.without_filters.is_empty()
                     || !wq.extra_changed_filters.is_empty()
+                    || !wq.extra_added_filters.is_empty()
             })
             .count();
         let base_q = non_empty_wire + entry.extra_obj_queries.len();
@@ -4769,17 +5834,65 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         target: LocalId,
         payload: Option<LocalId>,
     ) {
-        let Some(&ri) = self.ctx.relation_map.get(relation).or_else(|| {
+        let ptr_ty = self.ctx.ptr_ty;
+        let ent = self.use_scalar(entity);
+        let tgt = {
+            let tmp = self.use_scalar(target);
+            coerce_cl_val(self.b, tmp, types::I64, ptr_ty)
+        };
+        if is_child_of_rel(relation) {
+            let cmds = self.ensure_commands();
+            let comp = self.b.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                self.state_ptr,
+                self.ctx.state_layout.child_of_comp_off as i32,
+            );
+            let cmds_ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, cmds, 0);
+            let comp_nz = self.b.ins().icmp_imm_s(IntCC::NotEqual, comp, 0);
+            let comp_valid =
+                self.b
+                    .ins()
+                    .icmp_imm_s(IntCC::NotEqual, comp, i64::from(BAM_COMPONENT_INVALID));
+            let c0 = self.b.ins().band(cmds_ok, comp_nz);
+            let ok = self.b.ins().band(c0, comp_valid);
+            let do_bb = self.b.create_block();
+            let done_bb = self.b.create_block();
+            self.b.ins().brif(ok, do_bb, &[], done_bb, &[]);
+
+            self.b.switch_to_block(do_bb);
+            self.b.seal_block(do_bb);
+            let slot = alloc_zero_slot(self.b, 8, ptr_ty);
+            let dptr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+            self.b.ins().store(MemFlagsData::trusted(), tgt, dptr, 0);
+            let dlen = self.b.ins().iconst(ptr_ty, 8);
+            let _rc = call_vtable(
+                &self.ctx.obj_mod,
+                self.b,
+                self.api_ptr,
+                api_slots::CMD_INSERT,
+                &[ptr_ty, types::I64, types::I32, ptr_ty, ptr_ty],
+                Some(types::I32),
+                ptr_ty,
+                self.ctx.call_conv,
+                &[cmds, ent, comp, dptr, dlen],
+            );
+            self.b.ins().jump(done_bb, &[]);
+
+            self.b.switch_to_block(done_bb);
+            self.b.seal_block(done_bb);
+            return;
+        }
+        let rel_idx = self.ctx.relation_map.get(relation).copied().or_else(|| {
             relation
                 .rsplit("::")
                 .next()
-                .and_then(|s| self.ctx.relation_map.get(s))
-        }) else {
+                .and_then(|s| self.ctx.relation_map.get(s).copied())
+        });
+        let parent_lidx = self.custom_rel_parent_layout_idx(relation);
+        if rel_idx.is_none() && parent_lidx.is_none() {
             return;
-        };
-        let ptr_ty = self.ctx.ptr_ty;
-        let ent = self.use_scalar(entity);
-        let tgt = self.use_scalar(target);
+        }
         let cmds = self.ensure_commands();
         let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, cmds, 0);
         let do_bb = self.b.create_block();
@@ -4788,41 +5901,65 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
 
         self.b.switch_to_block(do_bb);
         self.b.seal_block(do_bb);
-        let rel_comp = self.b.ins().load(
-            types::I32,
-            MemFlagsData::trusted(),
-            self.state_ptr,
-            self.ctx.state_layout.rel_slot_offset(ri) as i32,
-        );
-        let sz = self.ctx.relations[ri].payload_size;
-        let dptr = if sz == 0 {
-            self.b.ins().iconst(ptr_ty, 0)
-        } else if let Some(pl) = payload {
-            let mty = &self.mir_fn.locals[pl.0 as usize].ty;
-            if matches!(mty, MirType::Ptr | MirType::MutPtr) || self.ctx.is_agg_mir_ty(mty) {
-                self.use_scalar(pl)
+        if let Some(ri) = rel_idx {
+            let rel_comp = self.b.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                self.state_ptr,
+                self.ctx.state_layout.rel_slot_offset(ri) as i32,
+            );
+            let sz = self.ctx.relations[ri].payload_size;
+            let dptr = if sz == 0 {
+                self.b.ins().iconst(ptr_ty, 0)
+            } else if let Some(pl) = payload {
+                let mty = self.effective_local_mir_ty(pl).clone();
+                if matches!(mty, MirType::Ptr | MirType::MutPtr) || self.ctx.is_agg_mir_ty(&mty) {
+                    self.use_scalar(pl)
+                } else {
+                    let s = alloc_zero_slot(self.b, sz.max(8), ptr_ty);
+                    let sp = self.b.ins().stack_addr(ptr_ty, s, 0);
+                    self.store_local_to_mem(pl, &mty, sp, 0);
+                    sp
+                }
             } else {
-                let s = alloc_zero_slot(self.b, sz.max(8), ptr_ty);
-                let sp = self.b.ins().stack_addr(ptr_ty, s, 0);
-                let cloned = mty.clone();
-                self.store_local_to_mem(pl, &cloned, sp, 0);
-                sp
-            }
-        } else {
-            self.b.ins().iconst(ptr_ty, 0)
-        };
-        let dlen = self.b.ins().iconst(ptr_ty, sz as i64);
-        let _rc = call_vtable(
-            &self.ctx.obj_mod,
-            self.b,
-            self.api_ptr,
-            api_slots::CMD_INSERT_RELATION,
-            &[ptr_ty, types::I64, types::I32, types::I64, ptr_ty, ptr_ty],
-            Some(types::I32),
-            ptr_ty,
-            self.ctx.call_conv,
-            &[cmds, ent, rel_comp, tgt, dptr, dlen],
-        );
+                self.b.ins().iconst(ptr_ty, 0)
+            };
+            let dlen = self.b.ins().iconst(ptr_ty, sz as i64);
+            let _rc = call_vtable(
+                &self.ctx.obj_mod,
+                self.b,
+                self.api_ptr,
+                api_slots::CMD_INSERT_RELATION,
+                &[ptr_ty, types::I64, types::I32, types::I64, ptr_ty, ptr_ty],
+                Some(types::I32),
+                ptr_ty,
+                self.ctx.call_conv,
+                &[cmds, ent, rel_comp, tgt, dptr, dlen],
+            );
+        }
+        if let Some(plidx) = parent_lidx {
+            let pcomp = self.b.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                self.state_ptr,
+                self.ctx.state_layout.comp_slot_offset(plidx) as i32,
+            );
+            let slot = alloc_zero_slot(self.b, 8, ptr_ty);
+            let dptr = self.b.ins().stack_addr(ptr_ty, slot, 0);
+            self.b.ins().store(MemFlagsData::trusted(), tgt, dptr, 0);
+            let dlen = self.b.ins().iconst(ptr_ty, 8);
+            let _prc = call_vtable(
+                &self.ctx.obj_mod,
+                self.b,
+                self.api_ptr,
+                api_slots::CMD_INSERT,
+                &[ptr_ty, types::I64, types::I32, ptr_ty, ptr_ty],
+                Some(types::I32),
+                ptr_ty,
+                self.ctx.call_conv,
+                &[cmds, ent, pcomp, dptr, dlen],
+            );
+        }
         self.b.ins().jump(done_bb, &[]);
 
         self.b.switch_to_block(done_bb);
@@ -4835,17 +5972,58 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         entity: LocalId,
         target: LocalId,
     ) {
-        let Some(&ri) = self.ctx.relation_map.get(relation).or_else(|| {
-            relation
-                .rsplit("::")
-                .next()
-                .and_then(|s| self.ctx.relation_map.get(s))
-        }) else {
-            return;
-        };
         let ptr_ty = self.ctx.ptr_ty;
         let ent = self.use_scalar(entity);
         let tgt = self.use_scalar(target);
+        if is_child_of_rel(relation) {
+            let cmds = self.ensure_commands();
+            let comp = self.b.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                self.state_ptr,
+                self.ctx.state_layout.child_of_comp_off as i32,
+            );
+            let cmds_ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, cmds, 0);
+            let comp_nz = self.b.ins().icmp_imm_s(IntCC::NotEqual, comp, 0);
+            let comp_valid =
+                self.b
+                    .ins()
+                    .icmp_imm_s(IntCC::NotEqual, comp, i64::from(BAM_COMPONENT_INVALID));
+            let c0 = self.b.ins().band(cmds_ok, comp_nz);
+            let ok = self.b.ins().band(c0, comp_valid);
+            let do_bb = self.b.create_block();
+            let done_bb = self.b.create_block();
+            self.b.ins().brif(ok, do_bb, &[], done_bb, &[]);
+
+            self.b.switch_to_block(do_bb);
+            self.b.seal_block(do_bb);
+            let _rc = call_vtable(
+                &self.ctx.obj_mod,
+                self.b,
+                self.api_ptr,
+                api_slots::CMD_REMOVE,
+                &[ptr_ty, types::I64, types::I32],
+                Some(types::I32),
+                ptr_ty,
+                self.ctx.call_conv,
+                &[cmds, ent, comp],
+            );
+            self.b.ins().jump(done_bb, &[]);
+
+            self.b.switch_to_block(done_bb);
+            self.b.seal_block(done_bb);
+            return;
+        }
+        let rel_idx = self.ctx.relation_map.get(relation).copied().or_else(|| {
+            relation
+                .rsplit("::")
+                .next()
+                .and_then(|s| self.ctx.relation_map.get(s).copied())
+        });
+        let parent_lidx = self.custom_rel_parent_layout_idx(relation);
+        if rel_idx.is_none() && parent_lidx.is_none() {
+            return;
+        }
         let cmds = self.ensure_commands();
         let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, cmds, 0);
         let do_bb = self.b.create_block();
@@ -4854,27 +6032,54 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
 
         self.b.switch_to_block(do_bb);
         self.b.seal_block(do_bb);
-        let rel_comp = self.b.ins().load(
-            types::I32,
-            MemFlagsData::trusted(),
-            self.state_ptr,
-            self.ctx.state_layout.rel_slot_offset(ri) as i32,
-        );
-        let _rc = call_vtable(
-            &self.ctx.obj_mod,
-            self.b,
-            self.api_ptr,
-            api_slots::CMD_REMOVE_RELATION,
-            &[ptr_ty, types::I64, types::I32, types::I64],
-            Some(types::I32),
-            ptr_ty,
-            self.ctx.call_conv,
-            &[cmds, ent, rel_comp, tgt],
-        );
+        if let Some(ri) = rel_idx {
+            let rel_comp = self.b.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                self.state_ptr,
+                self.ctx.state_layout.rel_slot_offset(ri) as i32,
+            );
+            let _rc = call_vtable(
+                &self.ctx.obj_mod,
+                self.b,
+                self.api_ptr,
+                api_slots::CMD_REMOVE_RELATION,
+                &[ptr_ty, types::I64, types::I32, types::I64],
+                Some(types::I32),
+                ptr_ty,
+                self.ctx.call_conv,
+                &[cmds, ent, rel_comp, tgt],
+            );
+        }
+        if let Some(plidx) = parent_lidx {
+            let pcomp = self.b.ins().load(
+                types::I32,
+                MemFlagsData::trusted(),
+                self.state_ptr,
+                self.ctx.state_layout.comp_slot_offset(plidx) as i32,
+            );
+            let _prc = call_vtable(
+                &self.ctx.obj_mod,
+                self.b,
+                self.api_ptr,
+                api_slots::CMD_REMOVE,
+                &[ptr_ty, types::I64, types::I32],
+                Some(types::I32),
+                ptr_ty,
+                self.ctx.call_conv,
+                &[cmds, ent, pcomp],
+            );
+        }
         self.b.ins().jump(done_bb, &[]);
 
         self.b.switch_to_block(done_bb);
         self.b.seal_block(done_bb);
+    }
+
+    fn custom_rel_parent_layout_idx(&self, relation: &str) -> Option<usize> {
+        let short_r = relation.rsplit("::").next().unwrap_or(relation);
+        let comp_short = format!("__strata_rel_parent_{short_r}");
+        lookup_name_in_map(&self.ctx.layout_map, &comp_short)
     }
 
     pub(super) fn lower_table_load(
@@ -4884,33 +6089,156 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         key: LocalId,
         field: &str,
     ) {
-        let Some(tbl) = self.ctx.tables.get(table_name).cloned() else {
-            self.def_zero_for_local(dst);
-            return;
-        };
-        let Some((foff, fmty)) = tbl.fields.get(field).cloned() else {
+        let Some(tbl) = self.ctx.resolve_table_by_key(table_name).cloned() else {
             self.def_zero_for_local(dst);
             return;
         };
         let ptr_ty = self.ctx.ptr_ty;
-        let raw_k = {
-            let __tmp = self.use_scalar(key);
-            coerce_cl_val(self.b, __tmp, ptr_ty, ptr_ty)
+        let raw_k_orig = self.use_scalar(key);
+        let raw_k_cl = self.b.func.dfg.value_type(raw_k_orig);
+        let key_mty = self.effective_local_mir_ty(key).clone();
+        let key_signed = tbl.key_is_signed
+            || is_signed_int_ty(&key_mty)
+            || self
+                .ctx
+                .enum_scalar_mir_ty(&key_mty)
+                .is_some_and(|st| is_signed_int_ty(&st));
+        let key_i64 = if raw_k_cl == types::I64 {
+            raw_k_orig
+        } else if raw_k_cl.bits() < 64 {
+            if key_signed {
+                self.b.ins().sextend(types::I64, raw_k_orig)
+            } else {
+                self.b.ins().uextend(types::I64, raw_k_orig)
+            }
+        } else {
+            coerce_cl_val(self.b, raw_k_orig, types::I64, ptr_ty)
         };
-        let in_range =
+
+        let safe_idx_ptr = if let Some(keys_id) = tbl.keys_data_id {
+            let kgv = self.ctx.obj_mod.declare_data_in_func(keys_id, self.b.func);
+            let kptr = self.b.ins().symbol_value(ptr_ty, kgv);
+            let z64 = self.b.ins().iconst(types::I64, 0);
+            let n64 = self.b.ins().iconst(types::I64, tbl.row_count as i64);
+
+            let bs_hdr = self.b.create_block();
+            let bs_body = self.b.create_block();
+            let bs_done = self.b.create_block();
+            self.b.append_block_param(bs_hdr, types::I64);
+            self.b.append_block_param(bs_hdr, types::I64);
             self.b
                 .ins()
-                .icmp_imm_s(IntCC::UnsignedLessThan, raw_k, tbl.row_count as i64);
-        let z = self.b.ins().iconst(ptr_ty, 0);
-        let safe_k = self.b.ins().select(in_range, raw_k, z);
+                .jump(bs_hdr, &[BlockArg::Value(z64), BlockArg::Value(n64)]);
+
+            self.b.switch_to_block(bs_hdr);
+            let lo = self.b.block_params(bs_hdr)[0];
+            let hi = self.b.block_params(bs_hdr)[1];
+            let cont = self.b.ins().icmp(IntCC::UnsignedLessThan, lo, hi);
+            self.b.ins().brif(cont, bs_body, &[], bs_done, &[]);
+
+            self.b.switch_to_block(bs_body);
+            self.b.seal_block(bs_body);
+            let sum = self.b.ins().iadd(lo, hi);
+            let mid = self.b.ins().ushr_imm_u(sum, 1);
+            let mid_p = coerce_cl_val(self.b, mid, ptr_ty, ptr_ty);
+            let m_off = self.b.ins().imul_imm_s(mid_p, 8);
+            let m_addr = self.b.ins().iadd(kptr, m_off);
+            let k_mid = self
+                .b
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), m_addr, 0);
+            let is_lt = self.b.ins().icmp(IntCC::SignedLessThan, k_mid, key_i64);
+            let mid_p1 = self.b.ins().iadd_imm_s(mid, 1);
+            let next_lo = self.b.ins().select(is_lt, mid_p1, lo);
+            let next_hi = self.b.ins().select(is_lt, hi, mid);
+            self.b.ins().jump(
+                bs_hdr,
+                &[BlockArg::Value(next_lo), BlockArg::Value(next_hi)],
+            );
+            self.b.seal_block(bs_hdr);
+
+            self.b.switch_to_block(bs_done);
+            self.b.seal_block(bs_done);
+            let lo_ok = self.b.ins().icmp(IntCC::UnsignedLessThan, lo, n64);
+            let chk_bb = self.b.create_block();
+            let miss_bb = self.b.create_block();
+            let resolved_bb = self.b.create_block();
+            self.b.append_block_param(resolved_bb, ptr_ty);
+            self.b.ins().brif(lo_ok, chk_bb, &[], miss_bb, &[]);
+
+            self.b.switch_to_block(chk_bb);
+            self.b.seal_block(chk_bb);
+            let lo_p = coerce_cl_val(self.b, lo, ptr_ty, ptr_ty);
+            let l_off = self.b.ins().imul_imm_s(lo_p, 8);
+            let l_addr = self.b.ins().iadd(kptr, l_off);
+            let k_at_lo = self
+                .b
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), l_addr, 0);
+            let eq = self.b.ins().icmp(IntCC::Equal, k_at_lo, key_i64);
+            let zp = self.b.ins().iconst(ptr_ty, 0);
+            let idx_p = self.b.ins().select(eq, lo_p, zp);
+            self.b.ins().jump(resolved_bb, &[BlockArg::Value(idx_p)]);
+
+            self.b.switch_to_block(miss_bb);
+            self.b.seal_block(miss_bb);
+            let zp2 = self.b.ins().iconst(ptr_ty, 0);
+            self.b.ins().jump(resolved_bb, &[BlockArg::Value(zp2)]);
+
+            self.b.switch_to_block(resolved_bb);
+            self.b.seal_block(resolved_bb);
+            self.b.block_params(resolved_bb)[0]
+        } else {
+            let raw_k_ptr = coerce_cl_val(self.b, key_i64, ptr_ty, ptr_ty);
+            let in_range =
+                self.b
+                    .ins()
+                    .icmp_imm_s(IntCC::UnsignedLessThan, key_i64, tbl.row_count as i64);
+            let z = self.b.ins().iconst(ptr_ty, 0);
+            self.b.ins().select(in_range, raw_k_ptr, z)
+        };
+
         let gv = self
             .ctx
             .obj_mod
             .declare_data_in_func(tbl.data_id, self.b.func);
         let tbl_ptr = self.b.ins().symbol_value(ptr_ty, gv);
-        let row_off = self.b.ins().imul_imm_s(safe_k, tbl.row_stride as i64);
+        let row_off = self.b.ins().imul_imm_s(safe_idx_ptr, tbl.row_stride as i64);
         let row_ptr = self.b.ins().iadd(tbl_ptr, row_off);
-        self.load_local_from_mem(dst, &fmty, row_ptr, foff as i32);
+
+        if field.is_empty() {
+            let dst_mty = self.effective_local_mir_ty(dst).clone();
+            if matches!(dst_mty, MirType::Ptr | MirType::MutPtr) || self.ctx.is_agg_mir_ty(&dst_mty)
+            {
+                self.def_scalar_typed(dst, row_ptr);
+                self.ptr_pointee_tys.insert(dst.0, dst_mty);
+            } else {
+                self.load_local_from_mem(dst, &dst_mty, row_ptr, 0);
+            }
+            return;
+        }
+        let (foff, fmty_opt) = if let Some((off, mty)) = tbl.fields.get(field) {
+            (*off, Some(mty.clone()))
+        } else {
+            self.ctx.resolve_field_offset_and_ty(table_name, field)
+        };
+        let Some(fmty) = fmty_opt else {
+            self.def_zero_for_local(dst);
+            return;
+        };
+        if let Some(scalar_mty) = self.ctx.enum_scalar_mir_ty(&fmty) {
+            self.load_local_from_mem(dst, &scalar_mty, row_ptr, foff as i32);
+        } else if self.ctx.is_agg_mir_ty(&fmty) {
+            let fptr = self.b.ins().iadd_imm_s(row_ptr, foff as i64);
+            self.def_scalar_typed(dst, fptr);
+            self.ptr_pointee_tys.insert(dst.0, fmty.clone());
+            if let MirType::Array { elem, len } = fmty {
+                self.array_ptr_lens.insert(dst.0, len);
+                self.ptr_elem_tys.insert(dst.0, *elem);
+            }
+        } else {
+            self.load_local_from_mem(dst, &fmty, row_ptr, foff as i32);
+        }
     }
 
     pub(super) fn lower_curve_sample(&mut self, dst: LocalId, curve_name: &str, x: LocalId) {
@@ -5058,4 +6386,22 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let final_y = self.b.block_params(done_bb)[0];
         self.def_scalar_typed(dst, final_y);
     }
+}
+
+fn parse_swizzle_lanes(field: &str) -> Option<Vec<u8>> {
+    if field.is_empty() || field.len() > 4 {
+        return None;
+    }
+    let mut lanes = Vec::with_capacity(field.len());
+    for c in field.chars() {
+        let l = match c {
+            'x' | 'r' => 0,
+            'y' | 'g' => 1,
+            'z' | 'b' => 2,
+            'w' | 'a' => 3,
+            _ => return None,
+        };
+        lanes.push(l);
+    }
+    Some(lanes)
 }

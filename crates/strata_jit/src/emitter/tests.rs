@@ -534,11 +534,13 @@ sys readonly_shared() {
                 layout_idx,
                 mode,
                 changed,
+                added: false,
             })
             .collect(),
         with_filters,
         without_filters,
         extra_changed_filters,
+        extra_added_filters: Vec::new(),
         param_set_group: 0,
     };
 
@@ -730,4 +732,115 @@ schedule FixedUpdate {}
             .unwrap_or_else(|e| panic!("{name} x86_64 PIC emit failed: {e}"));
         assert!(!art.object_bytes.is_empty());
     }
+}
+
+#[test]
+fn schedule_topology_avoids_seq_static_edges_and_honors_modifiers_added_and_stream() {
+    let src = r#"
+module test::sw_eq_unit @version(1.0.0);
+
+component Tag { v: i32 = 0 }
+stream Ping { code: u32 }
+
+sys f_a() {}
+sys f_b() {}
+sys s_a() {}
+sys s_b() {}
+sys s_c() {}
+sys m1() {}
+sys m2() {}
+sys p1() {}
+sys p2() {}
+sys scan_added() {
+    for _r in query(t: &Tag).added<Tag>() {}
+}
+
+schedule Update {
+    seq Main { f_a, f_b }
+    seq Outer { s_a, seq Inner { s_b, s_c } }
+    seq Wrap {
+        m2 after(m1)
+        m1
+        par S2 after(S1) { p2 }
+        par S1 { p1 }
+    }
+    seq_weak WeakSeq {
+        par WA { scan_added }
+        par WB { scan_added }
+    }
+}
+"#;
+    let sema = strata_sema::analyze_source("sw_eq_unit.strata", src);
+    assert!(sema.ok(), "sema: {:?}", sema.diagnostics);
+    let mir = strata_mir::lower_to_mir(&sema);
+
+    let triple = target_lexicon::Triple::host();
+    let isa_b = cranelift_codegen::isa::lookup(triple.clone()).expect("host isa");
+    let isa = isa_b
+        .finish(cranelift_codegen::settings::Flags::new(
+            cranelift_codegen::settings::builder(),
+        ))
+        .unwrap();
+    let fe_cfg = isa.frontend_config();
+    let call_conv = isa.default_call_conv();
+    let ptr_ty = Type::triple_pointer_type(&triple);
+    let ptr_bytes = usize::from(fe_cfg.pointer_bytes());
+    let obj_builder = cranelift_object::ObjectBuilder::new(
+        isa,
+        "sw_eq_unit",
+        cranelift_module::default_libcall_names(),
+    )
+    .unwrap();
+    let obj_mod = ObjectModule::new(obj_builder);
+    let ctx = build_module_context(&mir, obj_mod, triple, ptr_ty, ptr_bytes, call_conv, fe_cfg)
+        .expect("build_module_context");
+
+    let find_sys = |name: &str| -> &SystemRegistrationEntry {
+        ctx.systems
+            .iter()
+            .find(|s| ctx.mir.functions[s.fn_idx].name == name)
+            .unwrap_or_else(|| panic!("missing system `{name}`"))
+    };
+
+    // BUG-SW-02b: direct sibling leaves in `seq Main` / `seq Inner` must NOT bake immutable static `after`.
+    assert!(find_sys("f_b").after_names.is_empty());
+    assert!(
+        !find_sys("s_c")
+            .after_names
+            .contains(&find_sys("s_b").name_data_id)
+    );
+
+    // BUG-SW-07c: `m2 after(m1), m1` in `seq Wrap` orders `m1` ahead of `m2` (`sched_order`) with no cycle,
+    // and `par S2 after(S1)` populates `after_set_indices` / `before_set_indices`.
+    let sym_m1 = find_sys("m1");
+    let sym_m2 = find_sys("m2");
+    assert!(sym_m1.sched_order < sym_m2.sched_order);
+    assert_eq!(sym_m2.after_names, vec![sym_m1.name_data_id]);
+
+    assert!(ctx.schedule_sets.iter().any(|s| {
+        (s.flags & SCHEDULE_SET_FLAG_BEFORE_WEAK) != 0 && !s.before_set_indices.is_empty()
+    }));
+    assert!(ctx.schedule_sets.iter().any(|s| {
+        (s.flags & SCHEDULE_SET_FLAG_AFTER_WEAK) != 0 && !s.after_set_indices.is_empty()
+    }));
+
+    // EQ-07: `.added<Tag>()` propagates into `WireTermSpec::added` or `extra_added_filters`.
+    let sa = find_sys("scan_added");
+    assert!(
+        sa.wire_queries
+            .iter()
+            .any(|q| q.terms.iter().any(|t| t.added) || !q.extra_added_filters.is_empty()),
+        "expected added filter on scan_added query"
+    );
+
+    // EQ-02 / GF-14: standalone `stream` layout exists and marks `SchemaItemKind::Stream`.
+    let ping_layout = ctx
+        .mir_layouts_sorted
+        .iter()
+        .find(|l| l.canonical_name.ends_with("::Ping"))
+        .expect("Ping stream layout");
+    assert_eq!(
+        ping_layout.item_kind,
+        strata_sema::layout::SchemaItemKind::Stream
+    );
 }

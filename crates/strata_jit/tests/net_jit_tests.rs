@@ -4793,3 +4793,362 @@ int main(void) {{
         String::from_utf8_lossy(&run.stderr)
     );
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn jit_regression_nt01_nt03_nt09_narrow_clamp_soa_and_wide_quantize() {
+    use strata_jit::abi_offsets::{HOST_API_SLOTS, api_slots};
+    let src = r#"
+module test::jit_nt_regs @version(1.0.0);
+
+@net(reliable, channel = 0)
+@authority(server)
+component NarrowWide {
+    @quantize(min = 0.0, max = 510.0, bits = 8)
+    v_u8: u8 = 255,
+    @quantize(min = -128.0, max = 382.0, bits = 8)
+    v_i8: i8 = 127,
+    @quantize(min = 0.0, max = 131070.0, bits = 16)
+    v_u16: u16 = 65535,
+    @quantize(min = -32768.0, max = 98302.0, bits = 16)
+    v_i16: i16 = 32767,
+    @quantize(min = -1e308, max = 1e308, bits = 16)
+    huge_mid: f64 = 1234.5,
+    @quantize(min = -1e308, max = 1e308, bits = 16)
+    huge_hi: f64 = 9.0e307,
+}
+
+@soa
+@authority(server)
+@net(reliable, channel = 1)
+component NetBody {
+    hot {
+        pos: vec2 = vec2(0.0, 0.0),
+    }
+    cold telemetry {
+        id: u32 = 1,
+    }
+}
+
+schedule FixedUpdate {}
+"#;
+    let analyzed = analyze_source("jit_nt_regs.strata", src);
+    assert!(analyzed.ok(), "sema: {:?}", analyzed.diagnostics);
+    let mir = lower_to_mir(&analyzed);
+
+    let tmp = TempDir::new().expect("tempdir");
+    let art = compile_module_to_dylib(
+        &mir,
+        &JitCompileOptions {
+            out_dir: tmp.path().to_path_buf(),
+            module_stem: "jit_nt_regs".to_owned(),
+            opt_level: JitOptLevel::Speed,
+        },
+    )
+    .expect("compile_module_to_dylib");
+
+    let nw_layout = mir
+        .layouts
+        .iter()
+        .find(|l| l.canonical_name.ends_with("::NarrowWide"))
+        .expect("NarrowWide");
+    let hot_layout = mir
+        .layouts
+        .iter()
+        .find(|l| l.canonical_name.ends_with("::NetBody"))
+        .expect("NetBody");
+    let cold_layout = mir
+        .layouts
+        .iter()
+        .find(|l| l.canonical_name.ends_with("::NetBody__telemetry"))
+        .expect("NetBody__telemetry");
+    let pkt_canon = strata_codegen::net::STRATA_NET_PACKET_CANONICAL_NAME;
+    let pkt_fp = strata_codegen::net::STRATA_NET_PACKET_SCHEMA_FINGERPRINT;
+    let off = |l: &strata_sema::layout::SolvedLayout, f: &str| {
+        l.fields.iter().find(|sf| sf.name == f).unwrap().offset
+    };
+
+    let word = std::mem::size_of::<usize>();
+    let sidx = |slot: usize| (slot - 8) / word;
+    let s_hc = sidx(api_slots::LOAD_HOST_CTX);
+    let s_reg_c = sidx(api_slots::REGISTER_COMPONENT);
+    let s_res = sidx(api_slots::RESOLVE_COMPONENT);
+    let s_sq = sidx(api_slots::SYS_QUERY);
+    let s_next = sidx(api_slots::ITER_NEXT_CHUNK);
+    let s_rst = sidx(api_slots::ITER_RESET);
+    let s_ents = sidx(api_slots::ITER_ENTITIES);
+    let s_col_ro = sidx(api_slots::ITER_COLUMN_READONLY);
+    let s_col_mut = sidx(api_slots::ITER_COLUMN_MUTABLE);
+    let s_col_mut_u = sidx(api_slots::ITER_COLUMN_MUTABLE_UNTRACKED);
+    let s_mark = sidx(api_slots::ITER_MARK_CHANGED_RANGE);
+    let s_msg_r = sidx(api_slots::MSG_READ_BATCH);
+    let s_msg_w = sidx(api_slots::MSG_WRITE_BATCH);
+    let s_linfo = sidx(api_slots::COMPONENT_LAYOUT_INFO);
+    let s_reg_sh = sidx(api_slots::REGISTER_SYSTEM_HANDLE);
+    let s_reg_s = sidx(api_slots::REGISTER_SYSTEM);
+    let s_cfg_sset = sidx(api_slots::CONFIGURE_SCHEDULE_SET);
+    let s_mnt = sidx(api_slots::MOUNT_SYSTEM_IN_SCHEDULE);
+    let s_col_ticks = sidx(api_slots::ITER_COLUMN_TICKS);
+    let flag_msg = bamabi_sys::BAM_STORAGE_FLAG_MESSAGE;
+
+    let c_code = format!(
+        r#"
+#include <dlfcn.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct BamComponentUuid {{ uint64_t lo, hi; }} BamComponentUuid;
+typedef struct BamComponentDesc {{
+    uint32_t struct_size; uint32_t flags; const char* name; BamComponentUuid uuid;
+    size_t size; size_t align; const uint32_t* req; size_t req_n;
+    uint64_t fp; const void* fields; size_t fn; const void* rid; size_t rid_n;
+}} BamComponentDesc;
+typedef struct BamLayoutInfo {{
+    uint32_t struct_size; uint32_t flags; BamComponentUuid uuid; uint64_t fp;
+    size_t size; size_t align; const void* fields; size_t fn;
+}} BamLayoutInfo;
+typedef struct BamTermDesc {{
+    uint32_t component; uint32_t mode; uint16_t flags; uint8_t or_group; uint8_t reserved0;
+}} BamTermDesc;
+typedef struct BamQueryDesc {{
+    uint32_t struct_size; uint32_t flags; const BamTermDesc* terms; size_t term_count;
+    uint32_t param_set_group; uint32_t reserved0;
+}} BamQueryDesc;
+typedef uint32_t (*BamSystemFn)(void*, void*);
+typedef struct BamSystemDesc {{
+    uint32_t struct_size; uint32_t flags; const char* name; const BamQueryDesc* queries; size_t query_count;
+    BamSystemFn callback; void* user_data; uint32_t schedule; uint32_t reserved0;
+    const char* const* after; size_t after_count; const char* const* before; size_t before_count;
+    void* run_if; void* run_if_user_data; const char* const* in_sets; size_t in_set_count;
+    const char* const* after_weak; size_t after_weak_count; const char* const* before_weak; size_t before_weak_count;
+    const char* const* ambiguous_with; size_t ambiguous_with_count;
+    void* run_if_ctx; const BamQueryDesc* run_if_query; void* run_if_ctx_user_data;
+}} BamSystemDesc;
+typedef struct BamHostApi {{ uint32_t struct_size; uint32_t abi_version; void* slots[{HOST_API_SLOTS}]; }} BamHostApi;
+typedef struct StrataNetPacket {{
+    uint64_t module_net_fingerprint, item_schema_fingerprint, target_id, entity_bits;
+    uint32_t magic, tick_or_seq;
+    uint16_t version, payload_bits, flags;
+    uint8_t kind, channel, payload_bytes, client_id, _pad[6], payload[128];
+}} StrataNetPacket;
+
+static int g_hc = 1, g_lc = 2, g_sc = 3;
+static uint32_t g_nc = 10, g_nw_c = 0, g_hot_c = 0, g_cold_c = 0, g_pkt_c = 99;
+static BamSystemFn g_rx = NULL, g_tx = NULL;
+static void* g_rx_ud = NULL;
+static void* g_tx_ud = NULL;
+static uint32_t g_nw_q = 0, g_soa_q = 0, g_rx_nw_q = 0, g_rx_soa_q = 0, g_mark_terms[4] = {{0}};
+static uint8_t g_tx_nw[{nw_sz}], g_rx_nw[{nw_sz}];
+static uint8_t g_tx_hot[{hot_sz}], g_rx_hot[{hot_sz}];
+static uint8_t g_tx_cold[{cold_sz}], g_rx_cold[{cold_sz}];
+static uint64_t g_ent = 707ull;
+static uint32_t g_hot_chg = 1u, g_cold_chg = 5u, g_last_run = 3u, g_this_run = 6u;
+static int g_is_rx = 0;
+static StrataNetPacket g_pkts[8];
+static size_t g_pkt_n = 0, g_pkt_cur = 0, g_stage = 0, g_active_q = 0;
+
+static void* m_hc(const void* p) {{ (void)p; return &g_hc; }}
+static uint32_t m_reg_c(void* l, const BamComponentDesc* d, uint32_t* o) {{
+    (void)l; uint32_t id = g_nc++;
+    if (d->name && strstr(d->name, "NarrowWide")) g_nw_c = id;
+    if (d->name && strcmp(d->name, "test::jit_nt_regs::NetBody") == 0) g_hot_c = id;
+    if (d->name && strcmp(d->name, "test::jit_nt_regs::NetBody__telemetry") == 0) g_cold_c = id;
+    *o = id; return 0;
+}}
+static uint32_t m_res(const void* h, const char* n, const BamComponentUuid* u, uint32_t* o) {{
+    (void)h;(void)u; if (n && strcmp(n, "{pkt_canon}") == 0) {{ *o = g_pkt_c; return 0; }} return 4;
+}}
+static uint32_t m_linfo(const void* h, uint32_t c, BamLayoutInfo* o) {{
+    (void)h; memset(o, 0, sizeof(*o)); o->struct_size = (uint32_t)sizeof(*o);
+    if (c == g_pkt_c) {{ o->flags = {flag_msg}u; o->size = 184u; o->align = 8u; o->fp = 0x{pkt_fp:016X}ull; return 0; }}
+    return 4;
+}}
+static uint32_t m_cfg_sset(void* l, const void* d, uint32_t* o) {{ (void)l;(void)d; if (o) *o = 1u; return 0u; }}
+static uint32_t m_mnt(void* l, uint32_t s, uint32_t sc, uint32_t ss) {{ (void)l;(void)s;(void)sc;(void)ss; return 0u; }}
+static uint32_t m_reg_s(void* l, const BamSystemDesc* d, uint32_t* o) {{
+    (void)l;
+    if (strcmp(d->name, "__strata_net_rx_0") == 0) {{
+        g_rx = d->callback; g_rx_ud = d->user_data;
+        for (size_t q = 1; q < d->query_count; q++) {{
+            if (d->queries[q].term_count > 0 && d->queries[q].terms[0].component == g_nw_c) g_rx_nw_q = (uint32_t)q;
+            if (d->queries[q].term_count >= 2 && d->queries[q].terms[0].component == g_hot_c && d->queries[q].terms[1].component == g_cold_c) g_rx_soa_q = (uint32_t)q;
+        }}
+    }}
+    if (strcmp(d->name, "__strata_net_tx_0") == 0) {{
+        g_tx = d->callback; g_tx_ud = d->user_data;
+        for (size_t q = 1; q < d->query_count; q++) {{
+            if (d->queries[q].term_count > 0 && d->queries[q].terms[0].component == g_nw_c) g_nw_q = (uint32_t)q;
+            if (d->queries[q].term_count >= 2 && d->queries[q].terms[0].component == g_hot_c && d->queries[q].terms[1].component == g_cold_c) g_soa_q = (uint32_t)q;
+        }}
+    }}
+    *o = 1u; return 0;
+}}
+static uint32_t m_sq(void* s, size_t qi, void** o) {{ (void)s; g_active_q = qi; g_stage = 0; *o = (void*)(uintptr_t)(0x1000u + qi); return 0; }}
+static uint32_t m_rst(void* i) {{ (void)i; g_stage = 0; return 0; }}
+static uint8_t m_next(void* i, size_t* l) {{
+    (void)i; if (g_stage == 0) {{ g_stage = 1; *l = 1u; return 1u; }} *l = 0u; return 0u;
+}}
+static const uint64_t* m_ents(const void* i) {{ (void)i; return &g_ent; }}
+static const void* m_col_ro(const void* i, size_t ti) {{
+    (void)i;
+    if (g_active_q == g_nw_q) return g_tx_nw;
+    return (ti == 0) ? (const void*)g_tx_hot : (const void*)g_tx_cold;
+}}
+static void* m_col_mut(void* i, size_t ti) {{
+    (void)i;
+    uint32_t nw_q = g_is_rx ? g_rx_nw_q : g_nw_q;
+    if (g_active_q == nw_q) return g_rx_nw;
+    return (ti == 0) ? (void*)g_rx_hot : (void*)g_rx_cold;
+}}
+static uint32_t m_mark(void* i, size_t ti, size_t s, size_t l) {{
+    (void)i;(void)s;(void)l;
+    uint32_t soa_q = g_is_rx ? g_rx_soa_q : g_soa_q;
+    if (g_active_q == soa_q && ti < 4) g_mark_terms[ti]++;
+    return 0;
+}}
+static uint32_t m_col_ticks(const void* i, size_t ti, const uint32_t** oa, const uint32_t** oc, uint32_t* ol, uint32_t* ot) {{
+    (void)i;
+    if (g_active_q != g_soa_q) return 4u;
+    static uint32_t zero_tick = 0u;
+    *oa = &zero_tick;
+    *oc = (ti == 0) ? &g_hot_chg : &g_cold_chg;
+    *ol = g_last_run;
+    *ot = g_this_run;
+    return 0u;
+}}
+static uint32_t m_msg_w(void* i, size_t ti, const uint8_t* b, size_t c) {{
+    (void)i;(void)ti;
+    for (size_t k = 0; k < c && g_pkt_n < 8u; k++) memcpy(&g_pkts[g_pkt_n++], b + k * sizeof(StrataNetPacket), sizeof(StrataNetPacket));
+    return 0;
+}}
+static uint32_t m_msg_r(void* i, size_t ti, uint8_t* b, size_t m, size_t* r) {{
+    (void)i;(void)ti; (void)g_is_rx;
+    size_t n = 0;
+    while (g_pkt_cur < g_pkt_n && n < m) memcpy(b + (n++) * sizeof(StrataNetPacket), &g_pkts[g_pkt_cur++], sizeof(StrataNetPacket));
+    *r = n; return 0;
+}}
+
+int main(int argc, char** argv) {{
+    if (argc < 2) return 2;
+    void* dl = dlopen(argv[1], RTLD_NOW);
+    if (!dl) return 3;
+    typedef uint32_t (*InitFn)(const BamHostApi*, void*, void**);
+    typedef void (*ShutFn)(void*);
+    InitFn init_fn = (InitFn)dlsym(dl, "bamabi_init");
+    ShutFn shut_fn = (ShutFn)dlsym(dl, "bamabi_shutdown");
+    BamHostApi api; memset(&api, 0, sizeof(api));
+    api.struct_size = (uint32_t)sizeof(api); api.abi_version = 0x00030000u;
+    api.slots[{s_hc}] = (void*)m_hc; api.slots[{s_reg_c}] = (void*)m_reg_c; api.slots[{s_res}] = (void*)m_res;
+    api.slots[{s_sq}] = (void*)m_sq;
+    api.slots[{s_next}] = (void*)m_next; api.slots[{s_rst}] = (void*)m_rst; api.slots[{s_ents}] = (void*)m_ents;
+    api.slots[{s_col_ro}] = (void*)m_col_ro; api.slots[{s_col_mut}] = (void*)m_col_mut; api.slots[{s_col_mut_u}] = (void*)m_col_mut; api.slots[{s_mark}] = (void*)m_mark;
+    api.slots[{s_msg_r}] = (void*)m_msg_r; api.slots[{s_msg_w}] = (void*)m_msg_w; api.slots[{s_linfo}] = (void*)m_linfo;
+    api.slots[{s_cfg_sset}] = (void*)m_cfg_sset; api.slots[{s_mnt}] = (void*)m_mnt;
+    api.slots[{s_reg_sh}] = (void*)m_reg_s; api.slots[{s_reg_s}] = (void*)m_reg_s; api.slots[{s_col_ticks}] = (void*)m_col_ticks;
+
+    void* state = NULL;
+    uint32_t irc = init_fn(&api, &g_lc, &state);
+    if (irc != 0) {{ fprintf(stderr, "init failed rc=%u\n", irc); return 4; }}
+    if (!g_rx || !g_tx || g_nw_q == 0 || g_soa_q == 0) {{
+        fprintf(stderr, "missing rx=%p tx=%p nw_q=%u soa_q=%u hot=%u cold=%u nw=%u\n",
+            (void*)g_rx, (void*)g_tx, g_nw_q, g_soa_q, g_hot_c, g_cold_c, g_nw_c);
+        return 5;
+    }}
+
+    uint8_t vu8 = 255u; int8_t vi8 = 127; uint16_t vu16 = 65535u; int16_t vi16 = 32767;
+    double hmid = 1234.5, hhi = 9.0e307;
+    memset(g_tx_nw, 0, sizeof(g_tx_nw));
+    memset(g_rx_nw, 0, sizeof(g_rx_nw));
+    memcpy(g_tx_nw + {nw_u8}, &vu8, 1); memcpy(g_tx_nw + {nw_i8}, &vi8, 1);
+    memcpy(g_tx_nw + {nw_u16}, &vu16, 2); memcpy(g_tx_nw + {nw_i16}, &vi16, 2);
+    memcpy(g_tx_nw + {nw_hmid}, &hmid, 8); memcpy(g_tx_nw + {nw_hhi}, &hhi, 8);
+
+    float pos[2] = {{ 3.25f, -7.5f }}; uint32_t cid = 99u;
+    memset(g_tx_hot, 0, sizeof(g_tx_hot)); memset(g_rx_hot, 0, sizeof(g_rx_hot));
+    memset(g_tx_cold, 0, sizeof(g_tx_cold)); memset(g_rx_cold, 0, sizeof(g_rx_cold));
+    memcpy(g_tx_hot + {hot_pos}, pos, 8); memcpy(g_tx_cold + {cold_id}, &cid, 4);
+
+    // 1. Cold-only change (g_hot_chg <= g_last_run, g_cold_chg > g_last_run) must emit NetBody!
+    g_tx(&g_sc, g_tx_ud);
+    if (g_pkt_n != 2u) {{ fprintf(stderr, "expected 2 pkts (NW + Soa), got %zu\n", g_pkt_n); return 6; }}
+
+    // 2. Unchanged SoA entity must emit 0 NetBody pkts on next tick!
+    g_cold_chg = 2u; g_pkt_n = 0u;
+    g_tx(&g_sc, g_tx_ud);
+    // g_nw_q has no unchanged filter in mock, so only NetBody was skipped (1 pkt instead of 2)
+    if (g_pkt_n != 1u) {{ fprintf(stderr, "unchanged SoA should skip TX, got %zu pkts\n", g_pkt_n); return 7; }}
+
+    // 3. Re-emit both and decode via RX
+    g_cold_chg = 5u; g_pkt_n = 0u; g_pkt_cur = 0u; g_is_rx = 0;
+    g_tx(&g_sc, g_tx_ud);
+    g_is_rx = 1;
+    g_rx(&g_sc, g_rx_ud);
+
+    uint8_t ru8 = 0; int8_t ri8 = 0; uint16_t ru16 = 0; int16_t ri16 = 0;
+    double rhmid = 0.0, rhhi = 0.0;
+    memcpy(&ru8, g_rx_nw + {nw_u8}, 1); memcpy(&ri8, g_rx_nw + {nw_i8}, 1);
+    memcpy(&ru16, g_rx_nw + {nw_u16}, 2); memcpy(&ri16, g_rx_nw + {nw_i16}, 2);
+    memcpy(&rhmid, g_rx_nw + {nw_hmid}, 8); memcpy(&rhhi, g_rx_nw + {nw_hhi}, 8);
+    if (ru8 != 255u || ri8 != 127 || ru16 != 65535u || ri16 != 32767) {{
+        fprintf(stderr, "NT-01 wrap: %u %d %u %d\n", ru8, ri8, ru16, ri16); return 8;
+    }}
+    if (rhmid < -1e305 || rhmid > 1e305 || !(rhhi > 8.9e307 && rhhi <= 1e308)) {{
+        fprintf(stderr, "NT-09 decode: mid=%g hi=%g\n", rhmid, rhhi); return 9;
+    }}
+    float rpos[2] = {{0}}; uint32_t rcid = 0;
+    memcpy(rpos, g_rx_hot + {hot_pos}, 8); memcpy(&rcid, g_rx_cold + {cold_id}, 4);
+    if (fabsf(rpos[0] - 3.25f) > 1e-5f || fabsf(rpos[1] + 7.5f) > 1e-5f || rcid != 99u || g_mark_terms[1] == 0) {{
+        fprintf(stderr, "NT-03 soa rx: pos=(%f,%f) id=%u mark1=%u\n", rpos[0], rpos[1], rcid, g_mark_terms[1]); return 10;
+    }}
+
+    shut_fn(state);
+    dlclose(dl);
+    return 0;
+}}
+"#,
+        nw_sz = nw_layout.size,
+        hot_sz = hot_layout.size,
+        cold_sz = cold_layout.size,
+        pkt_fp = pkt_fp,
+        nw_u8 = off(nw_layout, "v_u8"),
+        nw_i8 = off(nw_layout, "v_i8"),
+        nw_u16 = off(nw_layout, "v_u16"),
+        nw_i16 = off(nw_layout, "v_i16"),
+        nw_hmid = off(nw_layout, "huge_mid"),
+        nw_hhi = off(nw_layout, "huge_hi"),
+        hot_pos = off(hot_layout, "pos"),
+        cold_id = off(cold_layout, "id"),
+    );
+
+    let hpath = tmp.path().join("jit_nt_regs.c");
+    std::fs::write(&hpath, c_code).unwrap();
+    let exe = tmp.path().join("jit_nt_regs");
+    let cc = find_c_compiler();
+    let comp = Command::new(cc)
+        .args(["-std=c99", "-Wall", "-Wextra", "-Wpedantic", "-Werror"])
+        .arg(&hpath)
+        .arg("-o")
+        .arg(&exe)
+        .arg("-ldl")
+        .arg("-lm")
+        .output()
+        .expect("compile jit_nt_regs");
+    assert!(
+        comp.status.success(),
+        "jit_nt_regs C compile failed:\n{}",
+        String::from_utf8_lossy(&comp.stderr)
+    );
+    let run = Command::new(&exe)
+        .arg(&art.dylib_path)
+        .output()
+        .expect("run jit_nt_regs");
+    assert!(
+        run.status.success(),
+        "jit_nt_regs failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}

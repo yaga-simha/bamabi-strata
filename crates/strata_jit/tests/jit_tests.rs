@@ -632,7 +632,7 @@ sys scan_hits() {
         dc += 1;
     }
     let mut sc: i32 = 0;
-    for _sh in TraceHist.query_segment_at(vec3(0.0, 0.0, 0.0), vec3(10.0, 0.0, 0.0), 2.0, 0) {
+    for _sh in TraceHist.query_segment_at(0, vec3(0.0, 0.0, 0.0), vec3(10.0, 0.0, 0.0), 2.0) {
         sc += 1;
     }
     for row in query(o: &mut QueryOut) {
@@ -779,7 +779,7 @@ int main(int argc, char** argv) {{
     memcpy(&dh, g_out_buf + {off_disc}, 4);
     memcpy(&sh, g_out_buf + {off_seg}, 4);
     if (g_reset_calls < 2) {{ fprintf(stderr, "reset_calls=%u\n", g_reset_calls); return 10; }}
-    if (dh != 2 || sh != 1) {{ fprintf(stderr, "dh=%d sh=%d\n", dh, sh); return 11; }}
+    if (dh != 2 || sh != 2) {{ fprintf(stderr, "dh=%d sh=%d\n", dh, sh); return 11; }}
 
     shut_fn(state);
     dlclose(dl);
@@ -821,8 +821,8 @@ sys check_cascade() {
 }
 
 sys check_atomic_abort(bank: &mut Bank) {
-    atomic {
-        for row in query(s: &mut Stat) {
+    for row in query(s: &mut Stat) {
+        atomic {
             bank.gold -= 35;
             row.s.total += 999.0;
             require_true(false);
@@ -857,7 +857,7 @@ schedule FixedUpdate { check_opt, check_cascade, check_atomic_abort }
     c_code.push_str(&format!(
         r#"
 static int g_hctx = 1, g_lctx = 2, g_sctx = 3;
-static uint32_t g_next_comp = 10, g_stat_comp = 0, g_sh_comp = 0, g_bf_comp = 0, g_bank_comp = 0, g_rel_comp = 50;
+static uint32_t g_next_comp = 10, g_stat_comp = 0, g_sh_comp = 0, g_bf_comp = 0, g_bank_comp = 0, g_parent_rel_comp = 0, g_rel_comp = 50;
 typedef struct SysReg {{ char name[64]; BamSystemFn cb; void* ud; }} SysReg;
 static SysReg g_sys[16];
 static size_t g_sys_n = 0;
@@ -878,7 +878,8 @@ static void* h_lhc(const void* p) {{ (void)p; return &g_hctx; }}
 static uint32_t h_reg_comp(void* lc, const BamComponentDesc* d, uint32_t* o) {{
     (void)lc; uint32_t id = g_next_comp++;
     if (d->name) {{
-        if (strstr(d->name, "Stat")) g_stat_comp = id;
+        if (strstr(d->name, "__strata_rel_parent_ParentRel")) g_parent_rel_comp = id;
+        else if (strstr(d->name, "Stat")) g_stat_comp = id;
         else if (strstr(d->name, "Shield")) g_sh_comp = id;
         else if (strstr(d->name, "Buff")) g_bf_comp = id;
         else if (strstr(d->name, "Bank")) g_bank_comp = id;
@@ -937,7 +938,7 @@ static uint32_t h_mark_chg(void* it, size_t ti, size_t s, size_t l) {{
 static uint32_t h_up_cascade(void* it, uint32_t rel, uint64_t ent, size_t ti, const void** out_ptr, uint64_t* out_owner) {{
     (void)it;
     g_up_calls++;
-    if (rel != g_rel_comp) return 1;
+    if (rel != g_parent_rel_comp) return 1;
     if (ti == 0) {{
         if (ent == 101ull) {{ *out_ptr = g_st_c0 + 0 * {st_sz}; *out_owner = 101ull; }}
         else if (ent == 102ull) {{ *out_ptr = g_st_c0 + 1 * {st_sz}; *out_owner = 102ull; }}
@@ -964,6 +965,8 @@ static void* h_res_mut(void* sc, uint32_t c, void* ticks) {{ (void)sc; (void)tic
 static void* h_ent_get(void* sc, size_t qi, uint64_t e, size_t ti) {{
     (void)sc; (void)qi; (void)ti;
     if (e == 101ull) return g_st_c0;
+    if (e == 102ull) return g_st_c0 + 1 * {st_sz};
+    if (e == 201ull) return g_st_c1;
     return NULL;
 }}
 
@@ -1052,7 +1055,7 @@ int main(int argc, char** argv) {{
         fprintf(stderr, "cascade totals=%f %f %f\n", t0, t1, tc1);
         return 14;
     }}
-    if (gold_after != 100 || g_ckpt_calls != 1 || g_rb_calls != 1) {{
+    if (gold_after != 100 || g_ckpt_calls != 3 || g_rb_calls != 3) {{
         fprintf(stderr, "atomic rollback failed gold=%d ckpt=%u rb=%u\n", gold_after, g_ckpt_calls, g_rb_calls);
         return 15;
     }}
@@ -3973,4 +3976,1210 @@ int main(int argc, char** argv) {{
 "#
     ));
     run_c_host_harness(tmp.path(), "jit_iter8", &c_code, &artifact.dylib_path);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn jit_regression_pm02_04_07_08_09_11_12() {
+    use strata_jit::abi_offsets::api_slots;
+    let par_ro_slot = (api_slots::PAR_FOR_EACH_CHUNK_READONLY - 8) / std::mem::size_of::<usize>();
+    let par_mut_slot = (api_slots::PAR_FOR_EACH_CHUNK - 8) / std::mem::size_of::<usize>();
+    let src = r#"
+module test::jit_pm_step2 @version(1.0.0);
+
+component FlagItem {
+    ok: bool = false,
+    fx32: fix32 = 2.0 as fix32,
+    fx64: fix64 = 2.0 as fix64,
+}
+
+component Out {
+    neg1: i32 = -1,
+    neg1_64: i64 = -1,
+    d32: i32 = 0,
+    r64: i64 = 99,
+    qm: quat = quat(0.0, 0.0, 0.0, 1.0),
+    qm2: quat = quat(0.0, 0.70710677, 0.0, 0.70710677),
+    qv: vec3 = vec3(0.0, 0.0, 0.0),
+    cnt_ok: u32 = 0,
+    any_ok: bool = false,
+    any_false: bool = true,
+    all_true: bool = false,
+    all_mixed: bool = true,
+    prod32: fix32 = 0.0 as fix32,
+    prod64: fix64 = 0.0 as fix64,
+    b_int: bool = false,
+    b_f32: bool = false,
+    b_fx: bool = false,
+    b_nan: bool = false,
+    b_zero: bool = true,
+    swiz_local: vec2 = vec2(0.0, 0.0),
+    comp_swiz: vec2 = vec2(3.0, 4.0),
+    vclamp: vec3 = vec3(0.0, 0.0, 0.0),
+    ivm: ivec2 = ivec2(0, 0),
+    ivc: ivec2 = ivec2(0, 0),
+    in_zero: f32 = 0.0,
+    in_half: f32 = 0.5,
+    in_256: i32 = 256,
+    in_fx: fix32 = 0.5 as fix32,
+}
+
+@par(chunk = 2)
+sys eval_math() {
+    let cnt_v = for e in query(it: &FlagItem) reduce(acc: count(e.it.ok));
+    let any_t = for e in query(it: &FlagItem) reduce(acc: any(e.it.ok));
+    let any_f = for e in query(it: &FlagItem) reduce(acc: any(!e.it.ok && e.it.ok));
+    let all_t = for e in query(it: &FlagItem) reduce(acc: all(e.it.ok || !e.it.ok));
+    let all_m = for e in query(it: &FlagItem) reduce(acc: all(e.it.ok));
+    let p32 = for e in query(it: &FlagItem) reduce(acc: prod(1.0 as fix32, e.it.fx32));
+    let p64 = for e in query(it: &FlagItem) reduce(acc: prod(1.0 as fix64, e.it.fx64));
+
+    for row in query(o: &mut Out) {
+        let m32: i32 = -2147483647 - 1;
+        let m64: i64 = -9223372036854775807 - 1;
+        row.o.d32 = m32 / row.o.neg1;
+        row.o.r64 = m64 % row.o.neg1_64;
+
+        let q1: quat = quat(0.0, 0.70710677, 0.0, 0.70710677);
+        let q2: quat = quat(0.0, 0.0, 0.70710677, 0.70710677);
+        row.o.qm = q1 * q2;
+        row.o.qm2 *= q2;
+        row.o.qv = q1 * vec3(1.0, 0.0, 0.0);
+
+        row.o.cnt_ok = cnt_v;
+        row.o.any_ok = any_t;
+        row.o.any_false = any_f;
+        row.o.all_true = all_t;
+        row.o.all_mixed = all_m;
+        row.o.prod32 = p32;
+        row.o.prod64 = p64;
+
+        row.o.b_int = row.o.in_256 as bool;
+        row.o.b_f32 = row.o.in_half as bool;
+        row.o.b_fx = row.o.in_fx as bool;
+        row.o.b_nan = (row.o.in_zero / row.o.in_zero) as bool;
+        row.o.b_zero = row.o.in_zero as bool;
+
+        let mut t: vec2 = vec2(3.0, 4.0);
+        t.yx = vec2(10.0, 20.0);
+        row.o.swiz_local = t;
+        row.o.comp_swiz.yx = vec2(50.0, 60.0);
+
+        row.o.vclamp = clamp(vec3(1.0, 2.0, 3.0), 1.5, 2.5);
+        row.o.ivm = ivec2(10, -7) * 2;
+        row.o.ivc = clamp(ivec2(-5, 9), 0, 4);
+    }
+}
+
+schedule FixedUpdate { eval_math }
+"#;
+    let analyzed = analyze_source("jit_pm_step2.strata", src);
+    assert!(analyzed.ok(), "{:?}", analyzed.diagnostics);
+    let mir = lower_to_mir(&analyzed);
+    let tmp = TempDir::new().expect("tempdir");
+    let artifact = compile_module_to_dylib(
+        &mir,
+        &JitCompileOptions {
+            out_dir: tmp.path().to_path_buf(),
+            module_stem: "jit_pm_step2".to_owned(),
+            opt_level: JitOptLevel::Speed,
+        },
+    )
+    .expect("compile_module_to_dylib");
+
+    let (item_sz, off_ok) = field_offset_of(&mir, "FlagItem", "ok");
+    let (_, off_fx32) = field_offset_of(&mir, "FlagItem", "fx32");
+    let (_, off_fx64) = field_offset_of(&mir, "FlagItem", "fx64");
+
+    let (out_sz, off_neg1) = field_offset_of(&mir, "Out", "neg1");
+    let (_, off_neg1_64) = field_offset_of(&mir, "Out", "neg1_64");
+    let (_, off_d32) = field_offset_of(&mir, "Out", "d32");
+    let (_, off_r64) = field_offset_of(&mir, "Out", "r64");
+    let (_, off_qm) = field_offset_of(&mir, "Out", "qm");
+    let (_, off_qm2) = field_offset_of(&mir, "Out", "qm2");
+    let (_, off_qv) = field_offset_of(&mir, "Out", "qv");
+    let (_, off_cnt_ok) = field_offset_of(&mir, "Out", "cnt_ok");
+    let (_, off_any_ok) = field_offset_of(&mir, "Out", "any_ok");
+    let (_, off_any_false) = field_offset_of(&mir, "Out", "any_false");
+    let (_, off_all_true) = field_offset_of(&mir, "Out", "all_true");
+    let (_, off_all_mixed) = field_offset_of(&mir, "Out", "all_mixed");
+    let (_, off_prod32) = field_offset_of(&mir, "Out", "prod32");
+    let (_, off_prod64) = field_offset_of(&mir, "Out", "prod64");
+    let (_, off_b_int) = field_offset_of(&mir, "Out", "b_int");
+    let (_, off_b_f32) = field_offset_of(&mir, "Out", "b_f32");
+    let (_, off_b_fx) = field_offset_of(&mir, "Out", "b_fx");
+    let (_, off_b_nan) = field_offset_of(&mir, "Out", "b_nan");
+    let (_, off_b_zero) = field_offset_of(&mir, "Out", "b_zero");
+    let (_, off_swiz_local) = field_offset_of(&mir, "Out", "swiz_local");
+    let (_, off_comp_swiz) = field_offset_of(&mir, "Out", "comp_swiz");
+    let (_, off_vclamp) = field_offset_of(&mir, "Out", "vclamp");
+    let (_, off_ivm) = field_offset_of(&mir, "Out", "ivm");
+    let (_, off_ivc) = field_offset_of(&mir, "Out", "ivc");
+    let (_, off_in_zero) = field_offset_of(&mir, "Out", "in_zero");
+    let (_, off_in_half) = field_offset_of(&mir, "Out", "in_half");
+    let (_, off_in_256) = field_offset_of(&mir, "Out", "in_256");
+    let (_, off_in_fx) = field_offset_of(&mir, "Out", "in_fx");
+
+    let mut c_code = c_abi_prelude();
+    c_code.push_str(&format!(
+        r#"
+static int g_hctx = 1, g_lctx = 2, g_sctx = 3;
+static uint32_t g_next_comp = 10, g_item_comp = 0, g_out_comp = 0;
+typedef struct SysReg {{ char name[64]; BamSystemFn cb; void* ud; uint32_t q_comp[8]; }} SysReg;
+static SysReg g_sys[8];
+static size_t g_sys_n = 0;
+static uint8_t g_items[4 * {item_sz}];
+static uint64_t g_item_ents[4] = {{ 1, 2, 3, 4 }};
+static uint8_t g_out[{out_sz}];
+static uint64_t g_out_ents[1] = {{ 10 }};
+typedef struct Iter {{ uint32_t comp; size_t st; }} Iter;
+static Iter g_it[16];
+
+static void* h_lhc(const void* p) {{ (void)p; return &g_hctx; }}
+static uint32_t h_res_comp(const void* hc, const char* n, const BamComponentUuid* u, uint32_t* o) {{ (void)hc; (void)n; (void)u; (void)o; return 4; }}
+static uint32_t h_linfo(const void* hc, uint32_t c, BamLayoutInfo* i) {{ (void)hc; (void)c; (void)i; return 4; }}
+static uint32_t h_reg_comp(void* lc, const BamComponentDesc* d, uint32_t* o) {{
+    (void)lc; uint32_t id = g_next_comp++;
+    if (d->name && strstr(d->name, "FlagItem")) g_item_comp = id;
+    if (d->name && strstr(d->name, "Out")) g_out_comp = id;
+    *o = id; return 0;
+}}
+static uint32_t h_reg_sys(void* lc, const BamSystemDesc* d, uint32_t* o) {{
+    (void)lc;
+    SysReg* r = &g_sys[g_sys_n];
+    snprintf(r->name, sizeof(r->name), "%s", d->name ? d->name : "");
+    r->cb = d->callback; r->ud = d->user_data;
+    for (size_t qi = 0; qi < d->query_count && qi < 8; qi++) {{
+        r->q_comp[qi] = d->queries[qi].term_count > 0 ? d->queries[qi].terms[0].component : 0;
+    }}
+    *o = (uint32_t)(++g_sys_n); return 0;
+}}
+static uint32_t h_sys_q(void* sc, size_t qi, void** o) {{
+    (void)sc;
+    size_t idx = qi < 16 ? qi : 0;
+    g_it[idx].comp = (qi == 7) ? g_out_comp : g_item_comp;
+    g_it[idx].st = 0;
+    *o = &g_it[idx]; return 0;
+}}
+static uint32_t h_par(void* it, uint32_t (*cb)(void*, void*), void* frame) {{
+    return cb(it, frame);
+}}
+static uint32_t h_iter_rst(void* it) {{ ((Iter*)it)->st = 0; return 0; }}
+static uint8_t h_next(void* it, size_t* len) {{
+    Iter* s = (Iter*)it;
+    if (s->st == 0) {{ s->st = 1; *len = (s->comp == g_item_comp) ? 4 : 1; return 1; }}
+    *len = 0; return 0;
+}}
+static const uint64_t* h_ents(void* it) {{
+    return (((Iter*)it)->comp == g_item_comp) ? g_item_ents : g_out_ents;
+}}
+static void* h_col(void* it, size_t ti) {{
+    (void)ti;
+    return (((Iter*)it)->comp == g_item_comp) ? (void*)g_items : (void*)g_out;
+}}
+
+int main(int argc, char** argv) {{
+    if (argc < 2) return 2;
+    void* dl = dlopen(argv[1], RTLD_NOW);
+    if (!dl) return 3;
+    typedef uint32_t (*InitFn)(const BamHostApi*, void*, void**);
+    typedef void (*ShutFn)(void*);
+    InitFn init_fn = (InitFn)dlsym(dl, "bamabi_init");
+    ShutFn shut_fn = (ShutFn)dlsym(dl, "bamabi_shutdown");
+    BamHostApi api; memset(&api, 0, sizeof(api));
+    api.struct_size = (uint32_t)sizeof(api); api.abi_version = WIRE_ABI_VER;
+    api.slots[SLOT_LOAD_HOST_CTX] = (void*)h_lhc;
+    api.slots[SLOT_REGISTER_COMPONENT] = (void*)h_reg_comp;
+    api.slots[SLOT_RESOLVE_COMPONENT] = (void*)h_res_comp;
+    api.slots[SLOT_COMPONENT_LAYOUT_INFO] = (void*)h_linfo;
+    api.slots[SLOT_REGISTER_SYSTEM] = (void*)h_reg_sys;
+    api.slots[SLOT_REGISTER_SYSTEM_HANDLE] = (void*)h_reg_sys;
+    api.slots[SLOT_SYS_QUERY] = (void*)h_sys_q;
+    api.slots[{par_ro_slot}] = (void*)h_par;
+    api.slots[{par_mut_slot}] = (void*)h_par;
+    api.slots[SLOT_ITER_RESET] = (void*)h_iter_rst;
+    api.slots[SLOT_ITER_NEXT_CHUNK] = (void*)h_next;
+    api.slots[SLOT_ITER_ENTITIES] = (void*)h_ents;
+    api.slots[SLOT_ITER_COL_RO] = (void*)h_col;
+    api.slots[SLOT_ITER_COL_MUT] = (void*)h_col;
+    api.slots[SLOT_ITER_COL_MUT_UNTRACKED] = (void*)h_col;
+
+    void* state = NULL;
+    if (init_fn(&api, &g_lctx, &state) != 0) return 4;
+
+    memset(g_items, 0, sizeof(g_items));
+    memset(g_out, 0, sizeof(g_out));
+    for (int i = 0; i < 4; i++) {{
+        uint8_t ok = (i % 2 == 0) ? 1 : 0;
+        int32_t fx32 = 2 * 65536;
+        int64_t fx64 = 2LL << 32;
+        memcpy(g_items + i * {item_sz} + {off_ok}, &ok, 1);
+        memcpy(g_items + i * {item_sz} + {off_fx32}, &fx32, 4);
+        memcpy(g_items + i * {item_sz} + {off_fx64}, &fx64, 8);
+    }}
+    int32_t n1 = -1, i256 = 256, ifx = 32768;
+    int64_t n1_64 = -1;
+    float qinit[4] = {{ 0.0f, 0.70710677f, 0.0f, 0.70710677f }};
+    float fz = 0.0f, fh = 0.5f;
+    memcpy(g_out + {off_neg1}, &n1, 4);
+    memcpy(g_out + {off_neg1_64}, &n1_64, 8);
+    memcpy(g_out + {off_qm2}, qinit, 16);
+    memcpy(g_out + {off_in_zero}, &fz, 4);
+    memcpy(g_out + {off_in_half}, &fh, 4);
+    memcpy(g_out + {off_in_256}, &i256, 4);
+    memcpy(g_out + {off_in_fx}, &ifx, 4);
+    uint8_t bt = 1;
+    memcpy(g_out + {off_any_false}, &bt, 1);
+    memcpy(g_out + {off_all_mixed}, &bt, 1);
+    memcpy(g_out + {off_b_zero}, &bt, 1);
+
+    for (size_t i = 0; i < g_sys_n; i++) {{
+        if (strcmp(g_sys[i].name, "eval_math") == 0) g_sys[i].cb(&g_sctx, g_sys[i].ud);
+    }}
+
+    int32_t d32 = 0, ivm[2] = {{0}}, ivc[2] = {{0}}, fx32_out = 0;
+    int64_t r64 = 0, fx64_out = 0;
+    uint32_t cnt_ok = 99;
+    uint8_t any_ok = 0, any_false = 1, all_true = 0, all_mixed = 1;
+    uint8_t b_int = 0, b_f32 = 0, b_fx = 0, b_nan = 0, b_zero = 1;
+    float qm[4] = {{0}}, qm2[4] = {{0}}, qv[3] = {{0}}, swiz_l[2] = {{0}}, swiz_c[2] = {{0}}, vc[3] = {{0}};
+
+    memcpy(&d32, g_out + {off_d32}, 4);
+    memcpy(&r64, g_out + {off_r64}, 8);
+    memcpy(qm, g_out + {off_qm}, 16);
+    memcpy(qm2, g_out + {off_qm2}, 16);
+    memcpy(qv, g_out + {off_qv}, 12);
+    memcpy(&cnt_ok, g_out + {off_cnt_ok}, 4);
+    memcpy(&any_ok, g_out + {off_any_ok}, 1);
+    memcpy(&any_false, g_out + {off_any_false}, 1);
+    memcpy(&all_true, g_out + {off_all_true}, 1);
+    memcpy(&all_mixed, g_out + {off_all_mixed}, 1);
+    memcpy(&fx32_out, g_out + {off_prod32}, 4);
+    memcpy(&fx64_out, g_out + {off_prod64}, 8);
+    memcpy(&b_int, g_out + {off_b_int}, 1);
+    memcpy(&b_f32, g_out + {off_b_f32}, 1);
+    memcpy(&b_fx, g_out + {off_b_fx}, 1);
+    memcpy(&b_nan, g_out + {off_b_nan}, 1);
+    memcpy(&b_zero, g_out + {off_b_zero}, 1);
+    memcpy(swiz_l, g_out + {off_swiz_local}, 8);
+    memcpy(swiz_c, g_out + {off_comp_swiz}, 8);
+    memcpy(vc, g_out + {off_vclamp}, 12);
+    memcpy(ivm, g_out + {off_ivm}, 8);
+    memcpy(ivc, g_out + {off_ivc}, 8);
+
+    if (d32 != INT32_MIN || r64 != 0) {{ fprintf(stderr, "PM-02 d32=%d r64=%lld\n", d32, (long long)r64); return 10; }}
+    for (int i = 0; i < 4; i++) {{
+        if (fabsf(qm[i] - 0.5f) > 1e-4f || fabsf(qm2[i] - 0.5f) > 1e-4f) {{
+            fprintf(stderr, "PM-04 qm=(%f,%f,%f,%f) qm2=(%f,%f,%f,%f)\n", qm[0],qm[1],qm[2],qm[3], qm2[0],qm2[1],qm2[2],qm2[3]);
+            return 11;
+        }}
+    }}
+    if (fabsf(qv[0]) > 1e-4f || fabsf(qv[1]) > 1e-4f || fabsf(qv[2] + 1.0f) > 1e-4f) {{
+        fprintf(stderr, "PM-04 qv=(%f,%f,%f)\n", qv[0], qv[1], qv[2]); return 12;
+    }}
+    if (cnt_ok != 2 || any_ok != 1 || any_false != 0 || all_true != 1 || all_mixed != 0) {{
+        fprintf(stderr, "PM-07 cnt=%u any=%u/%u all=%u/%u\n", cnt_ok, any_ok, any_false, all_true, all_mixed); return 13;
+    }}
+    if (fx32_out != 16 * 65536 || fx64_out != (16LL << 32)) {{
+        fprintf(stderr, "PM-08 fx32=%d fx64=%lld\n", fx32_out, (long long)fx64_out); return 14;
+    }}
+    if (!b_int || !b_f32 || !b_fx || !b_nan || b_zero) {{
+        fprintf(stderr, "PM-09 %u %u %u %u %u\n", b_int, b_f32, b_fx, b_nan, b_zero); return 15;
+    }}
+    if (fabsf(swiz_l[0] - 20.0f) > 1e-4f || fabsf(swiz_l[1] - 10.0f) > 1e-4f || fabsf(swiz_c[0] - 60.0f) > 1e-4f || fabsf(swiz_c[1] - 50.0f) > 1e-4f) {{
+        fprintf(stderr, "PM-11 local=(%f,%f) comp=(%f,%f)\n", swiz_l[0], swiz_l[1], swiz_c[0], swiz_c[1]); return 16;
+    }}
+    if (fabsf(vc[0] - 1.5f) > 1e-4f || fabsf(vc[1] - 2.0f) > 1e-4f || fabsf(vc[2] - 2.5f) > 1e-4f) {{
+        fprintf(stderr, "PM-12 vc=(%f,%f,%f)\n", vc[0], vc[1], vc[2]); return 17;
+    }}
+    if (ivm[0] != 20 || ivm[1] != -14 || ivc[0] != 0 || ivc[1] != 4) {{
+        fprintf(stderr, "PM-12 ivm=(%d,%d) ivc=(%d,%d)\n", ivm[0], ivm[1], ivc[0], ivc[1]); return 18;
+    }}
+
+    shut_fn(state);
+    dlclose(dl);
+    return 0;
+}}
+"#
+    ));
+    run_c_host_harness(tmp.path(), "jit_pm_step2", &c_code, &artifact.dylib_path);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn jit_regression_types_tables_inlinestr_bitset_and_smallvec() {
+    use strata_jit::abi_offsets::api_slots;
+    let src = r#"
+module test::jit_tl_step3 @version(1.0.0);
+
+enum TierKey {
+    Low = -5,
+    High = 10,
+}
+
+struct SubInfo {
+    bonus: i32 = 33,
+    txt: InlineStr<4> = "def",
+}
+
+struct BoxVal {
+    v: i32 = 99,
+}
+
+table Tiers by TierKey {
+    base: i32,
+    sub: SubInfo,
+    bits: BitSet<64>,
+} = {
+    Low  => { base: -12, sub: SubInfo { bonus: 77, txt: "low" }, bits: bits(4) },
+    High => { base: 44, sub: SubInfo { bonus: 88, txt: "hi" }, bits: bits() },
+};
+
+component MatHold {
+    m: mat3,
+    boxes: [BoxVal; 2],
+    sub: SubInfo,
+}
+
+object DefObj {
+    MatHold {
+        sub: SubInfo { txt: "over" },
+    }
+}
+
+component TypeProbe {
+    flags_arr: [BitSet<128>; 2],
+    has_before: i32 = 9,
+    has_after_set: i32 = 0,
+    has_after_clr: i32 = 9,
+    mat_rt: mat3,
+    arr2d_val: i32 = 0,
+    box_arr_val: i32 = 0,
+    sv_len: i32 = 0,
+    sv_last: i32 = 0,
+    def_box_v: i32 = 0,
+    def_sub_bonus: i32 = 0,
+    ascii_s: InlineStr<8> = "",
+    utf8_s: InlineStr<4> = "",
+    nested_s: SubInfo,
+    tbl_base: i32 = 0,
+    tbl_bonus: i32 = 0,
+    tbl_has_bit: i32 = 0,
+    tbl_txt: InlineStr<4> = "",
+}
+
+sys eval_types(p: &mut TypeProbe) {
+    for r in query(p: &mut TypeProbe, mh: &MatHold) {
+        r.p.flags_arr[1].set(70);
+        r.p.has_before = if r.p.flags_arr[0].has(70) { 1 } else { 0 };
+        r.p.has_after_set = if r.p.flags_arr[1].has(70) { 1 } else { 0 };
+        r.p.flags_arr[1].clear(70);
+        r.p.has_after_clr = if r.p.flags_arr[1].has(70) { 1 } else { 0 };
+
+        let mut grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+        grid[1][0] = 42;
+        r.p.arr2d_val = grid[1][0];
+
+        let mut barr: [BoxVal; 2] = [BoxVal { v: 1 }, BoxVal { v: 2 }];
+        barr[1].v = 77;
+        r.p.box_arr_val = barr[1].v;
+
+        let mut sv: SmallVec<i32, 4> = [10, 20];
+        sv.push(30);
+        r.p.sv_len = sv.len() as i32;
+        r.p.sv_last = sv[2];
+
+        r.p.mat_rt = mat3();
+        r.p.def_box_v = r.mh.boxes[1].v;
+        r.p.def_sub_bonus = r.mh.sub.bonus;
+
+        r.p.ascii_s = "abcdefghijkl";
+        r.p.utf8_s = "hi🎉bye";
+        let sub_cp = SubInfo { bonus: 15, txt: "cp" };
+        r.p.nested_s = sub_cp;
+
+        let trow = Tiers[TierKey::Low];
+        r.p.tbl_base = trow.base;
+        r.p.tbl_bonus = trow.sub.bonus;
+        r.p.tbl_has_bit = if trow.bits.has(4) { 1 } else { 0 };
+        r.p.tbl_txt = trow.sub.txt;
+    }
+}
+
+schedule Startup { eval_types }
+"#;
+    let analyzed = analyze_source("jit_tl_step3.strata", src);
+    assert!(analyzed.ok(), "sema: {:?}", analyzed.diagnostics);
+    let mir = lower_to_mir(&analyzed);
+    let tmp = TempDir::new().expect("tempdir");
+    let artifact = compile_module_to_dylib(
+        &mir,
+        &JitCompileOptions {
+            out_dir: tmp.path().to_path_buf(),
+            module_stem: "jit_tl_step3".to_owned(),
+            opt_level: JitOptLevel::Speed,
+        },
+    )
+    .expect("compile_module_to_dylib");
+
+    let (tp_sz, off_flags_arr) = field_offset_of(&mir, "TypeProbe", "flags_arr");
+    let (_, off_hb) = field_offset_of(&mir, "TypeProbe", "has_before");
+    let (_, off_hs) = field_offset_of(&mir, "TypeProbe", "has_after_set");
+    let (_, off_hc) = field_offset_of(&mir, "TypeProbe", "has_after_clr");
+    let (_, off_mat_rt) = field_offset_of(&mir, "TypeProbe", "mat_rt");
+    let (_, off_a2d) = field_offset_of(&mir, "TypeProbe", "arr2d_val");
+    let (_, off_bav) = field_offset_of(&mir, "TypeProbe", "box_arr_val");
+    let (_, off_svl) = field_offset_of(&mir, "TypeProbe", "sv_len");
+    let (_, off_svv) = field_offset_of(&mir, "TypeProbe", "sv_last");
+    let (_, off_dbv) = field_offset_of(&mir, "TypeProbe", "def_box_v");
+    let (_, off_dsb) = field_offset_of(&mir, "TypeProbe", "def_sub_bonus");
+    let (_, off_asc) = field_offset_of(&mir, "TypeProbe", "ascii_s");
+    let (_, off_u8s) = field_offset_of(&mir, "TypeProbe", "utf8_s");
+    let (_, off_nst) = field_offset_of(&mir, "TypeProbe", "nested_s");
+    let (_, off_tbase) = field_offset_of(&mir, "TypeProbe", "tbl_base");
+    let (_, off_tbonus) = field_offset_of(&mir, "TypeProbe", "tbl_bonus");
+    let (_, off_tbit) = field_offset_of(&mir, "TypeProbe", "tbl_has_bit");
+    let (_, off_ttxt) = field_offset_of(&mir, "TypeProbe", "tbl_txt");
+    let (mh_sz, _off_m) = field_offset_of(&mir, "MatHold", "m");
+    let (_, off_sub_txt) = field_offset_of(&mir, "SubInfo", "txt");
+
+    let word = std::mem::size_of::<usize>();
+    let idx = |off: usize| (off - 8) / word;
+    let s_spawn = idx(api_slots::CMD_SPAWN);
+    let s_bind = idx(api_slots::BIND_NAMED_OBJECT);
+    let mut c_code = c_abi_prelude();
+    c_code.push_str(&format!(
+        r#"
+#define SLOT_CMD_SPAWN {s_spawn}u
+#define SLOT_BIND_NAMED_OBJECT {s_bind}u
+static int g_hctx = 1, g_lctx = 2, g_sctx = 3, g_cmds = 9;
+static uint32_t g_next_c = 10, g_tp_comp = 0, g_mh_comp = 0;
+static size_t g_tp_reg_sz = 0, g_mh_reg_sz = 0;
+typedef struct SysReg {{ char name[64]; BamSystemFn cb; void* ud; }} SysReg;
+static SysReg g_sys[8];
+static size_t g_sys_n = 0;
+static uint8_t g_tp_buf[{tp_sz}];
+static uint8_t g_mh_buf[{mh_sz}];
+static uint64_t g_ents[1] = {{ 42ull }};
+static size_t g_it_stage = 0;
+static int g_init_done = 0;
+
+static void* h_lhc(const void* p) {{ (void)p; return &g_hctx; }}
+static uint32_t h_res_comp(const void* hc, const char* n, const BamComponentUuid* u, uint32_t* o) {{ (void)hc;(void)n;(void)u;(void)o; return 4; }}
+static uint32_t h_linfo(const void* hc, uint32_t c, BamLayoutInfo* i) {{ (void)hc;(void)c;(void)i; return 4; }}
+static uint32_t h_reg_comp(void* lc, const BamComponentDesc* d, uint32_t* o) {{
+    (void)lc; uint32_t id = g_next_c++;
+    if (d->name && strstr(d->name, "TypeProbe")) {{ g_tp_comp = id; g_tp_reg_sz = d->size; }}
+    if (d->name && strstr(d->name, "MatHold")) {{ g_mh_comp = id; g_mh_reg_sz = d->size; }}
+    *o = id; return 0;
+}}
+static uint32_t h_reg_sys(void* lc, const BamSystemDesc* d, uint32_t* o) {{
+    (void)lc;
+    snprintf(g_sys[g_sys_n].name, 64, "%s", d->name ? d->name : "");
+    g_sys[g_sys_n].cb = d->callback; g_sys[g_sys_n].ud = d->user_data;
+    *o = (uint32_t)(++g_sys_n); return 0;
+}}
+static uint32_t h_sys_cmds(void* sc, void** o) {{ (void)sc; *o = &g_cmds; return 0; }}
+static uint32_t h_cmd_spawn(void* cmds, const uint32_t* comps, const void* const* ptrs, size_t cnt, uint64_t* out_e) {{
+    (void)cmds; *out_e = 42ull;
+    for (size_t i = 0; i < cnt; i++) {{
+        if (comps[i] == g_mh_comp && ptrs[i]) memcpy(g_mh_buf, ptrs[i], {mh_sz});
+    }}
+    return 0;
+}}
+static uint32_t h_bind_obj(void* hc, const char* n, size_t l, uint64_t e) {{ (void)hc;(void)n;(void)l;(void)e; return 0; }}
+static uint32_t h_sys_q(void* sc, size_t qi, void** o) {{ (void)sc;(void)qi; g_it_stage = 0; *o = (void*)0x1111; return 0; }}
+static uint32_t h_it_rst(void* it) {{ (void)it; g_it_stage = 0; return 0; }}
+static uint8_t h_next(void* it, size_t* len) {{ (void)it; if (g_init_done && g_it_stage == 0) {{ g_it_stage = 1; *len = 1; return 1; }} *len = 0; return 0; }}
+static const uint64_t* h_ents(void* it) {{ (void)it; return g_ents; }}
+static void* h_col(void* it, size_t ti) {{ (void)it; return (ti == 0) ? (void*)g_tp_buf : (void*)g_mh_buf; }}
+
+int main(int argc, char** argv) {{
+    if (argc < 2) return 2;
+    void* dl = dlopen(argv[1], RTLD_NOW);
+    if (!dl) return 3;
+    typedef uint32_t (*InitFn)(const BamHostApi*, void*, void**);
+    typedef void (*ShutFn)(void*);
+    InitFn init_fn = (InitFn)dlsym(dl, "bamabi_init");
+    ShutFn shut_fn = (ShutFn)dlsym(dl, "bamabi_shutdown");
+    BamHostApi api; memset(&api, 0, sizeof(api));
+    api.struct_size = (uint32_t)sizeof(api); api.abi_version = WIRE_ABI_VER;
+    api.slots[SLOT_LOAD_HOST_CTX] = (void*)h_lhc;
+    api.slots[SLOT_REGISTER_COMPONENT] = (void*)h_reg_comp;
+    api.slots[SLOT_RESOLVE_COMPONENT] = (void*)h_res_comp;
+    api.slots[SLOT_COMPONENT_LAYOUT_INFO] = (void*)h_linfo;
+    api.slots[SLOT_REGISTER_SYSTEM] = (void*)h_reg_sys;
+    api.slots[SLOT_REGISTER_SYSTEM_HANDLE] = (void*)h_reg_sys;
+    api.slots[SLOT_SYS_COMMANDS] = (void*)h_sys_cmds;
+    api.slots[SLOT_CMD_SPAWN] = (void*)h_cmd_spawn;
+    api.slots[SLOT_BIND_NAMED_OBJECT] = (void*)h_bind_obj;
+    api.slots[SLOT_SYS_QUERY] = (void*)h_sys_q;
+    api.slots[SLOT_ITER_RESET] = (void*)h_it_rst;
+    api.slots[SLOT_ITER_NEXT_CHUNK] = (void*)h_next;
+    api.slots[SLOT_ITER_ENTITIES] = (void*)h_ents;
+    api.slots[SLOT_ITER_COL_RO] = (void*)h_col;
+    api.slots[SLOT_ITER_COL_MUT] = (void*)h_col;
+    api.slots[SLOT_ITER_COL_MUT_UNTRACKED] = (void*)h_col;
+
+    void* state = NULL;
+    if (init_fn(&api, &g_lctx, &state) != 0) return 4;
+    if (g_tp_reg_sz != {tp_sz} || g_mh_reg_sz != {mh_sz}) return 5;
+
+    memset(g_tp_buf, 0, sizeof(g_tp_buf));
+    memset(g_mh_buf, 0, sizeof(g_mh_buf));
+    for (size_t i = 0; i < g_sys_n; i++) {{
+        if (strcmp(g_sys[i].name, "strata_init_objects") == 0) g_sys[i].cb(&g_sctx, g_sys[i].ud);
+    }}
+    g_init_done = 1;
+    for (size_t i = 0; i < g_sys_n; i++) {{
+        if (strcmp(g_sys[i].name, "eval_types") == 0) g_sys[i].cb(&g_sctx, g_sys[i].ud);
+    }}
+
+    int32_t hb=0, hs=0, hc=0, a2d=0, bav=0, svl=0, svv=0, dbv=0, dsb=0, tbase=0, tbonus=0, tbit=0;
+    float md0=0, md1=0;
+    memcpy(&hb, g_tp_buf + {off_hb}, 4);
+    memcpy(&hs, g_tp_buf + {off_hs}, 4);
+    memcpy(&hc, g_tp_buf + {off_hc}, 4);
+    memcpy(&md0, g_tp_buf + {off_mat_rt}, 4);
+    memcpy(&md1, g_tp_buf + {off_mat_rt} + 16, 4);
+    memcpy(&a2d, g_tp_buf + {off_a2d}, 4);
+    memcpy(&bav, g_tp_buf + {off_bav}, 4);
+    memcpy(&svl, g_tp_buf + {off_svl}, 4);
+    memcpy(&svv, g_tp_buf + {off_svv}, 4);
+    memcpy(&dbv, g_tp_buf + {off_dbv}, 4);
+    memcpy(&dsb, g_tp_buf + {off_dsb}, 4);
+    memcpy(&tbase, g_tp_buf + {off_tbase}, 4);
+    memcpy(&tbonus, g_tp_buf + {off_tbonus}, 4);
+    memcpy(&tbit, g_tp_buf + {off_tbit}, 4);
+
+    if (hb != 0 || hs != 1 || hc != 0) {{ fprintf(stderr, "BitSet %d %d %d\n", hb, hs, hc); return 10; }}
+    if (fabsf(md0 - 1.0f) > 1e-4f || fabsf(md1 - 1.0f) > 1e-4f) {{ fprintf(stderr, "mat3 %f %f\n", md0, md1); return 11; }}
+    if (a2d != 42 || bav != 77 || svl != 3 || svv != 30) {{ fprintf(stderr, "arr/sv %d %d %d %d\n", a2d, bav, svl, svv); return 12; }}
+    if (dbv != 99 || dsb != 33) {{ fprintf(stderr, "defaults %d %d\n", dbv, dsb); return 13; }}
+    if (tbase != -12 || tbonus != 77 || tbit != 1) {{ fprintf(stderr, "table %d %d %d\n", tbase, tbonus, tbit); return 14; }}
+
+    uint32_t asc_len = 0, u8_len = 0, nst_len = 0, ttxt_len = 0;
+    memcpy(&asc_len, g_tp_buf + {off_asc}, 4);
+    memcpy(&u8_len, g_tp_buf + {off_u8s}, 4);
+    memcpy(&nst_len, g_tp_buf + {off_nst} + {off_sub_txt}, 4);
+    memcpy(&ttxt_len, g_tp_buf + {off_ttxt}, 4);
+    if (asc_len != 8 || memcmp(g_tp_buf + {off_asc} + 4, "abcdefgh", 8) != 0) return 15;
+    if (u8_len != 2 || memcmp(g_tp_buf + {off_u8s} + 4, "hi\0\0", 4) != 0) return 16;
+    if (nst_len != 2 || memcmp(g_tp_buf + {off_nst} + {off_sub_txt} + 4, "cp", 2) != 0) return 17;
+    if (ttxt_len != 3 || memcmp(g_tp_buf + {off_ttxt} + 4, "low", 3) != 0) return 18;
+    (void){off_flags_arr};
+
+    shut_fn(state);
+    dlclose(dl);
+    return 0;
+}}
+"#
+    ));
+    run_c_host_harness(tmp.path(), "jit_tl_step3", &c_code, &artifact.dylib_path);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn jit_regression_ecs_par_streams_relations_added_without_and_startup_before() {
+    use strata_jit::abi_offsets::api_slots;
+    let src = r#"
+module test::jit_ecs_step4 @version(1.0.0);
+
+tag TagA;
+tag TagB;
+component Node { v: i32 = 1 }
+@sparse component SpVal { w: f32 = 2.5 }
+resource Counter { total: i32 = 0 }
+resource ResultOut { sp_sum: f32 = 0.0, up_hits: i32 = 0, obs_seen: i32 = 0 }
+
+stream Ping { code: i32 }
+event Hit { dmg: i32 }
+
+relation CustomParent [exclusive];
+
+object BootMarker {
+    Node { v: 77 }
+}
+
+fn write_res_helper(delta: i32) {
+    res_mut<Counter>().total += delta;
+}
+
+@par
+sys par_with_res() {
+    for r in query(n: &Node) {
+        write_res_helper(r.n.v);
+    }
+}
+
+@par
+sys par_sparse(o: &mut res ResultOut) {
+    let s: f32 = for row in query(s: &SpVal) reduce(acc: sum(0.0, row.s.w));
+    o.sp_sum = s;
+}
+
+sys emit_and_rel(c: &mut Counter) {
+    emit(Ping { code: 42 });
+    let e1: Entity = spawn(Node { v: 1 });
+    let e2: Entity = spawn(Node { v: 2 });
+    insert_relation<ChildOf>(e2, e1);
+    insert_relation<CustomParent>(e2, e1);
+    trigger(e2, Hit { dmg: 10 }, propagate: true);
+    despawn_all<With<TagB>, Without<TagA>>();
+    for _r in query(n: &Node).added<Node>() {
+        c.total += 0;
+    }
+    let mut sum_up: i32 = 0;
+    for r in query(n: &Node).up<CustomParent>() {
+        sum_up += r.n.v;
+    }
+    res_mut<ResultOut>().up_hits = sum_up;
+}
+
+obs on_hit(e: &Trigger<Hit>, p: stream_in<Ping>, out: &mut res ResultOut) {
+    let _ = e.payload.dmg;
+    out.obs_seen = p.code;
+}
+
+sys boot_task() {}
+
+schedule Startup { boot_task }
+schedule FixedUpdate { par_with_res, par_sparse, emit_and_rel }
+"#;
+    let analyzed = analyze_source("jit_ecs_step4.strata", src);
+    assert!(analyzed.ok(), "sema: {:?}", analyzed.diagnostics);
+    let mir = lower_to_mir(&analyzed);
+    let tmp = TempDir::new().expect("tempdir");
+    let artifact = compile_module_to_dylib(
+        &mir,
+        &JitCompileOptions {
+            out_dir: tmp.path().to_path_buf(),
+            module_stem: "jit_ecs_step4".to_owned(),
+            opt_level: JitOptLevel::Speed,
+        },
+    )
+    .expect("compile_module_to_dylib");
+
+    use strata_jit::abi_offsets::structs::{
+        OBS_CTX_CALLBACK, OBS_NAME, OBS_QUERIES, OBS_QUERY_COUNT, OBS_USER_DATA,
+    };
+    let (node_sz, _) = field_offset_of(&mir, "Node", "v");
+    let (sp_sz, off_spw) = field_offset_of(&mir, "SpVal", "w");
+    let (cnt_sz, off_cnt) = field_offset_of(&mir, "Counter", "total");
+    let (ro_sz, off_sps) = field_offset_of(&mir, "ResultOut", "sp_sum");
+    let (_, off_uh) = field_offset_of(&mir, "ResultOut", "up_hits");
+    let (_, off_obs) = field_offset_of(&mir, "ResultOut", "obs_seen");
+    let (ping_sz, _) = field_offset_of(&mir, "Ping", "code");
+    let (_, off_hit_dmg) = field_offset_of(&mir, "Hit", "dmg");
+
+    let word = std::mem::size_of::<usize>();
+    let idx = |off: usize| (off - 8) / word;
+    let s_col_rows_ro = idx(api_slots::ITER_COLUMN_ROWS_READONLY);
+    let s_par_ro = idx(api_slots::PAR_FOR_EACH_CHUNK_READONLY);
+    let s_par_mut = idx(api_slots::PAR_FOR_EACH_CHUNK);
+    let s_msg_send = idx(api_slots::MSG_SEND);
+    let s_msg_rb = idx(api_slots::MSG_READ_BATCH);
+    let s_cmd_spawn = idx(api_slots::CMD_SPAWN);
+    let s_cmd_insert = idx(api_slots::CMD_INSERT);
+    let s_cmd_ins_rel = idx(api_slots::CMD_INSERT_RELATION);
+    let s_cmd_trig_ex = idx(api_slots::CMD_TRIGGER_EX);
+    let s_cmd_desp_all = idx(api_slots::CMD_DESPAWN_ALL);
+    let s_reg_obs = idx(api_slots::REGISTER_OBSERVER);
+    let s_bind_obj = idx(api_slots::BIND_NAMED_OBJECT);
+    let flag_res = bamabi_sys::BAM_STORAGE_FLAG_RESOURCE;
+    let flag_msg = bamabi_sys::BAM_STORAGE_FLAG_MESSAGE;
+    let flag_added = bamabi_sys::BAM_TERM_FLAG_ADDED;
+    let flag_prop = bamabi_sys::BAM_TRIGGER_FLAG_PROPAGATE;
+    let invalid_comp = strata_jit::abi_offsets::BAM_COMPONENT_INVALID;
+    let access_without = bamabi_sys::AccessMode::WITHOUT.0;
+
+    let mut c_code = c_abi_prelude();
+    c_code.push_str(&format!(
+        r#"
+#define SLOT_COL_ROWS_RO {s_col_rows_ro}u
+#define SLOT_PAR_RO {s_par_ro}u
+#define SLOT_PAR_MUT {s_par_mut}u
+#define SLOT_MSG_SEND {s_msg_send}u
+#define SLOT_MSG_RB {s_msg_rb}u
+#define SLOT_CMD_SPAWN {s_cmd_spawn}u
+#define SLOT_CMD_INSERT {s_cmd_insert}u
+#define SLOT_CMD_INS_REL {s_cmd_ins_rel}u
+#define SLOT_CMD_TRIG_EX {s_cmd_trig_ex}u
+#define SLOT_CMD_DESP_ALL {s_cmd_desp_all}u
+#define SLOT_REGISTER_OBSERVER {s_reg_obs}u
+#define SLOT_BIND_OBJ {s_bind_obj}u
+
+typedef struct BamTriggerDesc {{
+    uint32_t struct_size; uint32_t flags; uint32_t event; uint32_t event_kind;
+    uint32_t entity_lo; uint32_t entity_hi; const void* data_ptr; size_t data_len;
+    const uint32_t* watched_components; size_t watched_component_count;
+    uint32_t propagate_relationship; uint32_t reserved0;
+}} BamTriggerDesc;
+
+typedef uint32_t (*BamObsCtxFn)(uint64_t entity, const void* ev, void* sys_ctx, void* ud);
+
+static int g_hctx = 1, g_lctx = 2, g_sctx = 3, g_cmds = 9;
+static uint32_t g_next_c = 10;
+static uint32_t g_node_c = 0, g_sp_c = 0, g_taga_c = 0, g_tagb_c = 0, g_cnt_c = 0, g_ro_c = 0, g_ping_c = 0;
+static uint32_t g_childof_c = 0, g_custom_parent_c = 0, g_custom_rel_h = 0;
+static int g_ping_is_msg = 0, g_startup_has_before = 0, g_added_flag_ok = 0, g_without_ok = 0;
+static int g_childof_ins_ok = 0, g_custom_parent_ins_ok = 0, g_trig_prop_ok = 0, g_up_rel_comp_ok = 0;
+static uint32_t g_obs_ping_c = 0;
+static BamObsCtxFn g_obs_ctx_cb = NULL;
+static void* g_obs_ud = NULL;
+
+typedef struct SysReg {{ char name[64]; BamSystemFn cb; void* ud; uint32_t q_comp[8]; }} SysReg;
+static SysReg g_sys[16];
+static size_t g_sys_n = 0;
+static SysReg* g_cur_sys = NULL;
+
+static uint8_t g_cnt_buf[{cnt_sz}];
+static uint8_t g_ro_buf[{ro_sz}];
+static uint8_t g_nodes[4 * {node_sz}];
+static uint8_t g_sp_rows[4][{sp_sz}];
+static void* g_sp_ptrs[4] = {{ g_sp_rows[0], g_sp_rows[1], g_sp_rows[2], g_sp_rows[3] }};
+static uint64_t g_ents[4] = {{ 1, 2, 3, 4 }};
+static uint8_t g_ping_msg[64];
+static size_t g_ping_len = 0, g_ping_sent = 0, g_next_ent = 500;
+typedef struct Iter {{ uint32_t comp; size_t st; }} Iter;
+static Iter g_it[16];
+
+static void* h_lhc(const void* p) {{ (void)p; return &g_hctx; }}
+static uint32_t h_res_comp(const void* hc, const char* n, const BamComponentUuid* u, uint32_t* o) {{
+    (void)hc;(void)u;
+    if (n && strcmp(n, "bevy_ecs::hierarchy::ChildOf") == 0) {{ g_childof_c = 9001u; *o = g_childof_c; return 0; }}
+    if (n && strstr(n, "Counter")) {{ g_cnt_c = 9002u; *o = g_cnt_c; return 0; }}
+    if (n && strstr(n, "ResultOut")) {{ g_ro_c = 9003u; *o = g_ro_c; return 0; }}
+    return 4;
+}}
+static uint32_t h_linfo(const void* hc, uint32_t c, BamLayoutInfo* i) {{
+    (void)hc; memset(i, 0, sizeof(*i)); i->struct_size = (uint32_t)sizeof(*i);
+    if (c == g_ping_c && g_ping_is_msg) {{ i->flags = {flag_msg}u; i->size = {ping_sz}u; i->align = 4u; return 0; }}
+    if (c == g_cnt_c) {{ i->flags = {flag_res}u; i->size = {cnt_sz}u; i->align = 4u; return 0; }}
+    if (c == g_ro_c) {{ i->flags = {flag_res}u; i->size = {ro_sz}u; i->align = 4u; return 0; }}
+    return 4;
+}}
+static uint32_t h_reg_comp(void* lc, const BamComponentDesc* d, uint32_t* o) {{
+    (void)lc; uint32_t id = g_next_c++;
+    if (d->name) {{
+        if (strstr(d->name, "Node")) g_node_c = id;
+        if (strstr(d->name, "SpVal")) g_sp_c = id;
+        if (strstr(d->name, "TagA")) g_taga_c = id;
+        if (strstr(d->name, "TagB")) g_tagb_c = id;
+        if (strstr(d->name, "Counter")) g_cnt_c = id;
+        if (strstr(d->name, "ResultOut")) g_ro_c = id;
+        if (strstr(d->name, "Ping")) {{ g_ping_c = id; if (d->flags & {flag_msg}u) g_ping_is_msg = 1; }}
+        if (strstr(d->name, "__strata_rel_parent_CustomParent")) g_custom_parent_c = id;
+    }}
+    *o = id; return 0;
+}}
+static uint32_t h_reg_rel(void* lc, const void* d, uint32_t* o) {{ (void)lc;(void)d; g_custom_rel_h = 8001u; *o = g_custom_rel_h; return 0; }}
+static uint32_t h_reg_sys(void* lc, const BamSystemDesc* d, uint32_t* o) {{
+    (void)lc;
+    SysReg* r = &g_sys[g_sys_n];
+    snprintf(r->name, 64, "%s", d->name ? d->name : "");
+    r->cb = d->callback; r->ud = d->user_data;
+    for (size_t qi = 0; qi < d->query_count && qi < 8; qi++) {{
+        r->q_comp[qi] = d->queries[qi].term_count > 0 ? d->queries[qi].terms[0].component : 0;
+        for (size_t ti = 0; ti < d->queries[qi].term_count; ti++) {{
+            if (d->queries[qi].terms[ti].component == g_node_c && (d->queries[qi].terms[ti].flags & {flag_added}u)) g_added_flag_ok = 1;
+        }}
+    }}
+    if (d->name && strcmp(d->name, "strata_init_objects") == 0) {{
+        for (size_t bi = 0; bi < d->before_count; bi++) {{
+            if (d->before[bi] && strcmp(d->before[bi], "boot_task") == 0) g_startup_has_before = 1;
+        }}
+    }}
+    *o = (uint32_t)(++g_sys_n); return 0;
+}}
+static uint32_t h_sys_cmds(void* sc, void** o) {{ (void)sc; *o = &g_cmds; return 0; }}
+static uint32_t h_sys_q(void* sc, size_t qi, void** o) {{
+    (void)sc; size_t idx = qi < 16 ? qi : 0;
+    g_it[idx].comp = g_cur_sys ? g_cur_sys->q_comp[idx] : g_obs_ping_c;
+    g_it[idx].st = 0; *o = &g_it[idx]; return 0;
+}}
+static uint32_t h_it_rst(void* it) {{ ((Iter*)it)->st = 0; return 0; }}
+static uint8_t h_next(void* it, size_t* len) {{
+    Iter* s = (Iter*)it; if (s->st == 0) {{ s->st = 1; *len = 4; return 1; }} *len = 0; return 0;
+}}
+static const uint64_t* h_ents(void* it) {{ (void)it; return g_ents; }}
+static void* h_col(void* it, size_t ti) {{
+    (void)ti; Iter* s = (Iter*)it;
+    return (s->comp == g_sp_c) ? (void*)g_sp_ptrs : (void*)g_nodes;
+}}
+static void* h_res_ptr(void* sc, uint32_t c, void* t) {{
+    (void)sc;(void)t;
+    if (c == g_cnt_c) return g_cnt_buf;
+    if (c == g_ro_c) return g_ro_buf;
+    return NULL;
+}}
+static uint32_t h_par(void* it, uint32_t (*cb)(void*, void*), void* frame) {{ return cb(it, frame); }}
+static uint32_t h_msg_send(void* it, size_t ti, const void* p, size_t l) {{
+    (void)it;(void)ti; if (l <= sizeof(g_ping_msg)) {{ memcpy(g_ping_msg, p, l); g_ping_len = l; g_ping_sent = 1; }} return 0;
+}}
+static uint32_t h_msg_rb(void* it, size_t ti, uint8_t* b, size_t m, size_t* out_r) {{
+    (void)it;(void)ti; if (g_ping_sent && m > 0) {{ memcpy(b, g_ping_msg, g_ping_len); *out_r = 1; g_ping_sent = 0; }} else *out_r = 0; return 0;
+}}
+static uint32_t h_cmd_spawn(void* cmds, const uint32_t* cs, const void* const* ps, size_t n, uint64_t* oe) {{
+    (void)cmds;(void)cs;(void)ps;(void)n; *oe = g_next_ent++; return 0;
+}}
+static uint32_t h_cmd_ins(void* cmds, uint64_t e, uint32_t c, const void* d, size_t l) {{
+    (void)cmds;(void)e;(void)d;(void)l;
+    if (c == g_childof_c) g_childof_ins_ok = 1;
+    if (c == g_custom_parent_c) g_custom_parent_ins_ok = 1;
+    return 0;
+}}
+static uint32_t h_cmd_ins_rel(void* cmds, uint32_t r, uint64_t e, uint64_t t, const void* d, size_t l) {{
+    (void)cmds;(void)r;(void)e;(void)t;(void)d;(void)l; return 0;
+}}
+static uint32_t h_cmd_trig_ex(void* cmds, const BamTriggerDesc* d) {{
+    (void)cmds;
+    if (d && (d->flags & {flag_prop}u) && d->propagate_relationship == {invalid_comp}u) g_trig_prop_ok = 1;
+    return 0;
+}}
+static uint32_t h_cmd_desp_all(void* cmds, const BamTermDesc* ts, size_t cnt) {{
+    (void)cmds;
+    for (size_t i = 0; i < cnt; i++) {{
+        if (ts[i].component == g_taga_c && ts[i].mode == {access_without}u) g_without_ok = 1;
+    }}
+    return 0;
+}}
+static uint32_t h_up_cascade(void* it, uint32_t rel, uint64_t e, size_t ti, const void** out_p, uint64_t* out_e) {{
+    (void)it;(void)ti;
+    if (rel == g_custom_parent_c) g_up_rel_comp_ok = 1;
+    if (e == 1) {{ *out_p = g_nodes; *out_e = 99; return 0; }}
+    *out_p = NULL; *out_e = 0; return 4;
+}}
+static uint32_t h_reg_obs(void* lc, const void* desc_ptr) {{
+    (void)lc;
+    const uint8_t* p = (const uint8_t*)desc_ptr;
+    const char* name = *(const char* const*)(p + {OBS_NAME});
+    if (name && strstr(name, "on_hit")) {{
+        g_obs_ctx_cb = *(const BamObsCtxFn*)(p + {OBS_CTX_CALLBACK});
+        g_obs_ud = *(void* const*)(p + {OBS_USER_DATA});
+        const BamQueryDesc* qs = *(const BamQueryDesc* const*)(p + {OBS_QUERIES});
+        size_t qc = *(const size_t*)(p + {OBS_QUERY_COUNT});
+        if (qc > 0 && qs && qs[0].term_count > 0) g_obs_ping_c = qs[0].terms[0].component;
+    }}
+    return 0;
+}}
+static uint32_t h_mark_chg(void* it, size_t ti, size_t s, size_t l) {{ (void)it;(void)ti;(void)s;(void)l; return 0; }}
+static uint32_t h_bind_obj(void* hc, const char* n, size_t l, uint64_t e) {{ (void)hc;(void)n;(void)l;(void)e; return 0; }}
+
+int main(int argc, char** argv) {{
+    if (argc < 2) return 2;
+    void* dl = dlopen(argv[1], RTLD_NOW);
+    if (!dl) return 3;
+    typedef uint32_t (*InitFn)(const BamHostApi*, void*, void**);
+    typedef void (*ShutFn)(void*);
+    InitFn init_fn = (InitFn)dlsym(dl, "bamabi_init");
+    ShutFn shut_fn = (ShutFn)dlsym(dl, "bamabi_shutdown");
+    BamHostApi api; memset(&api, 0, sizeof(api));
+    api.struct_size = (uint32_t)sizeof(api); api.abi_version = WIRE_ABI_VER;
+    api.slots[SLOT_LOAD_HOST_CTX] = (void*)h_lhc;
+    api.slots[SLOT_REGISTER_COMPONENT] = (void*)h_reg_comp;
+    api.slots[SLOT_RESOLVE_COMPONENT] = (void*)h_res_comp;
+    api.slots[SLOT_COMPONENT_LAYOUT_INFO] = (void*)h_linfo;
+    api.slots[SLOT_REGISTER_RELATION] = (void*)h_reg_rel;
+    api.slots[SLOT_REGISTER_SYSTEM] = (void*)h_reg_sys;
+    api.slots[SLOT_REGISTER_SYSTEM_HANDLE] = (void*)h_reg_sys;
+    api.slots[SLOT_SYS_COMMANDS] = (void*)h_sys_cmds;
+    api.slots[SLOT_SYS_QUERY] = (void*)h_sys_q;
+    api.slots[SLOT_ITER_RESET] = (void*)h_it_rst;
+    api.slots[SLOT_ITER_NEXT_CHUNK] = (void*)h_next;
+    api.slots[SLOT_ITER_ENTITIES] = (void*)h_ents;
+    api.slots[SLOT_ITER_COL_RO] = (void*)h_col;
+    api.slots[SLOT_ITER_COL_MUT] = (void*)h_col;
+    api.slots[SLOT_ITER_COL_MUT_UNTRACKED] = (void*)h_col;
+    api.slots[SLOT_ITER_MARK_CHANGED_RANGE] = (void*)h_mark_chg;
+    api.slots[SLOT_COL_ROWS_RO] = (void*)h_col;
+    api.slots[SLOT_SYS_RES_PTR] = (void*)h_res_ptr;
+    api.slots[SLOT_SYS_RES_MUT_PTR] = (void*)h_res_ptr;
+    api.slots[SLOT_PAR_RO] = (void*)h_par;
+    api.slots[SLOT_PAR_MUT] = (void*)h_par;
+    api.slots[SLOT_MSG_SEND] = (void*)h_msg_send;
+    api.slots[SLOT_MSG_RB] = (void*)h_msg_rb;
+    api.slots[SLOT_CMD_SPAWN] = (void*)h_cmd_spawn;
+    api.slots[SLOT_CMD_INSERT] = (void*)h_cmd_ins;
+    api.slots[SLOT_CMD_INS_REL] = (void*)h_cmd_ins_rel;
+    api.slots[SLOT_CMD_TRIG_EX] = (void*)h_cmd_trig_ex;
+    api.slots[SLOT_CMD_DESP_ALL] = (void*)h_cmd_desp_all;
+    api.slots[SLOT_ITER_UP_CASCADE] = (void*)h_up_cascade;
+    api.slots[SLOT_REGISTER_OBSERVER] = (void*)h_reg_obs;
+    api.slots[SLOT_BIND_OBJ] = (void*)h_bind_obj;
+
+    void* state = NULL;
+    if (init_fn(&api, &g_lctx, &state) != 0) return 4;
+    if (!g_ping_is_msg || !g_startup_has_before || !g_added_flag_ok) {{
+        fprintf(stderr, "flags msg=%d boot=%d added=%d\n", g_ping_is_msg, g_startup_has_before, g_added_flag_ok);
+        return 5;
+    }}
+
+    memset(g_cnt_buf, 0, sizeof(g_cnt_buf));
+    memset(g_ro_buf, 0, sizeof(g_ro_buf));
+    for (int i = 0; i < 4; i++) {{
+        int32_t nv = i + 1;
+        float sv = 2.5f;
+        memcpy(g_nodes + i * {node_sz}, &nv, 4);
+        memcpy(g_sp_rows[i] + {off_spw}, &sv, 4);
+    }}
+    for (size_t i = 0; i < g_sys_n; i++) {{
+        if (strcmp(g_sys[i].name, "boot_task") == 0) continue;
+        if (strcmp(g_sys[i].name, "strata_init_objects") == 0) continue;
+        g_cur_sys = &g_sys[i];
+        g_sys[i].cb(&g_sctx, g_sys[i].ud);
+    }}
+    if (g_obs_ctx_cb) {{
+        uint64_t tgt_e = 5;
+        int32_t dmg = 10;
+        uint8_t ev_pkt[64];
+        memset(ev_pkt, 0, sizeof(ev_pkt));
+        memcpy(ev_pkt + {off_hit_dmg}, &dmg, 4);
+        g_cur_sys = NULL;
+        g_obs_ctx_cb(tgt_e, ev_pkt, &g_sctx, g_obs_ud);
+    }}
+
+    int32_t total = 0, up_hits = 0, obs_seen = 0;
+    float sp_sum = 0.0f;
+    memcpy(&total, g_cnt_buf + {off_cnt}, 4);
+    memcpy(&sp_sum, g_ro_buf + {off_sps}, 4);
+    memcpy(&up_hits, g_ro_buf + {off_uh}, 4);
+    memcpy(&obs_seen, g_ro_buf + {off_obs}, 4);
+    if (total != 10) {{ fprintf(stderr, "PM-06 total=%d\n", total); return 10; }}
+    if (fabsf(sp_sum - 10.0f) > 1e-4f) {{ fprintf(stderr, "PM-13 sp_sum=%f\n", sp_sum); return 11; }}
+    if (!g_childof_ins_ok || !g_custom_parent_ins_ok || !g_trig_prop_ok || !g_up_rel_comp_ok || up_hits != 1) {{
+        fprintf(stderr, "EQ-05 child=%d cparent=%d trig=%d up=%d hits=%d\n",
+            g_childof_ins_ok, g_custom_parent_ins_ok, g_trig_prop_ok, g_up_rel_comp_ok, up_hits);
+        return 12;
+    }}
+    if (!g_without_ok || obs_seen != 42) {{ fprintf(stderr, "GF13/EQ01 without=%d obs=%d\n", g_without_ok, obs_seen); return 13; }}
+
+    shut_fn(state);
+    dlclose(dl);
+    return 0;
+}}
+"#
+    ));
+    run_c_host_harness(tmp.path(), "jit_ecs_step4", &c_code, &artifact.dylib_path);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn jit_regression_spatial_limits_history_xz_and_run_if() {
+    use strata_jit::abi_offsets::api_slots;
+    let src = r#"
+module test::jit_sw_step5 @version(1.0.0);
+
+component Pos3 { xyz: vec3 = vec3(0.0, 0.0, 0.0) }
+resource OutSw {
+    disc64: i32 = 0,
+    seg64: i32 = 0,
+    seg_oob4: i32 = 9,
+    seg_umax: i32 = 9,
+    xz_v2: i32 = 0,
+    xz_v3_y0: i32 = 0,
+    xz_v3_y99: i32 = 0,
+    xz_seg: i32 = 0,
+    blocked_ran: i32 = 0,
+}
+
+spatial_grid GridXZ(cell_size: 4.0_m, bounds: vec2(-32.0_m, -32.0_m)..vec2(32.0_m, 32.0_m), capacity: 128) over Pos3 by Pos3.xyz;
+spatial_history HistXZ(frames: 4, cell_size: 4.0_m, bounds: vec2(-32.0_m, -32.0_m)..vec2(32.0_m, 32.0_m), capacity: 128) over Pos3 by Pos3.xyz;
+
+sys scan_all(g: &res GridXZ, h: &res HistXZ, out: &mut res OutSw) {
+    let mut c_disc: i32 = 0;
+    for _hit in g.query_disc(vec2(1.0, 1.0), 0.5_m) { c_disc += 1; }
+    out.disc64 = c_disc;
+
+    let mut c_seg: i32 = 0;
+    for _hit in h.query_segment_at(0, vec3(0.5, 0.0, 1.0), vec3(1.5, 0.0, 1.0), 0.5_m) { c_seg += 1; }
+    out.seg64 = c_seg;
+
+    let mut c_oob4: i32 = 0;
+    for _hit in h.query_segment_at(4, vec3(0.5, 0.0, 1.0), vec3(1.5, 0.0, 1.0), 0.5_m) { c_oob4 += 1; }
+    out.seg_oob4 = c_oob4;
+
+    let mut c_umax: i32 = 0;
+    for _hit in h.query_segment_at(4294967295_u32, vec3(0.5, 0.0, 1.0), vec3(1.5, 0.0, 1.0), 0.5_m) { c_umax += 1; }
+    out.seg_umax = c_umax;
+
+    let mut c_v2: i32 = 0;
+    for _hit in g.query_disc(vec2(10.0, 12.0), 1.0_m) { c_v2 += 1; }
+    out.xz_v2 = c_v2;
+
+    let mut c_v3_y0: i32 = 0;
+    for _hit in g.query_disc(vec3(10.0, 0.0, 12.0), 1.0_m) { c_v3_y0 += 1; }
+    out.xz_v3_y0 = c_v3_y0;
+
+    let mut c_v3_y99: i32 = 0;
+    for _hit in g.query_disc(vec3(10.0, 99.0, 12.0), 1.0_m) { c_v3_y99 += 1; }
+    out.xz_v3_y99 = c_v3_y99;
+
+    let mut c_xseg: i32 = 0;
+    for _hit in h.query_segment_at(0, vec3(9.5, 0.0, 12.0), vec3(10.5, 0.0, 12.0), 1.0_m) { c_xseg += 1; }
+    out.xz_seg = c_xseg;
+}
+
+sys blocked_sys(out: &mut res OutSw) {
+    out.blocked_ran = 1;
+}
+
+schedule Update { scan_all }
+schedule FixedUpdate run_if(false) { blocked_sys }
+"#;
+    let analyzed = analyze_source("jit_sw_step5.strata", src);
+    assert!(analyzed.ok(), "sema: {:?}", analyzed.diagnostics);
+    let mir = lower_to_mir(&analyzed);
+    let tmp = TempDir::new().expect("tempdir");
+    let artifact = compile_module_to_dylib(
+        &mir,
+        &JitCompileOptions {
+            out_dir: tmp.path().to_path_buf(),
+            module_stem: "jit_sw_step5".to_owned(),
+            opt_level: JitOptLevel::Speed,
+        },
+    )
+    .expect("compile_module_to_dylib");
+
+    let (p3_sz, off_xyz) = field_offset_of(&mir, "Pos3", "xyz");
+    let (out_sz, off_d64) = field_offset_of(&mir, "OutSw", "disc64");
+    let (_, off_s64) = field_offset_of(&mir, "OutSw", "seg64");
+    let (_, off_oob4) = field_offset_of(&mir, "OutSw", "seg_oob4");
+    let (_, off_umax) = field_offset_of(&mir, "OutSw", "seg_umax");
+    let (_, off_v2) = field_offset_of(&mir, "OutSw", "xz_v2");
+    let (_, off_y0) = field_offset_of(&mir, "OutSw", "xz_v3_y0");
+    let (_, off_y99) = field_offset_of(&mir, "OutSw", "xz_v3_y99");
+    let (_, off_xs) = field_offset_of(&mir, "OutSw", "xz_seg");
+    let (_, off_blk) = field_offset_of(&mir, "OutSw", "blocked_ran");
+
+    let word = std::mem::size_of::<usize>();
+    let idx = |off: usize| (off - 8) / word;
+    let s_cfg_sset = idx(api_slots::CONFIGURE_SCHEDULE_SET);
+    let s_mnt_sys = idx(api_slots::MOUNT_SYSTEM_IN_SCHEDULE);
+    let flag_res = bamabi_sys::BAM_STORAGE_FLAG_RESOURCE;
+
+    let mut c_code = c_abi_prelude();
+    c_code.push_str(&format!(
+        r#"
+#define SLOT_CFG_SSET {s_cfg_sset}u
+#define SLOT_MNT_SYS {s_mnt_sys}u
+static int g_hctx = 1, g_lctx = 2, g_sctx = 3;
+static uint32_t g_next_c = 10, g_out_c = 100u;
+typedef struct SysReg {{ char name[96]; BamSystemFn cb; void* ud; uint32_t (*run_if_ctx)(void*, void*); void* run_if_ud; }} SysReg;
+static SysReg g_sys[16];
+static size_t g_sys_n = 0;
+static uint8_t g_pos_buf[65 * {p3_sz}];
+static uint64_t g_pos_ents[65];
+static uint8_t g_out_buf[{out_sz}];
+static size_t g_it_stage = 0;
+
+static void* h_lhc(const void* p) {{ (void)p; return &g_hctx; }}
+static uint32_t h_res_comp(const void* hc, const char* n, const BamComponentUuid* u, uint32_t* o) {{
+    (void)hc;(void)u; if (n && strstr(n, "OutSw")) {{ *o = g_out_c; return 0; }} return 4;
+}}
+static uint32_t h_linfo(const void* hc, uint32_t c, BamLayoutInfo* i) {{
+    (void)hc; memset(i, 0, sizeof(*i)); i->struct_size = (uint32_t)sizeof(*i);
+    if (c == g_out_c) {{ i->flags = {flag_res}u; i->size = {out_sz}u; i->align = 4u; return 0; }}
+    return 4;
+}}
+static uint32_t h_reg_comp(void* lc, const BamComponentDesc* d, uint32_t* o) {{
+    (void)lc; uint32_t id = g_next_c++; if (d->name && strstr(d->name, "OutSw")) g_out_c = id; *o = id; return 0;
+}}
+static uint32_t h_cfg_sset(void* lc, const void* d, uint32_t* o) {{ (void)lc;(void)d; if (o) *o = 1; return 0; }}
+static uint32_t h_mnt_sys(void* lc, uint32_t s, uint32_t sc, uint32_t ss) {{ (void)lc;(void)s;(void)sc;(void)ss; return 0; }}
+static uint32_t h_reg_sys(void* lc, const BamSystemDesc* d, uint32_t* o) {{
+    (void)lc; snprintf(g_sys[g_sys_n].name, 96, "%s", d->name ? d->name : "");
+    g_sys[g_sys_n].cb = d->callback; g_sys[g_sys_n].ud = d->user_data;
+    g_sys[g_sys_n].run_if_ctx = (uint32_t (*)(void*, void*))d->run_if_ctx;
+    g_sys[g_sys_n].run_if_ud = d->run_if_ctx_user_data;
+    *o = (uint32_t)(++g_sys_n); return 0;
+}}
+static uint32_t h_sys_q(void* sc, size_t qi, void** o) {{ (void)sc;(void)qi; g_it_stage = 0; *o = (void*)0x2222; return 0; }}
+static uint32_t h_it_rst(void* it) {{ (void)it; g_it_stage = 0; return 0; }}
+static uint8_t h_next(void* it, size_t* len) {{ (void)it; if (g_it_stage == 0) {{ g_it_stage = 1; *len = 65; return 1; }} *len = 0; return 0; }}
+static const uint64_t* h_ents(void* it) {{ (void)it; return g_pos_ents; }}
+static void* h_col(void* it, size_t ti) {{ (void)it;(void)ti; return g_pos_buf; }}
+static void* h_res_ptr(void* sc, uint32_t c, void* t) {{ (void)sc;(void)t; return (c == g_out_c) ? g_out_buf : NULL; }}
+
+int main(int argc, char** argv) {{
+    if (argc < 2) return 2;
+    void* dl = dlopen(argv[1], RTLD_NOW);
+    if (!dl) return 3;
+    typedef uint32_t (*InitFn)(const BamHostApi*, void*, void**);
+    typedef void (*ShutFn)(void*);
+    InitFn init_fn = (InitFn)dlsym(dl, "bamabi_init");
+    ShutFn shut_fn = (ShutFn)dlsym(dl, "bamabi_shutdown");
+    BamHostApi api; memset(&api, 0, sizeof(api));
+    api.struct_size = (uint32_t)sizeof(api); api.abi_version = WIRE_ABI_VER;
+    api.slots[SLOT_LOAD_HOST_CTX] = (void*)h_lhc;
+    api.slots[SLOT_REGISTER_COMPONENT] = (void*)h_reg_comp;
+    api.slots[SLOT_RESOLVE_COMPONENT] = (void*)h_res_comp;
+    api.slots[SLOT_COMPONENT_LAYOUT_INFO] = (void*)h_linfo;
+    api.slots[SLOT_CFG_SSET] = (void*)h_cfg_sset;
+    api.slots[SLOT_MNT_SYS] = (void*)h_mnt_sys;
+    api.slots[SLOT_REGISTER_SYSTEM] = (void*)h_reg_sys;
+    api.slots[SLOT_REGISTER_SYSTEM_HANDLE] = (void*)h_reg_sys;
+    api.slots[SLOT_SYS_QUERY] = (void*)h_sys_q;
+    api.slots[SLOT_ITER_RESET] = (void*)h_it_rst;
+    api.slots[SLOT_ITER_NEXT_CHUNK] = (void*)h_next;
+    api.slots[SLOT_ITER_ENTITIES] = (void*)h_ents;
+    api.slots[SLOT_ITER_COL_RO] = (void*)h_col;
+    api.slots[SLOT_ITER_COL_MUT] = (void*)h_col;
+    api.slots[SLOT_ITER_COL_MUT_UNTRACKED] = (void*)h_col;
+    api.slots[SLOT_SYS_RES_PTR] = (void*)h_res_ptr;
+    api.slots[SLOT_SYS_RES_MUT_PTR] = (void*)h_res_ptr;
+
+    void* state = NULL;
+    if (init_fn(&api, &g_lctx, &state) != 0) return 4;
+    memset(g_pos_buf, 0, sizeof(g_pos_buf));
+    memset(g_out_buf, 0, sizeof(g_out_buf));
+    for (int i = 0; i < 64; i++) {{
+        g_pos_ents[i] = (uint64_t)(100 + i);
+        float p[3] = {{ 1.0f, 0.0f, 1.0f }};
+        memcpy(g_pos_buf + i * {p3_sz} + {off_xyz}, p, 12);
+    }}
+    g_pos_ents[64] = 999ull;
+    float pxz[3] = {{ 10.0f, 99.0f, 12.0f }};
+    memcpy(g_pos_buf + 64 * {p3_sz} + {off_xyz}, pxz, 12);
+
+    for (size_t i = 0; i < g_sys_n; i++) {{
+        if (strstr(g_sys[i].name, "rebuild_csr")) g_sys[i].cb(&g_sctx, g_sys[i].ud);
+    }}
+    for (size_t i = 0; i < g_sys_n; i++) {{
+        if (!strstr(g_sys[i].name, "rebuild_csr")) {{
+            if (!g_sys[i].run_if_ctx || g_sys[i].run_if_ctx(&g_sctx, g_sys[i].run_if_ud)) {{
+                g_sys[i].cb(&g_sctx, g_sys[i].ud);
+            }}
+        }}
+    }}
+
+    int32_t d64=0, s64=0, oob4=9, umax=9, v2=0, y0=0, y99=0, xs=0, blk=9;
+    memcpy(&d64, g_out_buf + {off_d64}, 4);
+    memcpy(&s64, g_out_buf + {off_s64}, 4);
+    memcpy(&oob4, g_out_buf + {off_oob4}, 4);
+    memcpy(&umax, g_out_buf + {off_umax}, 4);
+    memcpy(&v2, g_out_buf + {off_v2}, 4);
+    memcpy(&y0, g_out_buf + {off_y0}, 4);
+    memcpy(&y99, g_out_buf + {off_y99}, 4);
+    memcpy(&xs, g_out_buf + {off_xs}, 4);
+    memcpy(&blk, g_out_buf + {off_blk}, 4);
+    if (d64 != 64 || s64 != 64) {{
+        fprintf(stderr, "SW-04 d64=%d s64=%d oob4=%d blk=%d g_sys_n=%zu", d64, s64, oob4, blk, g_sys_n);
+        for (size_t i = 0; i < g_sys_n; i++) fprintf(stderr, " [%zu:%s]", i, g_sys[i].name);
+        fprintf(stderr, "\n");
+        return 10;
+    }}
+    if (oob4 != 0 || umax != 0) {{ fprintf(stderr, "SW-05 oob4=%d umax=%d\n", oob4, umax); return 11; }}
+    if (v2 != 1 || y0 != 1 || y99 != 1 || xs != 1) {{
+        fprintf(stderr, "SW-06 v2=%d y0=%d y99=%d xs=%d\n", v2, y0, y99, xs); return 12;
+    }}
+    if (blk != 0) {{ fprintf(stderr, "SW-07d blocked_ran=%d\n", blk); return 13; }}
+
+    shut_fn(state);
+    dlclose(dl);
+    return 0;
+}}
+"#
+    ));
+    run_c_host_harness(tmp.path(), "jit_sw_step5", &c_code, &artifact.dylib_path);
 }

@@ -430,7 +430,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         radius: LocalId,
     ) {
         let ptr_ty = self.ctx.ptr_ty;
-        let out_slot = alloc_zero_slot(self.b, MAX_SPATIAL_CANDIDATES * 8, ptr_ty);
+        let out_slot = alloc_zero_slot(self.b, (MAX_SPATIAL_CANDIDATES + 1) * 8, ptr_ty);
         let out_ptr = self.b.ins().stack_addr(ptr_ty, out_slot, 0);
         let Some(meta) = resolve_spatial_meta(self.ctx, self.mir_fn, grid_name) else {
             self.def_scalar_typed(dst, out_ptr);
@@ -441,6 +441,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             return;
         }
 
+        let center_is_2d = self.effective_vec_dims(center) == Some(2);
         let cvec = self.use_vec(center);
         let rad_raw = {
             let __tmp = self.use_scalar(radius);
@@ -480,8 +481,14 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             .iadd_imm_s(frame_ptr, meta.positions_off as i64);
 
         let c_coords = [cvec[0], cvec[1], cvec[2]];
-        let cx_coord = axis_val(c_coords, meta.plane_axes[0]);
-        let cy_coord = axis_val(c_coords, meta.plane_axes[1]);
+        let (cx_coord, cy_coord) = if center_is_2d {
+            (cvec[0], cvec[1])
+        } else {
+            (
+                axis_val(c_coords, meta.plane_axes[0]),
+                axis_val(c_coords, meta.plane_axes[1]),
+            )
+        };
         let min_x = self.b.ins().fsub(cx_coord, rad);
         let max_x = self.b.ins().fadd(cx_coord, rad);
         let min_y = self.b.ins().fsub(cy_coord, rad);
@@ -541,11 +548,10 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let cy = self.b.use_var(cy_var);
         let w_cy = self.b.use_var(w_var);
         let cy_ok = self.b.ins().icmp(IntCC::SignedLessThanOrEqual, cy, max_cy);
-        let w_ok_cy = self.b.ins().icmp_imm_s(
-            IntCC::UnsignedLessThan,
-            w_cy,
-            (MAX_SPATIAL_CANDIDATES - 1) as i64,
-        );
+        let w_ok_cy =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::UnsignedLessThan, w_cy, MAX_SPATIAL_CANDIDATES as i64);
         let cy_go = self.b.ins().band(cy_ok, w_ok_cy);
         self.b.ins().brif(cy_go, cy_body, &[], exit, &[]);
 
@@ -558,11 +564,10 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let cx = self.b.use_var(cx_var);
         let w_cx = self.b.use_var(w_var);
         let cx_ok = self.b.ins().icmp(IntCC::SignedLessThanOrEqual, cx, max_cx);
-        let w_ok_cx = self.b.ins().icmp_imm_s(
-            IntCC::UnsignedLessThan,
-            w_cx,
-            (MAX_SPATIAL_CANDIDATES - 1) as i64,
-        );
+        let w_ok_cx =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::UnsignedLessThan, w_cx, MAX_SPATIAL_CANDIDATES as i64);
         let cx_go = self.b.ins().band(cx_ok, w_ok_cx);
         self.b.ins().brif(cx_go, cx_body, &[], cy_step, &[]);
 
@@ -608,11 +613,10 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let k = self.b.use_var(k_var);
         let w_k = self.b.use_var(w_var);
         let k_ok = self.b.ins().icmp(IntCC::UnsignedLessThan, k, end);
-        let w_ok_k = self.b.ins().icmp_imm_s(
-            IntCC::UnsignedLessThan,
-            w_k,
-            (MAX_SPATIAL_CANDIDATES - 1) as i64,
-        );
+        let w_ok_k =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::UnsignedLessThan, w_k, MAX_SPATIAL_CANDIDATES as i64);
         let k_go = self.b.ins().band(k_ok, w_ok_k);
         self.b.ins().brif(k_go, k_body, &[], cx_step, &[]);
 
@@ -633,14 +637,14 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             .b
             .ins()
             .load(types::F32, MemFlagsData::trusted(), pptr, 8);
-        let dx = self.b.ins().fsub(px, cvec[0]);
-        let dy = self.b.ins().fsub(py, cvec[1]);
-        let dz = self.b.ins().fsub(pz, cvec[2]);
+        let p_coords = [px, py, pz];
+        let pax0 = axis_val(p_coords, meta.plane_axes[0]);
+        let pax1 = axis_val(p_coords, meta.plane_axes[1]);
+        let dx = self.b.ins().fsub(pax0, cx_coord);
+        let dy = self.b.ins().fsub(pax1, cy_coord);
         let dx2 = self.b.ins().fmul(dx, dx);
         let dy2 = self.b.ins().fmul(dy, dy);
-        let dz2 = self.b.ins().fmul(dz, dz);
-        let dxy2 = self.b.ins().fadd(dx2, dy2);
-        let d2 = self.b.ins().fadd(dxy2, dz2);
+        let d2 = self.b.ins().fadd(dx2, dy2);
         let hit = self.b.ins().fcmp(FloatCC::LessThanOrEqual, d2, r2);
         self.b.ins().brif(hit, add_bb, &[], k_step, &[]);
 
@@ -698,7 +702,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         tick_offset: LocalId,
     ) {
         let ptr_ty = self.ctx.ptr_ty;
-        let out_slot = alloc_zero_slot(self.b, MAX_SPATIAL_CANDIDATES * 8, ptr_ty);
+        let out_slot = alloc_zero_slot(self.b, (MAX_SPATIAL_CANDIDATES + 1) * 8, ptr_ty);
         let out_ptr = self.b.ins().stack_addr(ptr_ty, out_slot, 0);
         let Some(meta) = resolve_spatial_meta(self.ctx, self.mir_fn, history_name) else {
             self.def_scalar_typed(dst, out_ptr);
@@ -709,6 +713,8 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             return;
         }
 
+        let start_is_2d = self.effective_vec_dims(start) == Some(2);
+        let end_is_2d = self.effective_vec_dims(end) == Some(2);
         let svec = self.use_vec(start);
         let evec = self.use_vec(end);
         let rad_raw = {
@@ -720,16 +726,56 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let rad = self.b.ins().select(rad_pos, rad_raw, zf);
         let r2 = self.b.ins().fmul(rad, rad);
 
-        let toff_raw = {
-            let __tmp = self.use_scalar(tick_offset);
-            coerce_cl_val(self.b, __tmp, types::I32, ptr_ty)
-        };
         let z32 = self.b.ins().iconst(types::I32, 0);
-        let toff_ge0 = self
-            .b
+        let exit = self.b.create_block();
+        let early_exit_bb = self.b.create_block();
+        let query_bb = self.b.create_block();
+        let toff_mty = self.effective_local_mir_ty(tick_offset).clone();
+        let __toff_raw = self.use_scalar(tick_offset);
+        let (toff, in_window) = if matches!(toff_mty, MirType::F32 | MirType::F64) {
+            let f = coerce_cl_val(self.b, __toff_raw, types::F64, ptr_ty);
+            let zf64 = self.b.ins().f64const(0.0);
+            let max_f = self.b.ins().f64const(meta.frames as f64);
+            let ge0 = self.b.ins().fcmp(FloatCC::GreaterThanOrEqual, f, zf64);
+            let lt_f = self.b.ins().fcmp(FloatCC::LessThan, f, max_f);
+            let ok = self.b.ins().band(ge0, lt_f);
+            let u = self.b.ins().fcvt_to_uint_sat(types::I32, f);
+            (u, ok)
+        } else {
+            let is_signed = matches!(
+                toff_mty,
+                MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64
+            );
+            let ty64 = self.b.func.dfg.value_type(__toff_raw);
+            let toff_64 = if ty64 == types::I64 {
+                __toff_raw
+            } else if ty64.is_int() {
+                if is_signed {
+                    self.b.ins().sextend(types::I64, __toff_raw)
+                } else {
+                    self.b.ins().uextend(types::I64, __toff_raw)
+                }
+            } else {
+                coerce_cl_val(self.b, __toff_raw, types::I64, ptr_ty)
+            };
+            // `UnsignedLessThan` rejects both negative values and `>= meta.frames`.
+            let ok = self
+                .b
+                .ins()
+                .icmp_imm_s(IntCC::UnsignedLessThan, toff_64, meta.frames as i64);
+            let u = self.b.ins().ireduce(types::I32, toff_64);
+            (u, ok)
+        };
+        self.b
             .ins()
-            .icmp_imm_s(IntCC::SignedGreaterThan, toff_raw, 0);
-        let toff = self.b.ins().select(toff_ge0, toff_raw, z32);
+            .brif(in_window, query_bb, &[], early_exit_bb, &[]);
+
+        self.b.switch_to_block(early_exit_bb);
+        self.b.seal_block(early_exit_bb);
+        self.b.ins().jump(exit, &[]);
+
+        self.b.switch_to_block(query_bb);
+        self.b.seal_block(query_bb);
 
         let cur_tick = self.b.ins().load(
             types::I32,
@@ -739,10 +785,9 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         );
         let target_frame = if meta.frames > 1 {
             let fv = self.b.ins().iconst(types::I32, meta.frames as i64);
-            let toff_mod = self.b.ins().urem(toff, fv);
             let cur_mod = self.b.ins().urem(cur_tick, fv);
             let added = self.b.ins().iadd(cur_mod, fv);
-            let diff = self.b.ins().isub(added, toff_mod);
+            let diff = self.b.ins().isub(added, toff);
             self.b.ins().urem(diff, fv)
         } else {
             z32
@@ -766,10 +811,22 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
 
         let s_coords = [svec[0], svec[1], svec[2]];
         let e_coords = [evec[0], evec[1], evec[2]];
-        let a0 = axis_val(s_coords, meta.plane_axes[0]);
-        let b0 = axis_val(e_coords, meta.plane_axes[0]);
-        let a1 = axis_val(s_coords, meta.plane_axes[1]);
-        let b1 = axis_val(e_coords, meta.plane_axes[1]);
+        let (a0, a1) = if start_is_2d {
+            (svec[0], svec[1])
+        } else {
+            (
+                axis_val(s_coords, meta.plane_axes[0]),
+                axis_val(s_coords, meta.plane_axes[1]),
+            )
+        };
+        let (b0, b1) = if end_is_2d {
+            (evec[0], evec[1])
+        } else {
+            (
+                axis_val(e_coords, meta.plane_axes[0]),
+                axis_val(e_coords, meta.plane_axes[1]),
+            )
+        };
 
         let x_lo = self.b.ins().fmin(a0, b0);
         let x_hi = self.b.ins().fmax(a0, b0);
@@ -809,14 +866,25 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             meta.rows,
         );
 
-        let abx = self.b.ins().fsub(evec[0], svec[0]);
-        let aby = self.b.ins().fsub(evec[1], svec[1]);
-        let abz = self.b.ins().fsub(evec[2], svec[2]);
-        let abx2 = self.b.ins().fmul(abx, abx);
-        let aby2 = self.b.ins().fmul(aby, aby);
-        let abz2 = self.b.ins().fmul(abz, abz);
-        let ab_xy2 = self.b.ins().fadd(abx2, aby2);
-        let ab_len2 = self.b.ins().fadd(ab_xy2, abz2);
+        let use_2d_dist = start_is_2d || end_is_2d || meta.plane_axes != [0, 1];
+        let (abx, aby, abz, ab_len2) = if use_2d_dist {
+            let ab0 = self.b.ins().fsub(b0, a0);
+            let ab1 = self.b.ins().fsub(b1, a1);
+            let ab0_2 = self.b.ins().fmul(ab0, ab0);
+            let ab1_2 = self.b.ins().fmul(ab1, ab1);
+            let len2 = self.b.ins().fadd(ab0_2, ab1_2);
+            (ab0, ab1, zf, len2)
+        } else {
+            let abx = self.b.ins().fsub(evec[0], svec[0]);
+            let aby = self.b.ins().fsub(evec[1], svec[1]);
+            let abz = self.b.ins().fsub(evec[2], svec[2]);
+            let abx2 = self.b.ins().fmul(abx, abx);
+            let aby2 = self.b.ins().fmul(aby, aby);
+            let abz2 = self.b.ins().fmul(abz, abz);
+            let ab_xy2 = self.b.ins().fadd(abx2, aby2);
+            let len2 = self.b.ins().fadd(ab_xy2, abz2);
+            (abx, aby, abz, len2)
+        };
         let eps = self.b.ins().f32const(1e-12);
         let ab_ok = self.b.ins().fcmp(FloatCC::GreaterThan, ab_len2, eps);
         let onef = self.b.ins().f32const(1.0);
@@ -838,18 +906,16 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let k_step = self.b.create_block();
         let cx_step = self.b.create_block();
         let cy_step = self.b.create_block();
-        let exit = self.b.create_block();
         self.b.ins().jump(cy_hdr, &[]);
 
         self.b.switch_to_block(cy_hdr);
         let cy = self.b.use_var(cy_var);
         let w_cy = self.b.use_var(w_var);
         let cy_ok = self.b.ins().icmp(IntCC::SignedLessThanOrEqual, cy, max_cy);
-        let w_ok_cy = self.b.ins().icmp_imm_s(
-            IntCC::UnsignedLessThan,
-            w_cy,
-            (MAX_SPATIAL_CANDIDATES - 1) as i64,
-        );
+        let w_ok_cy =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::UnsignedLessThan, w_cy, MAX_SPATIAL_CANDIDATES as i64);
         let cy_go = self.b.ins().band(cy_ok, w_ok_cy);
         self.b.ins().brif(cy_go, cy_body, &[], exit, &[]);
 
@@ -862,11 +928,10 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let cx = self.b.use_var(cx_var);
         let w_cx = self.b.use_var(w_var);
         let cx_ok = self.b.ins().icmp(IntCC::SignedLessThanOrEqual, cx, max_cx);
-        let w_ok_cx = self.b.ins().icmp_imm_s(
-            IntCC::UnsignedLessThan,
-            w_cx,
-            (MAX_SPATIAL_CANDIDATES - 1) as i64,
-        );
+        let w_ok_cx =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::UnsignedLessThan, w_cx, MAX_SPATIAL_CANDIDATES as i64);
         let cx_go = self.b.ins().band(cx_ok, w_ok_cx);
         self.b.ins().brif(cx_go, cx_body, &[], cy_step, &[]);
 
@@ -912,11 +977,10 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let k = self.b.use_var(k_var);
         let w_k = self.b.use_var(w_var);
         let k_ok = self.b.ins().icmp(IntCC::UnsignedLessThan, k, end_idx);
-        let w_ok_k = self.b.ins().icmp_imm_s(
-            IntCC::UnsignedLessThan,
-            w_k,
-            (MAX_SPATIAL_CANDIDATES - 1) as i64,
-        );
+        let w_ok_k =
+            self.b
+                .ins()
+                .icmp_imm_s(IntCC::UnsignedLessThan, w_k, MAX_SPATIAL_CANDIDATES as i64);
         let k_go = self.b.ins().band(k_ok, w_ok_k);
         self.b.ins().brif(k_go, k_body, &[], cx_step, &[]);
 
@@ -938,33 +1002,58 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             .ins()
             .load(types::F32, MemFlagsData::trusted(), pptr, 8);
 
-        let apx = self.b.ins().fsub(px, svec[0]);
-        let apy = self.b.ins().fsub(py, svec[1]);
-        let apz = self.b.ins().fsub(pz, svec[2]);
-        let dot_x = self.b.ins().fmul(apx, abx);
-        let dot_y = self.b.ins().fmul(apy, aby);
-        let dot_z = self.b.ins().fmul(apz, abz);
-        let dot_xy = self.b.ins().fadd(dot_x, dot_y);
-        let dot = self.b.ins().fadd(dot_xy, dot_z);
-        let raw_t = self.b.ins().fdiv(dot, ab_len2);
-        let t_safe = self.b.ins().select(ab_ok, raw_t, zf);
-        let t_min = self.b.ins().fmax(t_safe, zf);
-        let t_clamped = self.b.ins().fmin(t_min, onef);
+        let d2 = if use_2d_dist {
+            let p_coords = [px, py, pz];
+            let pax0 = axis_val(p_coords, meta.plane_axes[0]);
+            let pax1 = axis_val(p_coords, meta.plane_axes[1]);
+            let ap0 = self.b.ins().fsub(pax0, a0);
+            let ap1 = self.b.ins().fsub(pax1, a1);
+            let dot0 = self.b.ins().fmul(ap0, abx);
+            let dot1 = self.b.ins().fmul(ap1, aby);
+            let dot = self.b.ins().fadd(dot0, dot1);
+            let raw_t = self.b.ins().fdiv(dot, ab_len2);
+            let t_safe = self.b.ins().select(ab_ok, raw_t, zf);
+            let t_min = self.b.ins().fmax(t_safe, zf);
+            let t_clamped = self.b.ins().fmin(t_min, onef);
 
-        let sx_step = self.b.ins().fmul(abx, t_clamped);
-        let sy_step = self.b.ins().fmul(aby, t_clamped);
-        let sz_step = self.b.ins().fmul(abz, t_clamped);
-        let clx = self.b.ins().fadd(svec[0], sx_step);
-        let cly = self.b.ins().fadd(svec[1], sy_step);
-        let clz = self.b.ins().fadd(svec[2], sz_step);
-        let dx = self.b.ins().fsub(px, clx);
-        let dy = self.b.ins().fsub(py, cly);
-        let dz = self.b.ins().fsub(pz, clz);
-        let dx2 = self.b.ins().fmul(dx, dx);
-        let dy2 = self.b.ins().fmul(dy, dy);
-        let dz2 = self.b.ins().fmul(dz, dz);
-        let dxy2 = self.b.ins().fadd(dx2, dy2);
-        let d2 = self.b.ins().fadd(dxy2, dz2);
+            let s0_step = self.b.ins().fmul(abx, t_clamped);
+            let s1_step = self.b.ins().fmul(aby, t_clamped);
+            let cl0 = self.b.ins().fadd(a0, s0_step);
+            let cl1 = self.b.ins().fadd(a1, s1_step);
+            let dx = self.b.ins().fsub(pax0, cl0);
+            let dy = self.b.ins().fsub(pax1, cl1);
+            let dx2 = self.b.ins().fmul(dx, dx);
+            let dy2 = self.b.ins().fmul(dy, dy);
+            self.b.ins().fadd(dx2, dy2)
+        } else {
+            let apx = self.b.ins().fsub(px, svec[0]);
+            let apy = self.b.ins().fsub(py, svec[1]);
+            let apz = self.b.ins().fsub(pz, svec[2]);
+            let dot_x = self.b.ins().fmul(apx, abx);
+            let dot_y = self.b.ins().fmul(apy, aby);
+            let dot_z = self.b.ins().fmul(apz, abz);
+            let dot_xy = self.b.ins().fadd(dot_x, dot_y);
+            let dot = self.b.ins().fadd(dot_xy, dot_z);
+            let raw_t = self.b.ins().fdiv(dot, ab_len2);
+            let t_safe = self.b.ins().select(ab_ok, raw_t, zf);
+            let t_min = self.b.ins().fmax(t_safe, zf);
+            let t_clamped = self.b.ins().fmin(t_min, onef);
+
+            let sx_step = self.b.ins().fmul(abx, t_clamped);
+            let sy_step = self.b.ins().fmul(aby, t_clamped);
+            let sz_step = self.b.ins().fmul(abz, t_clamped);
+            let clx = self.b.ins().fadd(svec[0], sx_step);
+            let cly = self.b.ins().fadd(svec[1], sy_step);
+            let clz = self.b.ins().fadd(svec[2], sz_step);
+            let dx = self.b.ins().fsub(px, clx);
+            let dy = self.b.ins().fsub(py, cly);
+            let dz = self.b.ins().fsub(pz, clz);
+            let dx2 = self.b.ins().fmul(dx, dx);
+            let dy2 = self.b.ins().fmul(dy, dy);
+            let dz2 = self.b.ins().fmul(dz, dz);
+            let dxy2 = self.b.ins().fadd(dx2, dy2);
+            self.b.ins().fadd(dxy2, dz2)
+        };
         let hit = self.b.ins().fcmp(FloatCC::LessThanOrEqual, d2, r2);
         self.b.ins().brif(hit, add_bb, &[], k_step, &[]);
 

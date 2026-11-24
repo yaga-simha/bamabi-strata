@@ -15,12 +15,13 @@ use crate::abi_offsets::{
     BAM_SYSTEM_SET_INVALID, FFI_ENTITY_NULL, FFI_OK, FFI_TYPE_MISMATCH, QUERY_FLAG_PARAM_SET,
     QUERY_TERM_CAP, RELATION_FLAG_ACYCLIC, RELATION_FLAG_CASCADE_DESPAWN,
     RELATION_FLAG_CLEANUP_REMOVE, RELATION_FLAG_EXCLUSIVE, RELATION_FLAG_SYMMETRIC,
-    SCHEDULE_SET_FLAG_PARALLEL, SCHEDULE_SET_FLAG_SEQUENCE, SCHEDULE_SET_FLAG_SEQUENCE_WEAK,
-    SYSTEM_QUERY_CAP, TRIGGER_FLAG_PROPAGATE, WIRE_ABI_VERSION, api_slots, structs,
+    SCHEDULE_SET_FLAG_AFTER_WEAK, SCHEDULE_SET_FLAG_BEFORE_WEAK, SCHEDULE_SET_FLAG_PARALLEL,
+    SCHEDULE_SET_FLAG_SEQUENCE, SCHEDULE_SET_FLAG_SEQUENCE_WEAK, SYSTEM_QUERY_CAP,
+    TRIGGER_FLAG_PROPAGATE, WIRE_ABI_VERSION, api_slots, structs,
 };
 use crate::{JitCompileOptions, JitError, JitOptLevel};
 use bamabi_sys::{
-    AccessMode, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_REQUIRED_FLAG_CUSTOM_BYTES,
+    AccessMode, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_TERM_FLAG_ADDED,
     BamRequiredComponent, ComponentDesc, ScheduleId, fnv1a_64_str,
 };
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -42,8 +43,8 @@ use strata_codegen::net::{
     validate_net_packet_capacity,
 };
 use strata_mir::{
-    Inst, LocalId, MirConstVal, MirFnKind, MirFunction, MirModule, MirNetComponent, MirStmt,
-    MirStreamOpKind, MirType, Terminator,
+    Inst, LocalId, MirConstVal, MirFnKind, MirFunction, MirModule, MirNetComponent,
+    MirNetFieldSpec, MirStmt, MirStreamOpKind, MirType, Terminator,
 };
 use strata_sema::access::TermAccessMode;
 use strata_sema::hir::{
@@ -145,6 +146,8 @@ struct SpatialIndexMeta {
 #[derive(Clone)]
 struct TableRodata {
     data_id: DataId,
+    keys_data_id: Option<DataId>,
+    key_is_signed: bool,
     row_count: usize,
     row_stride: usize,
     fields: HashMap<String, (usize, MirType)>,
@@ -163,6 +166,7 @@ struct StateLayout {
     comp_off: usize,
     res_flags_off: usize,
     rel_off: usize,
+    child_of_comp_off: usize,
     obj_off: usize,
     sys_off: usize,
     set_off: usize,
@@ -213,6 +217,8 @@ impl StateLayout {
         cursor = align_up(cursor, 4);
         let rel_off = cursor;
         cursor += rel_count.max(1) * structs::BAM_COMPONENT_SIZE;
+        let child_of_comp_off = cursor;
+        cursor += structs::BAM_COMPONENT_SIZE;
 
         cursor = align_up(cursor, 8);
         let obj_off = cursor;
@@ -300,6 +306,7 @@ impl StateLayout {
                 comp_off,
                 res_flags_off,
                 rel_off,
+                child_of_comp_off,
                 obj_off,
                 sys_off,
                 set_off,
@@ -343,6 +350,7 @@ struct WireTermSpec {
     layout_idx: usize,
     mode: TermAccessMode,
     changed: bool,
+    added: bool,
 }
 
 #[derive(Clone)]
@@ -353,6 +361,7 @@ struct WireQuerySpec {
     with_filters: Vec<usize>,
     without_filters: Vec<usize>,
     extra_changed_filters: Vec<usize>,
+    extra_added_filters: Vec<usize>,
     /// Mutually exclusive `ParamSet` group (`0` = independent; `1, 2, ...` = connected component).
     param_set_group: u32,
 }
@@ -376,7 +385,7 @@ struct NetSystemChunkEntry {
     rx_name_data_id: DataId,
     tx_name_data_id: DataId,
     res_layout_indices: Vec<usize>,
-    comp_layout_indices: Vec<usize>,
+    comp_stratum_groups: Vec<Vec<usize>>,
     tx_after_weak_names: Vec<DataId>,
 }
 
@@ -396,7 +405,7 @@ struct SystemRegistrationEntry {
     in_set_names: Vec<DataId>,
     mount_set_indices: Vec<usize>,
     sched_order: usize,
-    run_if_guard: Option<(HirExpr, usize)>,
+    run_if_guard: Option<(HirExpr, Option<usize>)>,
 }
 
 #[derive(Clone)]
@@ -449,6 +458,8 @@ struct ModuleContext<'a> {
     init_objects_fn: Option<(FuncId, DataId, Vec<(usize, usize)>)>,
     net_chunks: Vec<Vec<MirNetComponent>>,
     net_systems: Vec<NetSystemChunkEntry>,
+    uses_child_of: bool,
+    unsafe_par_fns: HashSet<String>,
 }
 
 /// Compiles a verified `MirModule` directly from MIR CFGs into a native PIC `.o` artifact.
@@ -726,6 +737,8 @@ fn collect_inst_referenced_comps(inst: &Inst, out: &mut BTreeSet<String>) {
                 let inner = tok
                     .strip_prefix("Without<")
                     .or_else(|| tok.strip_prefix("With<"))
+                    .or_else(|| tok.strip_prefix("Added<"))
+                    .or_else(|| tok.strip_prefix("Changed<"))
                     .and_then(|r| r.strip_suffix('>'))
                     .unwrap_or(tok)
                     .trim();
@@ -1037,6 +1050,25 @@ fn build_module_context<'a>(
             .map_err(|e| JitError::Codegen(format!("local `__strata_fix64_div`: {e}")))?
     };
 
+    let uses_child_of = mir.relations.iter().any(|r| {
+        r.canonical_name == "ChildOf"
+            || r.canonical_name.ends_with("::ChildOf")
+            || r.name == "ChildOf"
+    }) || mir.fns.iter().chain(mir.functions.iter()).any(|f| {
+        f.blocks.iter().any(|bb| {
+            bb.stmts.iter().any(|s| match &s.inst {
+                Inst::IterUpCascade { relation, .. }
+                | Inst::CmdInsertRelation { relation, .. }
+                | Inst::CmdRemoveRelation { relation, .. } => {
+                    relation == "ChildOf" || relation.ends_with("::ChildOf")
+                }
+                _ => false,
+            })
+        })
+    });
+
+    let unsafe_par_fns = compute_unsafe_par_fns(mir);
+
     let mut ctx = ModuleContext {
         mir,
         obj_mod,
@@ -1069,6 +1101,8 @@ fn build_module_context<'a>(
         init_objects_fn: None,
         net_chunks,
         net_systems: Vec::new(),
+        uses_child_of,
+        unsafe_par_fns,
     };
 
     // Build schedule system descriptors + observers.
@@ -1175,13 +1209,22 @@ fn build_module_context<'a>(
                 .map_err(|e| JitError::Codegen(e.to_string()))?;
 
             let mut res_layout_indices = Vec::new();
-            let mut comp_layout_indices = Vec::new();
+            let mut comp_stratum_groups = Vec::new();
             for nc in chunk {
                 if let Some(lidx) = lookup_name_in_map(&ctx.layout_map, &nc.canonical_name) {
                     if nc.is_resource {
                         res_layout_indices.push(lidx);
                     } else {
-                        comp_layout_indices.push(lidx);
+                        let mut strata = vec![lidx];
+                        for wf in &nc.wire_fields {
+                            if let Some(ref sl_name) = wf.stratum_layout
+                                && let Some(sl_lidx) = lookup_name_in_map(&ctx.layout_map, sl_name)
+                                && !strata.contains(&sl_lidx)
+                            {
+                                strata.push(sl_lidx);
+                            }
+                        }
+                        comp_stratum_groups.push(strata);
                     }
                 }
             }
@@ -1197,7 +1240,7 @@ fn build_module_context<'a>(
                 rx_name_data_id: rx_cstrs[chunk_idx],
                 tx_name_data_id: tx_cstrs[chunk_idx],
                 res_layout_indices,
-                comp_layout_indices,
+                comp_stratum_groups,
                 tx_after_weak_names,
             });
         }
@@ -1295,6 +1338,71 @@ fn extract_schedule_topology(
     let mut set_index_map: HashMap<(u32, String), usize> = HashMap::new();
     let mut sys_map: HashMap<String, SysSchedTopology> = HashMap::new();
 
+    fn collect_group_names(g: &HirScheduleGroup, out: &mut HashSet<String>) {
+        if !g.name.is_empty() {
+            out.insert(bare_schedule_target(&g.name).to_owned());
+        }
+        for ch in &g.children {
+            collect_group_names(ch, out);
+        }
+    }
+
+    fn topo_sort_seq_child_indices(children: &[HirScheduleGroup]) -> Vec<usize> {
+        let k = children.len();
+        if k <= 1 {
+            return (0..k).collect();
+        }
+        let mut names_at: Vec<HashSet<String>> = Vec::with_capacity(k);
+        for ch in children {
+            let mut s = HashSet::new();
+            collect_group_names(ch, &mut s);
+            names_at.push(s);
+        }
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); k];
+        let mut indeg = vec![0usize; k];
+        for (u_pos, u) in children.iter().enumerate() {
+            for (v_pos, v) in children.iter().enumerate() {
+                if u_pos == v_pos {
+                    continue;
+                }
+                let u_before_v = u
+                    .before
+                    .iter()
+                    .any(|b| names_at[v_pos].contains(bare_schedule_target(b)));
+                let v_after_u = v
+                    .after
+                    .iter()
+                    .any(|a| names_at[u_pos].contains(bare_schedule_target(a)));
+                if (u_before_v || v_after_u) && !adj[u_pos].contains(&v_pos) {
+                    adj[u_pos].push(v_pos);
+                    indeg[v_pos] += 1;
+                }
+            }
+        }
+        let mut ready: std::collections::BTreeSet<usize> = indeg
+            .iter()
+            .enumerate()
+            .filter(|&(_, &d)| d == 0)
+            .map(|(pos, _)| pos)
+            .collect();
+        let mut ordered = Vec::with_capacity(k);
+        while let Some(pos) = ready.pop_first() {
+            ordered.push(pos);
+            for &next in &adj[pos] {
+                indeg[next] -= 1;
+                if indeg[next] == 0 {
+                    ready.insert(next);
+                }
+            }
+        }
+        for pos in 0..k {
+            if !ordered.contains(&pos) {
+                ordered.push(pos);
+            }
+        }
+        ordered
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn walk_group(
         obj_mod: &mut ObjectModule,
@@ -1305,6 +1413,7 @@ fn extract_schedule_topology(
         sets: &mut Vec<ScheduleSetEntry>,
         set_index_map: &mut HashMap<(u32, String), usize>,
         sys_map: &mut HashMap<String, SysSchedTopology>,
+        pending_group_edges: &mut Vec<(u32, usize, String, Vec<String>, Vec<String>)>,
         seq_counter: &mut usize,
         leaf_order: &mut usize,
     ) -> Result<(Vec<String>, Option<usize>), JitError> {
@@ -1318,6 +1427,18 @@ fn extract_schedule_topology(
             }
             if entry.run_if_expr.is_none() {
                 entry.run_if_expr = run_if_expr.cloned();
+            }
+            for target in &group.before {
+                let bt = bare_schedule_target(target).to_owned();
+                if !bt.is_empty() && bt != bare_leaf && !entry.before.contains(&bt) {
+                    entry.before.push(bt);
+                }
+            }
+            for target in &group.after {
+                let bt = bare_schedule_target(target).to_owned();
+                if !bt.is_empty() && bt != bare_leaf && !entry.after.contains(&bt) {
+                    entry.after.push(bt);
+                }
             }
             for (_, bare_set_name) in parent_sets {
                 if !entry.in_sets.contains(bare_set_name) {
@@ -1364,6 +1485,15 @@ fn extract_schedule_topology(
                 set_index_map.insert(key, idx);
                 idx
             };
+            if !group.before.is_empty() || !group.after.is_empty() {
+                pending_group_edges.push((
+                    sched_id,
+                    idx,
+                    bare.clone(),
+                    group.before.clone(),
+                    group.after.clone(),
+                ));
+            }
             // Nested parent set relationship; ordering between siblings happens below.
             own_set_idx = Some(idx);
             next_parent_sets.push((idx, bare));
@@ -1374,8 +1504,14 @@ fn extract_schedule_topology(
         let mut prev_leaves: Vec<String> = Vec::new();
         let mut prev_set_idx: Option<usize> = None;
         let mut all_leaves: Vec<String> = Vec::new();
+        let child_order: Vec<usize> = if (is_seq || is_seq_weak) && group.children.len() > 1 {
+            topo_sort_seq_child_indices(&group.children)
+        } else {
+            (0..group.children.len()).collect()
+        };
 
-        for ch in &group.children {
+        for ch_idx in child_order {
+            let ch = &group.children[ch_idx];
             let (leaves, cur_set_idx) = walk_group(
                 obj_mod,
                 sched_id,
@@ -1385,28 +1521,37 @@ fn extract_schedule_topology(
                 sets,
                 set_index_map,
                 sys_map,
+                pending_group_edges,
                 seq_counter,
                 leaf_order,
             )?;
             if is_seq || is_seq_weak {
-                if let (Some(p_s), Some(c_s)) = (prev_set_idx, cur_set_idx)
-                    && p_s != c_s
-                {
-                    if !sets[c_s].after_set_indices.contains(&p_s) {
-                        sets[c_s].after_set_indices.push(p_s);
+                if let (Some(p_s), Some(c_s)) = (prev_set_idx, cur_set_idx) {
+                    if p_s != c_s {
+                        if !sets[c_s].after_set_indices.contains(&p_s) {
+                            sets[c_s].after_set_indices.push(p_s);
+                        }
+                        if !sets[p_s].before_set_indices.contains(&c_s) {
+                            sets[p_s].before_set_indices.push(c_s);
+                        }
+                        if is_seq_weak {
+                            sets[c_s].flags |= SCHEDULE_SET_FLAG_AFTER_WEAK;
+                            sets[p_s].flags |= SCHEDULE_SET_FLAG_BEFORE_WEAK;
+                        }
                     }
-                    if !sets[p_s].before_set_indices.contains(&c_s) {
-                        sets[p_s].before_set_indices.push(c_s);
-                    }
-                }
-                for l in &leaves {
-                    if let Some(ent) = sys_map.get_mut(l) {
-                        for pl in &prev_leaves {
-                            if pl != l {
-                                if is_seq && !ent.after.contains(pl) {
-                                    ent.after.push(pl.clone());
-                                } else if is_seq_weak && !ent.after_weak.contains(pl) {
-                                    ent.after_weak.push(pl.clone());
+                } else if cur_set_idx.is_some() != prev_set_idx.is_some() || own_set_idx.is_none() {
+                    // Only emit static leaf edges across mixed leaf/set boundaries; sibling
+                    // leaves directly mounted inside a `seq`/`seq_weak` set are ordered
+                    // dynamically by `ModScheduleSetRewirePass` without baking cycles.
+                    for l in &leaves {
+                        if let Some(ent) = sys_map.get_mut(l) {
+                            for pl in &prev_leaves {
+                                if pl != l {
+                                    if is_seq && !ent.after.contains(pl) {
+                                        ent.after.push(pl.clone());
+                                    } else if is_seq_weak && !ent.after_weak.contains(pl) {
+                                        ent.after_weak.push(pl.clone());
+                                    }
                                 }
                             }
                         }
@@ -1426,6 +1571,7 @@ fn extract_schedule_topology(
         Ok((all_leaves, own_set_idx))
     }
 
+    let mut pending_group_edges: Vec<(u32, usize, String, Vec<String>, Vec<String>)> = Vec::new();
     let mut seq_counter = 0usize;
     let mut leaf_order = 0usize;
     for sched in &mir.schedules {
@@ -1440,9 +1586,53 @@ fn extract_schedule_topology(
                 &mut sets,
                 &mut set_index_map,
                 &mut sys_map,
+                &mut pending_group_edges,
                 &mut seq_counter,
                 &mut leaf_order,
             )?;
+        }
+    }
+
+    for (sched_id, set_idx, set_bare, before_targets, after_targets) in pending_group_edges {
+        for target in before_targets {
+            let bt = bare_schedule_target(&target).to_owned();
+            if bt.is_empty() || bt == set_bare {
+                continue;
+            }
+            if let Some(&t_idx) = set_index_map.get(&(sched_id, bt.clone())) {
+                if t_idx != set_idx {
+                    if !sets[set_idx].before_set_indices.contains(&t_idx) {
+                        sets[set_idx].before_set_indices.push(t_idx);
+                    }
+                    if !sets[t_idx].after_set_indices.contains(&set_idx) {
+                        sets[t_idx].after_set_indices.push(set_idx);
+                    }
+                }
+            } else if let Some(ent) = sys_map.get_mut(&bt)
+                && !ent.after.contains(&set_bare)
+            {
+                ent.after.push(set_bare.clone());
+            }
+        }
+        for target in after_targets {
+            let at = bare_schedule_target(&target).to_owned();
+            if at.is_empty() || at == set_bare {
+                continue;
+            }
+            if let Some(&t_idx) = set_index_map.get(&(sched_id, at.clone())) {
+                if t_idx != set_idx {
+                    if !sets[set_idx].after_set_indices.contains(&t_idx) {
+                        sets[set_idx].after_set_indices.push(t_idx);
+                    }
+                    if !sets[t_idx].before_set_indices.contains(&set_idx) {
+                        sets[t_idx].before_set_indices.push(set_idx);
+                    }
+                }
+            } else if let Some(ent) = sys_map.get_mut(&at)
+                && !ent.before.contains(&set_bare)
+            {
+                ent.before.push(set_bare.clone());
+            }
         }
     }
 
@@ -1567,6 +1757,12 @@ fn wire_query_sets(
             comp_reads.insert(cf);
         }
     }
+    for &af in &wq.extra_added_filters {
+        with_set.insert(af);
+        if !comp_writes.contains(&af) {
+            comp_reads.insert(af);
+        }
+    }
 
     (
         comp_reads,
@@ -1650,6 +1846,101 @@ fn assign_param_set_groups(wire_queries: &mut [WireQuerySpec]) {
     }
 }
 
+fn is_child_of_rel(relation: &str) -> bool {
+    relation == "ChildOf" || relation.ends_with("::ChildOf")
+}
+
+fn fn_has_direct_par_unsafe_inst(f: &MirFunction) -> bool {
+    for bb in &f.blocks {
+        for s in &bb.stmts {
+            if matches!(
+                &s.inst,
+                Inst::ResRead { .. }
+                    | Inst::ResWrite { .. }
+                    | Inst::CmdSpawn { .. }
+                    | Inst::CmdSpawnBatch { .. }
+                    | Inst::SpawnBatchBegin { .. }
+                    | Inst::SpawnBatchPush { .. }
+                    | Inst::SpawnBatchCommit { .. }
+                    | Inst::CmdDespawn { .. }
+                    | Inst::CmdDespawnAll { .. }
+                    | Inst::CmdInsert { .. }
+                    | Inst::CmdRemove { .. }
+                    | Inst::CmdTrigger { .. }
+                    | Inst::StreamEmit { .. }
+                    | Inst::CmdCheckpoint
+                    | Inst::CmdRollback { .. }
+                    | Inst::CmdInsertRelation { .. }
+                    | Inst::CmdRemoveRelation { .. }
+                    | Inst::EntityGet { .. }
+                    | Inst::EntityGetMut { .. }
+                    | Inst::ResolveNamedObject { .. }
+                    | Inst::BindNamedObject { .. }
+                    | Inst::IterCount { .. }
+                    | Inst::IterUpCascade { .. }
+                    | Inst::IterReset { .. }
+                    | Inst::ParForEachChunk { .. }
+                    | Inst::ParForEachChunkReadonly { .. }
+                    | Inst::SpatialRebuildCsr { .. }
+                    | Inst::SpatialCsrBegin { .. }
+                    | Inst::SpatialCsrCount { .. }
+                    | Inst::SpatialCsrPrefixSum { .. }
+                    | Inst::SpatialCsrScatter { .. }
+                    | Inst::SpatialQueryDisc { .. }
+                    | Inst::SpatialQuerySegmentAt { .. }
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn compute_unsafe_par_fns(mir: &MirModule) -> HashSet<String> {
+    let mut unsafe_names: HashSet<String> = HashSet::new();
+    let all_fns: Vec<&MirFunction> = mir.fns.iter().chain(mir.functions.iter()).collect();
+    for f in &all_fns {
+        if fn_has_direct_par_unsafe_inst(f) {
+            unsafe_names.insert(f.name.clone());
+            if let Some(short) = f.name.rsplit("::").next() {
+                unsafe_names.insert(short.to_owned());
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for f in &all_fns {
+            if unsafe_names.contains(&f.name) {
+                continue;
+            }
+            let calls_unsafe = f.blocks.iter().any(|bb| {
+                bb.stmts.iter().any(|s| {
+                    if let Inst::Call { callee, .. } = &s.inst {
+                        unsafe_names.contains(callee.as_str())
+                            || callee
+                                .rsplit("::")
+                                .next()
+                                .is_some_and(|s| unsafe_names.contains(s))
+                    } else {
+                        false
+                    }
+                })
+            });
+            if calls_unsafe {
+                unsafe_names.insert(f.name.clone());
+                if let Some(short) = f.name.rsplit("::").next() {
+                    unsafe_names.insert(short.to_owned());
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    unsafe_names
+}
+
 fn build_system_registration_entry(
     ctx: &mut ModuleContext<'_>,
     fn_idx: usize,
@@ -1705,9 +1996,15 @@ fn build_system_registration_entry(
                     && (ct.term_idx == t.term_idx
                         || ct.canonical_component == t.canonical_component)
             });
+            let is_added = f.added_terms.iter().any(|at| {
+                at.query_idx == qb.query_idx
+                    && (at.term_idx == t.term_idx
+                        || at.canonical_component == t.canonical_component)
+            });
             if let Some(&wire_idx) = by_comp.get(&lidx) {
                 terms[wire_idx].mode = merge_access_mode(terms[wire_idx].mode, t.mode);
                 terms[wire_idx].changed |= is_changed;
+                terms[wire_idx].added |= is_added;
                 term_map.push(wire_idx);
             } else {
                 let wire_idx = terms.len();
@@ -1716,6 +2013,7 @@ fn build_system_registration_entry(
                     layout_idx: lidx,
                     mode: t.mode,
                     changed: is_changed,
+                    added: is_added,
                 });
                 term_map.push(wire_idx);
             }
@@ -1739,11 +2037,24 @@ fn build_system_registration_entry(
                 }
             }
         }
+        let mut extra_added_filters = Vec::new();
+        for (aq_idx, af) in &f.added_filters {
+            if *aq_idx == qb.query_idx
+                && let Some(lidx) = lookup_name_in_map(&ctx.layout_map, af)
+            {
+                if let Some(&wi) = by_comp.get(&lidx) {
+                    terms[wi].added = true;
+                } else if !extra_added_filters.contains(&lidx) {
+                    extra_added_filters.push(lidx);
+                }
+            }
+        }
         let mut with_filters = Vec::new();
         for w in &qb.with_filters {
             if let Some(lidx) = lookup_name_in_map(&ctx.layout_map, w)
                 && !by_comp.contains_key(&lidx)
                 && !extra_changed_filters.contains(&lidx)
+                && !extra_added_filters.contains(&lidx)
                 && !with_filters.contains(&lidx)
             {
                 with_filters.push(lidx);
@@ -1765,6 +2076,7 @@ fn build_system_registration_entry(
             with_filters,
             without_filters,
             extra_changed_filters,
+            extra_added_filters,
             param_set_group: 0,
         });
     }
@@ -1869,11 +2181,12 @@ fn build_system_registration_entry(
         }
     }
 
-    let run_if_guard = if let Some(ref expr) = topo.run_if_expr
-        && let Some((res_name, _)) = find_res_access_in_hir(expr)
-        && let Some(res_lidx) = lookup_name_in_map(&ctx.layout_map, &res_name)
-    {
-        res_modes.entry(res_lidx).or_insert(false);
+    let run_if_guard = if let Some(ref expr) = topo.run_if_expr {
+        let res_lidx = find_res_access_in_hir(expr)
+            .and_then(|(res_name, _)| lookup_name_in_map(&ctx.layout_map, &res_name));
+        if let Some(lidx) = res_lidx {
+            res_modes.entry(lidx).or_insert(false);
+        }
         Some((expr.clone(), res_lidx))
     } else {
         None
@@ -2028,10 +2341,10 @@ fn find_res_access_in_hir(expr: &HirExpr) -> Option<(String, String)> {
 }
 
 fn eval_hir_run_if(
-    res_layout: &SolvedLayout,
+    res_layout: Option<&SolvedLayout>,
     consts: &HashMap<String, HirConst>,
     b: &mut FunctionBuilder<'_>,
-    res_ptr: Value,
+    res_ptr: Option<Value>,
     expr: &HirExpr,
 ) -> Option<Value> {
     enum RunVal {
@@ -2041,10 +2354,10 @@ fn eval_hir_run_if(
     }
 
     fn eval_val(
-        res_layout: &SolvedLayout,
+        res_layout: Option<&SolvedLayout>,
         consts: &HashMap<String, HirConst>,
         b: &mut FunctionBuilder<'_>,
-        res_ptr: Value,
+        res_ptr: Option<Value>,
         expr: &HirExpr,
     ) -> Option<RunVal> {
         match expr {
@@ -2063,12 +2376,14 @@ fn eval_hir_run_if(
             } => match (op, eval_val(res_layout, consts, b, res_ptr, inner)?) {
                 (HirUnOp::Neg, RunVal::F32(v)) => Some(RunVal::F32(b.ins().fneg(v))),
                 (HirUnOp::Neg, RunVal::I64(v)) => Some(RunVal::I64(b.ins().ineg(v))),
-                (HirUnOp::Not, RunVal::Bool(v)) => {
+                (HirUnOp::Not, RunVal::Bool(v)) | (HirUnOp::Not, RunVal::I64(v)) => {
                     Some(RunVal::Bool(b.ins().icmp_imm_s(IntCC::Equal, v, 0)))
                 }
                 _ => None,
             },
             HirExpr::Field { base: _, field, ty } => {
+                let res_layout = res_layout?;
+                let res_ptr = res_ptr?;
                 let f = res_layout.fields.iter().find(|f| f.name == *field)?;
                 let eff_ty = if matches!(ty, Ty::Unknown) { &f.ty } else { ty };
                 let mty = mir_type_from_ty(eff_ty);
@@ -2203,16 +2518,237 @@ fn mir_type_from_ty(ty: &Ty) -> MirType {
         Ty::Vec3 => MirType::Vec3,
         Ty::IVec3 => MirType::IVec3,
         Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => MirType::Vec4,
+        Ty::Mat3 => MirType::Named("mat3".to_owned()),
+        Ty::Mat4 => MirType::Named("mat4".to_owned()),
+        Ty::InputBuffer { action, cap } => MirType::Named(format!("InputBuffer<{action},{cap}>")),
+        Ty::BitSet(bits) => MirType::Named(format!("BitSet<{bits}>")),
+        Ty::InlineStr(cap) => MirType::Named(format!("InlineStr<{cap}>")),
+        Ty::Asset(a) => MirType::Named(format!("Asset<{a}>")),
+        Ty::SmallVec { elem, cap } => MirType::Named(format!("SmallVec<{elem:?},{cap}>")),
+        Ty::Option(inner) => mir_type_from_ty(inner),
         Ty::Array { elem, len } => MirType::Array {
             elem: Box::new(mir_type_from_ty(elem)),
             len: *len,
         },
         Ty::Tuple(ts) => MirType::Tuple(ts.iter().map(mir_type_from_ty).collect()),
         Ty::Ref(_) => MirType::Entity,
-        Ty::Named(n) => MirType::Named(n.clone()),
+        Ty::Named(n) => {
+            if n == "Entity" {
+                MirType::Entity
+            } else {
+                MirType::Named(n.clone())
+            }
+        }
         Ty::Borrow { mutable: true, .. } => MirType::MutPtr,
         _ => MirType::Ptr,
     }
+}
+
+pub(super) fn inline_str_cap_from_name(name: &str) -> Option<usize> {
+    name.strip_prefix("InlineStr<")
+        .and_then(|s| s.strip_suffix('>'))
+        .and_then(|s| s.parse::<usize>().ok())
+}
+
+pub(super) fn bitset_bytes_from_mir_ty(mty: &MirType) -> Option<usize> {
+    let MirType::Named(name) = mty else {
+        return None;
+    };
+    name.strip_prefix("BitSet<")
+        .and_then(|s| s.strip_suffix('>'))
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|bits| bits.div_ceil(32).max(1) * 4)
+}
+
+pub(super) fn ty_size_and_align(
+    ty: &Ty,
+    mir: &MirModule,
+    enums: &HashMap<String, EnumDef>,
+    ptr_bytes: usize,
+) -> (usize, usize) {
+    match ty {
+        Ty::Unit => (0, 1),
+        Ty::Bool | Ty::U8 | Ty::I8 => (1, 1),
+        Ty::U16 | Ty::I16 => (2, 2),
+        Ty::U32
+        | Ty::I32
+        | Ty::F32
+        | Ty::Sym
+        | Ty::Fix32
+        | Ty::Rgba8
+        | Ty::UnitScalar { .. }
+        | Ty::GraceWindow => (4, 4),
+        Ty::Vec2 | Ty::IVec2 | Ty::UVec2 => (8, 4),
+        Ty::Vec3 | Ty::IVec3 => (12, 4),
+        Ty::Vec3a | Ty::Vec4 | Ty::Quat | Ty::Rgba => (16, 4),
+        Ty::Mat3 => (36, 4),
+        Ty::Mat4 => (64, 4),
+        Ty::Asset(_) => (32, 8),
+        Ty::BitSet(bits) => (bits.div_ceil(32).max(1) * 4, 4),
+        Ty::InlineStr(cap) => (4 + cap.div_ceil(4) * 4, 4),
+        Ty::InputBuffer { cap, .. } => (cap * 8, 4),
+        Ty::SmallVec { elem, cap } => {
+            let (es, ea) = ty_size_and_align(elem, mir, enums, ptr_bytes);
+            let ea = ea.max(1);
+            let stride = align_up(es, ea);
+            (8 + stride * cap, ea.max(4))
+        }
+        Ty::Array { elem, len } => {
+            let (es, ea) = ty_size_and_align(elem, mir, enums, ptr_bytes);
+            let ea = ea.max(1);
+            let stride = align_up(es, ea);
+            (stride * len, ea)
+        }
+        Ty::Tuple(ts) => {
+            let mut cursor = 0usize;
+            let mut max_align = 1usize;
+            for t in ts {
+                let (s, a) = ty_size_and_align(t, mir, enums, ptr_bytes);
+                let a = a.max(1);
+                max_align = max_align.max(a);
+                cursor = align_up(cursor, a) + s;
+            }
+            (align_up(cursor, max_align), max_align)
+        }
+        Ty::Named(n) => {
+            if n == "Entity" {
+                return (8, 8);
+            }
+            if n == "GraceWindow" {
+                return (4, 4);
+            }
+            if let Some(ed) = lookup_name_ref(enums, n) {
+                let sz = ed.repr_bytes.max(1);
+                return (sz, sz);
+            }
+            let short = n.rsplit("::").next().unwrap_or(n.as_str());
+            if let Some(l) = mir.layouts.iter().find(|l| {
+                l.canonical_name == *n || l.canonical_name.rsplit("::").next() == Some(short)
+            }) {
+                return (l.size, l.align.max(1));
+            }
+            (ptr_bytes.max(8), 8)
+        }
+        _ => (ptr_bytes.max(8), 8),
+    }
+}
+
+fn mir_ty_from_debug_ty(inner: &str) -> Option<MirType> {
+    let t = inner.trim();
+    match t {
+        "Bool" => Some(MirType::Bool),
+        "U8" => Some(MirType::U8),
+        "I8" => Some(MirType::I8),
+        "U16" => Some(MirType::U16),
+        "I16" => Some(MirType::I16),
+        "U32" | "Rgba8" => Some(MirType::U32),
+        "I32" => Some(MirType::I32),
+        "F32" | "GraceWindow" => Some(MirType::F32),
+        "Fix32" => Some(MirType::Fix32),
+        "U64" => Some(MirType::U64),
+        "I64" => Some(MirType::I64),
+        "F64" => Some(MirType::F64),
+        "Fix64" => Some(MirType::Fix64),
+        "Sym" => Some(MirType::Sym),
+        "Vec2" => Some(MirType::Vec2),
+        "IVec2" => Some(MirType::IVec2),
+        "UVec2" => Some(MirType::UVec2),
+        "Vec3" => Some(MirType::Vec3),
+        "IVec3" => Some(MirType::IVec3),
+        "Vec3a" | "Vec4" | "Quat" | "Rgba" => Some(MirType::Vec4),
+        "Mat3" => Some(MirType::Named("mat3".to_owned())),
+        "Mat4" => Some(MirType::Named("mat4".to_owned())),
+        "Unit" => Some(MirType::Unit),
+        _ => {
+            if t.starts_with("UnitScalar") {
+                return Some(MirType::F32);
+            }
+            if t.starts_with("Ref(") {
+                return Some(MirType::Entity);
+            }
+            if let Some(b) = t.strip_prefix("BitSet(").and_then(|s| s.strip_suffix(')')) {
+                return Some(MirType::Named(format!("BitSet<{b}>")));
+            }
+            if let Some(c) = t
+                .strip_prefix("InlineStr(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                return Some(MirType::Named(format!("InlineStr<{c}>")));
+            }
+            if let Some(n) = t
+                .strip_prefix("Named(\"")
+                .and_then(|s| s.strip_suffix("\")"))
+            {
+                return Some(if n == "Entity" {
+                    MirType::Entity
+                } else {
+                    MirType::Named(n.to_owned())
+                });
+            }
+            if let Some(inner_t) = t.strip_prefix("Tuple([").and_then(|s| s.strip_suffix("])")) {
+                let parts: Vec<MirType> = split_top_level_commas(inner_t)
+                    .into_iter()
+                    .filter_map(mir_ty_from_debug_ty)
+                    .collect();
+                return Some(MirType::Tuple(parts));
+            }
+            if let Some(inner_a) = t
+                .strip_prefix("Array { ")
+                .and_then(|s| s.strip_suffix(" }"))
+            {
+                // `Array { elem: <T>, len: <N> }`
+                let parts = split_top_level_commas(inner_a);
+                let elem_s = parts.first()?.strip_prefix("elem:")?.trim();
+                let len_s = parts.get(1)?.trim().strip_prefix("len:")?.trim();
+                let elem = mir_ty_from_debug_ty(elem_s)?;
+                let len = len_s.parse::<usize>().ok()?;
+                return Some(MirType::Array {
+                    elem: Box::new(elem),
+                    len,
+                });
+            }
+            None
+        }
+    }
+}
+
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut in_str = false;
+    let mut prev_esc = false;
+    for (i, ch) in s.char_indices() {
+        if in_str {
+            if ch == '"' && !prev_esc {
+                in_str = false;
+            }
+            prev_esc = ch == '\\' && !prev_esc;
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < s.len() {
+        parts.push(&s[start..]);
+    }
+    parts
+}
+
+pub(super) fn parse_smallvec_mir_name(name: &str) -> Option<(MirType, usize)> {
+    let inner = name.strip_prefix("SmallVec<")?.strip_suffix('>')?;
+    let (elem_dbg, cap_str) = inner.rsplit_once(',')?;
+    let cap = cap_str.trim().parse::<usize>().ok()?;
+    let elem_mty = mir_ty_from_debug_ty(elem_dbg)?;
+    Some((elem_mty, cap))
 }
 
 impl<'a> ModuleContext<'a> {
@@ -2256,6 +2792,30 @@ impl<'a> ModuleContext<'a> {
             .map_err(|e| JitError::Codegen(e.to_string()))?;
         self.string_cache.insert(text.to_owned(), id);
         Ok((id, len))
+    }
+
+    fn intern_inline_str_blob(&mut self, text: &str, cap: usize) -> Result<DataId, JitError> {
+        let eff_cap = cap;
+        let aligned_cap = eff_cap.div_ceil(4) * 4;
+        let total = 4 + aligned_cap;
+        let mut end = text.len().min(eff_cap);
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut bytes = vec![0u8; total.max(4)];
+        bytes[..4].copy_from_slice(&(end as u32).to_le_bytes());
+        bytes[4..4 + end].copy_from_slice(&text.as_bytes()[..end]);
+        let id = self
+            .obj_mod
+            .declare_anonymous_data(false, false)
+            .map_err(|e| JitError::Codegen(e.to_string()))?;
+        let mut desc = DataDescription::new();
+        desc.define(bytes.into_boxed_slice());
+        desc.set_align(4);
+        self.obj_mod
+            .define_data(id, &desc)
+            .map_err(|e| JitError::Codegen(e.to_string()))?;
+        Ok(id)
     }
 
     fn declare_extern_fn(
@@ -2311,6 +2871,65 @@ impl<'a> ModuleContext<'a> {
         }
     }
 
+    fn resolve_table_by_key(&self, key: &str) -> Option<&TableRodata> {
+        let stripped = key
+            .strip_prefix("__table_row::")
+            .or_else(|| key.split("::__table_row::").nth(1))
+            .unwrap_or(key);
+        let bare = stripped.rsplit("::").next().unwrap_or(stripped);
+        self.tables
+            .get(key)
+            .or_else(|| self.tables.get(stripped))
+            .or_else(|| self.tables.get(bare))
+    }
+
+    fn mir_ty_align_of(&self, mty: &MirType) -> usize {
+        match mty {
+            MirType::Unit | MirType::Bool | MirType::U8 | MirType::I8 => 1,
+            MirType::U16 | MirType::I16 => 2,
+            MirType::U32
+            | MirType::I32
+            | MirType::F32
+            | MirType::Sym
+            | MirType::Fix32
+            | MirType::Vec2
+            | MirType::IVec2
+            | MirType::UVec2
+            | MirType::Vec3
+            | MirType::IVec3
+            | MirType::Vec4 => 4,
+            MirType::Array { elem, .. } => self.mir_ty_align_of(elem),
+            MirType::Tuple(ts) => ts
+                .iter()
+                .map(|t| self.mir_ty_align_of(t))
+                .max()
+                .unwrap_or(1)
+                .max(1),
+            MirType::Named(name) => {
+                if let Some(scalar) = self.enum_scalar_mir_ty(mty) {
+                    return self.mir_ty_align_of(&scalar);
+                }
+                if name == "mat3"
+                    || name == "mat4"
+                    || name == "GraceWindow"
+                    || name.starts_with("BitSet<")
+                    || name.starts_with("InlineStr<")
+                    || name.starts_with("InputBuffer<")
+                {
+                    return 4;
+                }
+                if let Some((elem_mty, _)) = parse_smallvec_mir_name(name) {
+                    return self.mir_ty_align_of(&elem_mty).max(4);
+                }
+                if let Some(i) = lookup_name_in_map(&self.layout_map, name) {
+                    return self.mir_layouts_sorted[i].align.max(1);
+                }
+                8
+            }
+            _ => 8,
+        }
+    }
+
     fn layout_size_of_mir_ty(&self, mty: &MirType) -> usize {
         match mty {
             MirType::Unit | MirType::Bool | MirType::U8 | MirType::I8 => 1,
@@ -2328,22 +2947,56 @@ impl<'a> ModuleContext<'a> {
             MirType::Vec2 | MirType::IVec2 | MirType::UVec2 => 8,
             MirType::Vec3 | MirType::IVec3 => 12,
             MirType::Vec4 => 16,
-            MirType::Array { elem, len } => self.layout_size_of_mir_ty(elem) * (*len),
-            MirType::Tuple(ts) => ts
-                .iter()
-                .enumerate()
-                .map(|(i, t)| i * 8 + self.layout_size_of_mir_ty(t))
-                .max()
-                .unwrap_or(0),
+            MirType::Array { elem, len } => {
+                let es = self.layout_size_of_mir_ty(elem);
+                let ea = self.mir_ty_align_of(elem).max(1);
+                align_up(es, ea) * (*len)
+            }
+            MirType::Tuple(ts) => {
+                let mut cursor = 0usize;
+                let mut max_align = 1usize;
+                for t in ts {
+                    let s = self.layout_size_of_mir_ty(t);
+                    let a = self.mir_ty_align_of(t).max(1);
+                    max_align = max_align.max(a);
+                    cursor = align_up(cursor, a) + s;
+                }
+                align_up(cursor, max_align)
+            }
             MirType::Named(name) => {
                 if let Some(scalar) = self.enum_scalar_mir_ty(mty) {
                     self.layout_size_of_mir_ty(&scalar)
+                } else if name == "mat3" {
+                    36
+                } else if name == "mat4" {
+                    64
+                } else if name == "GraceWindow" {
+                    4
+                } else if name.starts_with("Asset<") {
+                    32
+                } else if let Some(cap) = inline_str_cap_from_name(name) {
+                    4 + cap.div_ceil(4) * 4
+                } else if name == "InlineStr" {
+                    4 + 64
+                } else if let Some(cap) = name
+                    .strip_prefix("InputBuffer<")
+                    .and_then(|s| s.strip_suffix('>'))
+                    .and_then(|s| s.rsplit_once(','))
+                    .and_then(|(_, c)| c.trim().parse::<usize>().ok())
+                {
+                    cap * 8
+                } else if let Some((elem_mty, cap)) = parse_smallvec_mir_name(name) {
+                    let es = self.layout_size_of_mir_ty(&elem_mty);
+                    let ea = self.mir_ty_align_of(&elem_mty).max(1);
+                    8 + align_up(es, ea) * cap
                 } else if let Some(bits) = name
                     .strip_prefix("BitSet<")
                     .and_then(|s| s.strip_suffix('>'))
                     .and_then(|s| s.parse::<usize>().ok())
                 {
                     bits.div_ceil(32).max(1) * 4
+                } else if let Some(tbl) = self.resolve_table_by_key(name) {
+                    tbl.row_stride
                 } else {
                     lookup_name_in_map(&self.layout_map, name)
                         .map(|i| self.layouts[i].size)
@@ -2376,16 +3029,8 @@ impl<'a> ModuleContext<'a> {
 
     fn sema_ty_to_field_mir_ty(&self, ty: &Ty) -> Option<MirType> {
         match ty {
-            Ty::Unit
-            | Ty::Unknown
-            | Ty::BannedWire(_)
-            | Ty::Asset(_)
-            | Ty::Mat3
-            | Ty::Mat4
-            | Ty::BitSet(_)
-            | Ty::InlineStr(_)
-            | Ty::InputBuffer { .. }
-            | Ty::SmallVec { .. } => None,
+            Ty::Unit | Ty::Unknown | Ty::BannedWire(_) => None,
+            Ty::GraceWindow => Some(MirType::F32),
             Ty::Named(n) if n == "GraceWindow" => Some(MirType::F32),
             Ty::Named(n) => {
                 let enum_repr = lookup_name_ref(&self.enums_by_name, n)
@@ -2416,6 +3061,19 @@ impl<'a> ModuleContext<'a> {
         layout_key: &str,
         field: &str,
     ) -> (usize, Option<MirType>) {
+        if let Some(tbl) = self.resolve_table_by_key(layout_key) {
+            if let Some((off, mty)) = tbl.fields.get(field) {
+                return (*off, Some(mty.clone()));
+            }
+            if let Some((first, rest)) = field.split_once('.')
+                && let Some((base_off, MirType::Named(inner_key))) = tbl.fields.get(first)
+            {
+                let (sub_off, sub_ty) = self.resolve_field_offset_and_ty(inner_key, rest);
+                if sub_ty.is_some() {
+                    return (base_off + sub_off, sub_ty);
+                }
+            }
+        }
         let mut cur_layout = lookup_name_in_map(&self.layout_map, layout_key)
             .map(|lidx| &self.mir_layouts_sorted[lidx])
             .or_else(|| {

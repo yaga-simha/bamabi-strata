@@ -14,6 +14,7 @@ pub(super) fn build_helper_signature(
 ) -> Signature {
     let mut sig = Signature::new(cc);
     sig.params.push(AbiParam::new(ptr_ty)); // state_ptr
+    sig.params.push(AbiParam::new(ptr_ty)); // sys_ctx
     if helper_uses_out_ptr(&hfn.ret_ty) {
         sig.params.push(AbiParam::new(ptr_ty)); // sret out_ptr for 3/4-lane vecs
     }
@@ -483,6 +484,7 @@ pub(super) fn find_par_subcfg_info(
     is_readonly: bool,
     deterministic_order: bool,
     enums_by_name: &HashMap<String, EnumDef>,
+    unsafe_par_fns: &HashSet<String>,
 ) -> Option<ParSubCfgInfo> {
     if is_readonly && deterministic_order {
         return None;
@@ -575,8 +577,21 @@ pub(super) fn find_par_subcfg_info(
                 | Inst::SpatialCsrPrefixSum { .. }
                 | Inst::SpatialCsrScatter { .. }
                 | Inst::IterReset { .. }
+                | Inst::IterCount { .. }
+                | Inst::IterUpCascade { .. }
+                | Inst::ResRead { .. }
+                | Inst::ResWrite { .. }
                 | Inst::SpatialQueryDisc { .. }
                 | Inst::SpatialQuerySegmentAt { .. } => return None,
+                Inst::Call { callee, .. }
+                    if unsafe_par_fns.contains(callee.as_str())
+                        || callee
+                            .rsplit("::")
+                            .next()
+                            .is_some_and(|s| unsafe_par_fns.contains(s)) =>
+                {
+                    return None;
+                }
                 Inst::SlotStore { slot, .. } if !allocs_inside.contains(&slot.0) => return None,
                 _ => {}
             }
@@ -837,6 +852,107 @@ pub(super) fn collect_slot_elem_tys(
             }
         }
     }
+    // Recover vector local types for `vec * scalar` / `ivec * i32` where upstream Sema/MIR
+    // fell back to scalar `I32`/`F32` on the intermediate `BinOp`/`UnOp`/`SlotLoad` local.
+    let eff = |map: &HashMap<u32, MirType>, id: LocalId| -> MirType {
+        map.get(&id.0)
+            .unwrap_or(&mir_fn.locals[id.0 as usize].ty)
+            .clone()
+    };
+    for _pass in 0..4 {
+        let mut changed = false;
+        for bb in &mir_fn.blocks {
+            for s in &bb.stmts {
+                match &s.inst {
+                    Inst::BinOp { op, lhs, rhs, .. } if !is_cmp_op(op) => {
+                        if let Some(d) = s.dst {
+                            let dty = eff(&slot_elem_tys, d);
+                            if vec_dims(&dty).is_none() {
+                                let lty = eff(&slot_elem_tys, *lhs);
+                                let rty = eff(&slot_elem_tys, *rhs);
+                                let vty = if vec_dims(&lty).is_some() {
+                                    Some(lty)
+                                } else if vec_dims(&rty).is_some() {
+                                    Some(rty)
+                                } else {
+                                    None
+                                };
+                                if let Some(vt) = vty
+                                    && slot_elem_tys.get(&d.0) != Some(&vt)
+                                {
+                                    slot_elem_tys.insert(d.0, vt);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    Inst::UnOp { op, val } if op == "-" => {
+                        if let Some(d) = s.dst {
+                            let dty = eff(&slot_elem_tys, d);
+                            let vty = eff(&slot_elem_tys, *val);
+                            if vec_dims(&dty).is_none()
+                                && vec_dims(&vty).is_some()
+                                && slot_elem_tys.get(&d.0) != Some(&vty)
+                            {
+                                slot_elem_tys.insert(d.0, vty);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Inst::IntrinsicMath { name, .. } | Inst::Call { callee: name, .. } => {
+                        if let Some(d) = s.dst {
+                            let short = name.rsplit("::").next().unwrap_or(name.as_str());
+                            let mty = match short {
+                                "mat3" | "Mat3" => Some(MirType::Named("mat3".to_owned())),
+                                "mat4" | "Mat4" => Some(MirType::Named("mat4".to_owned())),
+                                _ => None,
+                            };
+                            if let Some(mt) = mty
+                                && mir_fn.locals[d.0 as usize].ty == MirType::Unit
+                                && slot_elem_tys.get(&d.0) != Some(&mt)
+                            {
+                                slot_elem_tys.insert(d.0, mt);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Inst::Copy { val } | Inst::SlotLoad { slot: val } => {
+                        if let Some(d) = s.dst {
+                            let dty = eff(&slot_elem_tys, d);
+                            let vty = eff(&slot_elem_tys, *val);
+                            let prop_agg = dty == MirType::Unit
+                                && matches!(vty, MirType::Named(ref n) if n == "mat3" || n == "mat4");
+                            if ((vec_dims(&dty).is_none() && vec_dims(&vty).is_some()) || prop_agg)
+                                && slot_elem_tys.get(&d.0) != Some(&vty)
+                            {
+                                slot_elem_tys.insert(d.0, vty);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Inst::SlotStore { slot, val } => {
+                        let st_raw = &mir_fn.locals[slot.0 as usize].ty;
+                        if matches!(st_raw, MirType::MutPtr | MirType::Ptr) {
+                            let sty = eff(&slot_elem_tys, *slot);
+                            let vty = eff(&slot_elem_tys, *val);
+                            let prop_agg = sty == MirType::Unit
+                                && matches!(vty, MirType::Named(ref n) if n == "mat3" || n == "mat4");
+                            if ((vec_dims(&sty).is_none() && vec_dims(&vty).is_some()) || prop_agg)
+                                && slot_elem_tys.get(&slot.0) != Some(&vty)
+                            {
+                                slot_elem_tys.insert(slot.0, vty);
+                                changed = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     slot_elem_tys
 }
 
@@ -864,8 +980,15 @@ pub(super) fn emit_mir_function_body(
             };
             if let Some((qi, ro, det)) = par_spec
                 && mode == MirCallbackMode::System
-                && let Some(info) =
-                    find_par_subcfg_info(mir_fn, bi, qi, ro, det, &ctx.enums_by_name)
+                && let Some(info) = find_par_subcfg_info(
+                    mir_fn,
+                    bi,
+                    qi,
+                    ro,
+                    det,
+                    &ctx.enums_by_name,
+                    &ctx.unsafe_par_fns,
+                )
             {
                 let mut offsets = Vec::with_capacity(info.live_in_locals.len() + 1);
                 let mut off = ctx.ptr_bytes; // offset 0 = state_ptr
@@ -876,7 +999,12 @@ pub(super) fn emit_mir_function_body(
                         .get(&lid)
                         .unwrap_or(&mir_fn.locals[lid as usize].ty);
                     off += match mty {
-                        MirType::Vec2 | MirType::Vec3 | MirType::Vec4 => 16,
+                        MirType::Vec2
+                        | MirType::Vec3
+                        | MirType::Vec4
+                        | MirType::IVec2
+                        | MirType::IVec3
+                        | MirType::UVec2 => 16,
                         _ => 8,
                     };
                 }
@@ -981,15 +1109,7 @@ pub(super) fn emit_mir_function_body(
                     Some(params[0]),
                     Some(params[1]),
                 ),
-                MirCallbackMode::Helper => (
-                    b.ins().iconst(ptr_ty, 0),
-                    params[0],
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
+                MirCallbackMode::Helper => (params[1], params[0], None, None, None, None, None),
             };
 
         let api_ptr = b.ins().load(
@@ -1008,17 +1128,20 @@ pub(super) fn emit_mir_function_body(
         let sr_plan = analyze_strength_reduction(mir_fn, &mut b, ptr_ty);
         if mode == MirCallbackMode::System
             && let Some(entry) = sys_entry
-            && let Some((ref guard_expr, res_lidx)) = entry.run_if_guard
+            && let Some((ref guard_expr, res_lidx_opt)) = entry.run_if_guard
         {
-            let rptr =
-                emit_res_ptr_lookup(ctx, &mut b, api_ptr, sys_ctx, state_ptr, res_lidx, false);
-            if let Some(cond) = eval_hir_run_if(
-                &ctx.mir_layouts_sorted[res_lidx],
-                &ctx.consts_by_name,
-                &mut b,
-                rptr,
-                guard_expr,
-            ) {
+            let (res_layout, rptr) = match res_lidx_opt {
+                Some(res_lidx) => (
+                    Some(&ctx.mir_layouts_sorted[res_lidx]),
+                    Some(emit_res_ptr_lookup(
+                        ctx, &mut b, api_ptr, sys_ctx, state_ptr, res_lidx, false,
+                    )),
+                ),
+                None => (None, None),
+            };
+            if let Some(cond) =
+                eval_hir_run_if(res_layout, &ctx.consts_by_name, &mut b, rptr, guard_expr)
+            {
                 let run_bb = b.create_block();
                 let skip_bb = b.create_block();
                 b.ins().brif(cond, run_bb, &[], skip_bb, &[]);
@@ -1052,10 +1175,10 @@ pub(super) fn emit_mir_function_body(
         // Bind `HelperFn` parameters onto `MirParam.local`.
         if mode == MirCallbackMode::Helper {
             let mut p_off = if helper_uses_out_ptr(&mir_fn.ret_ty) {
-                lowerer.helper_out_ptr = Some(params[1]);
-                2usize
+                lowerer.helper_out_ptr = Some(params[2]);
+                3usize
             } else {
-                1usize
+                2usize
             };
             for p in &mir_fn.params {
                 let count = match p.ty {
@@ -1070,7 +1193,7 @@ pub(super) fn emit_mir_function_body(
                 }
                 p_off += count;
             }
-        } else if mode == MirCallbackMode::System {
+        } else if matches!(mode, MirCallbackMode::System | MirCallbackMode::Observer) {
             lowerer.bind_stream_in_params()?;
         }
 
@@ -1413,10 +1536,16 @@ pub(super) struct FnLowerer<'a, 'b, 'f> {
     pub(super) sr_plan: StrengthPlan,
     pub(super) ptr_vec_hints: HashMap<u32, (i32, u8)>,
     pub(super) const_strings: HashMap<u32, (DataId, usize)>,
+    pub(super) const_string_texts: HashMap<u32, String>,
     pub(super) batch_schemas: HashMap<u32, Vec<usize>>,
     pub(super) const_defs: HashMap<u32, MirConstVal>,
     pub(super) array_elems: HashMap<u32, Vec<LocalId>>,
     pub(super) array_ptr_lens: HashMap<u32, usize>,
+    pub(super) ptr_elem_tys: HashMap<u32, MirType>,
+    pub(super) ptr_pointee_tys: HashMap<u32, MirType>,
+    pub(super) slot_ptr_elem_tys: HashMap<u32, MirType>,
+    pub(super) slot_ptr_pointee_tys: HashMap<u32, MirType>,
+    pub(super) slot_array_lens: HashMap<u32, usize>,
 }
 
 impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
@@ -1478,14 +1607,28 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         }
 
         let mut array_ptr_lens = HashMap::new();
+        let mut ptr_elem_tys = HashMap::new();
+        let mut ptr_pointee_tys = HashMap::new();
         for (li, loc) in mir_fn.locals.iter().enumerate() {
-            if let MirType::Array { len, .. } = &loc.ty {
+            if let MirType::Array { elem, len } = &loc.ty {
                 array_ptr_lens.insert(li as u32, *len);
+                ptr_elem_tys.insert(li as u32, (**elem).clone());
+                ptr_pointee_tys.insert(li as u32, loc.ty.clone());
+            } else if let MirType::Named(n) = &loc.ty
+                && n.starts_with("SmallVec<")
+            {
+                ptr_pointee_tys.insert(li as u32, loc.ty.clone());
             }
         }
         for (&sid, ty) in &agg_slot_tys {
-            if let MirType::Array { len, .. } = ty {
+            if let MirType::Array { elem, len } = ty {
                 array_ptr_lens.insert(sid, *len);
+                ptr_elem_tys.insert(sid, (**elem).clone());
+                ptr_pointee_tys.insert(sid, ty.clone());
+            } else if let MirType::Named(n) = ty
+                && n.starts_with("SmallVec<")
+            {
+                ptr_pointee_tys.insert(sid, ty.clone());
             }
         }
 
@@ -1600,10 +1743,16 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             sr_plan,
             ptr_vec_hints,
             const_strings: HashMap::new(),
+            const_string_texts: HashMap::new(),
             batch_schemas: HashMap::new(),
             const_defs: HashMap::new(),
             array_elems: HashMap::new(),
             array_ptr_lens,
+            ptr_elem_tys,
+            ptr_pointee_tys,
+            slot_ptr_elem_tys: HashMap::new(),
+            slot_ptr_pointee_tys: HashMap::new(),
+            slot_array_lens: HashMap::new(),
         }
     }
 
@@ -1643,6 +1792,34 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         self.slot_elem_tys
             .get(&lid.0)
             .unwrap_or(&self.mir_fn.locals[lid.0 as usize].ty)
+    }
+
+    pub(super) fn is_query_term_sparse(
+        &self,
+        query_idx: u32,
+        term_idx: u32,
+        storage_key: &str,
+    ) -> bool {
+        if let Some(qb) = self
+            .mir_fn
+            .query_bindings
+            .iter()
+            .find(|qb| qb.query_idx == query_idx)
+            && let Some(t) = qb.terms.iter().find(|t| {
+                t.term_idx == term_idx || (!storage_key.is_empty() && t.storage_key == storage_key)
+            })
+            && t.is_sparse
+        {
+            return true;
+        }
+        if !storage_key.is_empty()
+            && let Some(lidx) = lookup_name_in_map(&self.ctx.layout_map, storage_key)
+            && (self.ctx.mir_layouts_sorted[lidx].component_flags & BAM_COMPONENT_FLAG_SPARSE_SET)
+                != 0
+        {
+            return true;
+        }
+        false
     }
 
     pub(super) fn effective_vec_dims(&self, lid: LocalId) -> Option<u8> {
@@ -1778,17 +1955,22 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                 let mem_ty = self.ctx.cl_type_for_mir_val(mty);
                 let val = self.b.ins().load(mem_ty, MemFlagsData::new(), ptr, offset);
                 let dst_mty = self.effective_local_mir_ty(lid).clone();
-                let target_ty = self.expected_cl_ty(lid);
-                let coerced = cast_value(
-                    self.b,
-                    val,
-                    mty,
-                    is_signed_int_ty(mty),
-                    target_ty,
-                    is_signed_int_ty(&dst_mty),
-                    self.ctx.ptr_ty,
-                );
-                self.def_scalar_typed(lid, coerced);
+                if dst_mty == MirType::Bool {
+                    let bval = cast_to_bool(self.b, val, mty);
+                    self.def_scalar_typed(lid, bval);
+                } else {
+                    let target_ty = self.expected_cl_ty(lid);
+                    let coerced = cast_value(
+                        self.b,
+                        val,
+                        mty,
+                        is_signed_int_ty(mty),
+                        target_ty,
+                        is_signed_int_ty(&dst_mty),
+                        self.ctx.ptr_ty,
+                    );
+                    self.def_scalar_typed(lid, coerced);
+                }
             }
         }
     }
@@ -1972,6 +2154,9 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
                 is_signed_int_ty(dst_mty),
                 ptr_ty,
             );
+        }
+        if *dst_mty == MirType::Bool {
+            return cast_to_bool(self.b, val, src_mty);
         }
         cast_value(
             self.b,
@@ -2173,7 +2358,12 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let mut frame_bytes = self.ctx.ptr_bytes;
         for (&lid, &off) in info.live_in_locals.iter().zip(offsets.iter()) {
             let extra = match self.effective_local_mir_ty(LocalId(lid)) {
-                MirType::Vec2 | MirType::Vec3 | MirType::Vec4 => 16,
+                MirType::Vec2
+                | MirType::Vec3
+                | MirType::Vec4
+                | MirType::IVec2
+                | MirType::IVec3
+                | MirType::UVec2 => 16,
                 _ => 8,
             };
             frame_bytes = frame_bytes.max(off + extra);
@@ -2448,15 +2638,58 @@ pub(super) fn float_cmp(b: &mut FunctionBuilder<'_>, op: &str, l: Value, r: Valu
     b.ins().fcmp(cc, l, r)
 }
 
-pub(super) fn guarded_sdiv(b: &mut FunctionBuilder<'_>, ty: Type, l: Value, r: Value) -> Value {
-    let nz = b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
+fn signed_div_rem_guarded(
+    b: &mut FunctionBuilder<'_>,
+    ty: Type,
+    is_rem: bool,
+    l: Value,
+    r: Value,
+) -> Value {
+    let min_bits: i64 = match ty {
+        types::I8 => i64::from(i8::MIN),
+        types::I16 => i64::from(i16::MIN),
+        types::I32 => i64::from(i32::MIN),
+        _ => i64::MIN,
+    };
+    let is_zero = b.ins().icmp_imm_s(IntCC::Equal, r, 0);
+    let min_v = b.ins().iconst(ty, min_bits);
+    let is_min = b.ins().icmp(IntCC::Equal, l, min_v);
+    let is_neg1 = b.ins().icmp_imm_s(IntCC::Equal, r, -1);
+    let is_overflow = b.ins().band(is_min, is_neg1);
+    let bad = b.ins().bor(is_zero, is_overflow);
+
     let ok_bb = b.create_block();
-    let zero_bb = b.create_block();
+    let bad_bb = b.create_block();
     let done_bb = b.create_block();
     b.append_block_param(done_bb, ty);
-    b.ins().brif(nz, ok_bb, &[], zero_bb, &[]);
+    b.ins().brif(bad, bad_bb, &[], ok_bb, &[]);
 
-    self_block_div(b, ty, true, false, l, r, ok_bb, zero_bb, done_bb)
+    b.switch_to_block(ok_bb);
+    b.seal_block(ok_bb);
+    let q = if is_rem {
+        b.ins().srem(l, r)
+    } else {
+        b.ins().sdiv(l, r)
+    };
+    b.ins().jump(done_bb, &[BlockArg::Value(q)]);
+
+    b.switch_to_block(bad_bb);
+    b.seal_block(bad_bb);
+    let z = b.ins().iconst(ty, 0);
+    let fallback = if is_rem {
+        z
+    } else {
+        b.ins().select(is_overflow, l, z)
+    };
+    b.ins().jump(done_bb, &[BlockArg::Value(fallback)]);
+
+    b.switch_to_block(done_bb);
+    b.seal_block(done_bb);
+    b.block_params(done_bb)[0]
+}
+
+pub(super) fn guarded_sdiv(b: &mut FunctionBuilder<'_>, ty: Type, l: Value, r: Value) -> Value {
+    signed_div_rem_guarded(b, ty, false, l, r)
 }
 
 pub(super) fn self_block_div(
@@ -2503,22 +2736,30 @@ pub(super) fn int_binop_or_cmp(
         "-" => b.ins().isub(l, r),
         "*" => b.ins().imul(l, r),
         "/" => {
-            let nz = b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
-            let ok_bb = b.create_block();
-            let zero_bb = b.create_block();
-            let done_bb = b.create_block();
-            b.append_block_param(done_bb, ty);
-            b.ins().brif(nz, ok_bb, &[], zero_bb, &[]);
-            self_block_div(b, ty, signed, false, l, r, ok_bb, zero_bb, done_bb)
+            if signed {
+                signed_div_rem_guarded(b, ty, false, l, r)
+            } else {
+                let nz = b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
+                let ok_bb = b.create_block();
+                let zero_bb = b.create_block();
+                let done_bb = b.create_block();
+                b.append_block_param(done_bb, ty);
+                b.ins().brif(nz, ok_bb, &[], zero_bb, &[]);
+                self_block_div(b, ty, false, false, l, r, ok_bb, zero_bb, done_bb)
+            }
         }
         "%" => {
-            let nz = b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
-            let ok_bb = b.create_block();
-            let zero_bb = b.create_block();
-            let done_bb = b.create_block();
-            b.append_block_param(done_bb, ty);
-            b.ins().brif(nz, ok_bb, &[], zero_bb, &[]);
-            self_block_div(b, ty, signed, true, l, r, ok_bb, zero_bb, done_bb)
+            if signed {
+                signed_div_rem_guarded(b, ty, true, l, r)
+            } else {
+                let nz = b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
+                let ok_bb = b.create_block();
+                let zero_bb = b.create_block();
+                let done_bb = b.create_block();
+                b.append_block_param(done_bb, ty);
+                b.ins().brif(nz, ok_bb, &[], zero_bb, &[]);
+                self_block_div(b, ty, false, true, l, r, ok_bb, zero_bb, done_bb)
+            }
         }
         "&" | "&&" => b.ins().band(l, r),
         "|" | "||" => b.ins().bor(l, r),
@@ -2577,6 +2818,7 @@ pub(super) fn apply_min_max(
     b: &mut FunctionBuilder<'_>,
     ty: Type,
     is_min: bool,
+    signed: bool,
     a: Value,
     v: Value,
 ) -> Value {
@@ -2586,11 +2828,30 @@ pub(super) fn apply_min_max(
         } else {
             b.ins().fmax(a, v)
         }
+    } else if signed {
+        if is_min {
+            b.ins().smin(a, v)
+        } else {
+            b.ins().smax(a, v)
+        }
     } else if is_min {
-        b.ins().smin(a, v)
+        b.ins().umin(a, v)
     } else {
-        b.ins().smax(a, v)
+        b.ins().umax(a, v)
     }
+}
+
+pub(super) fn cast_to_bool(b: &mut FunctionBuilder<'_>, val: Value, src_mty: &MirType) -> Value {
+    let from = b.func.dfg.value_type(val);
+    if matches!(src_mty, MirType::F32 | MirType::F64) || from == types::F32 || from == types::F64 {
+        let z = if from == types::F64 {
+            b.ins().f64const(0.0)
+        } else {
+            b.ins().f32const(0.0)
+        };
+        return b.ins().fcmp(FloatCC::NotEqual, val, z);
+    }
+    b.ins().icmp_imm_s(IntCC::NotEqual, val, 0)
 }
 
 fn emit_fcvt_to_sint_sat(b: &mut FunctionBuilder<'_>, to: Type, val: Value) -> Value {
@@ -2818,6 +3079,62 @@ pub(super) fn call_vtable_guarded(
     b.switch_to_block(skip_bb);
     b.seal_block(skip_bb);
     let z = zero_for_cl_type(b, ret);
+    b.ins().jump(merge_bb, &[BlockArg::Value(z)]);
+
+    b.switch_to_block(merge_bb);
+    b.seal_block(merge_bb);
+    b.block_params(merge_bb)[0]
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn call_vtable_opt(
+    _module: &ObjectModule,
+    b: &mut FunctionBuilder<'_>,
+    api_ptr: Value,
+    slot_offset: usize,
+    params: &[Type],
+    ret: Option<Type>,
+    ptr_ty: Type,
+    call_conv: CallConv,
+    args: &[Value],
+) -> Value {
+    let fn_ptr = b
+        .ins()
+        .load(ptr_ty, MemFlagsData::trusted(), api_ptr, slot_offset as i32);
+    let ok = b.ins().icmp_imm_s(IntCC::NotEqual, fn_ptr, 0);
+    let call_bb = b.create_block();
+    let skip_bb = b.create_block();
+    let merge_bb = b.create_block();
+    let merge_ty = ret.unwrap_or(types::I32);
+    b.append_block_param(merge_bb, merge_ty);
+    b.ins().brif(ok, call_bb, &[], skip_bb, &[]);
+
+    b.switch_to_block(call_bb);
+    b.seal_block(call_bb);
+    let mut sig = Signature::new(call_conv);
+    for &p in params {
+        sig.params.push(AbiParam::new(p));
+    }
+    if let Some(r) = ret {
+        sig.returns.push(AbiParam::new(r));
+    }
+    let sig_ref = b.import_signature(sig);
+    let coerced_args: Vec<Value> = args
+        .iter()
+        .zip(params.iter())
+        .map(|(&a, &p)| coerce_cl_val(b, a, p, ptr_ty))
+        .collect();
+    let call = b.ins().call_indirect(sig_ref, fn_ptr, &coerced_args);
+    let r = b
+        .inst_results(call)
+        .first()
+        .copied()
+        .unwrap_or_else(|| zero_for_cl_type(b, merge_ty));
+    b.ins().jump(merge_bb, &[BlockArg::Value(r)]);
+
+    b.switch_to_block(skip_bb);
+    b.seal_block(skip_bb);
+    let z = zero_for_cl_type(b, merge_ty);
     b.ins().jump(merge_bb, &[BlockArg::Value(z)]);
 
     b.switch_to_block(merge_bb);

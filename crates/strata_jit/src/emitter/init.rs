@@ -300,6 +300,7 @@ pub(super) fn define_object_comp_blob(
         return Ok(None);
     }
     let mut blob = vec![0u8; layout.size];
+    fill_layout_defaults(&mut blob, layout, ctx.mir, 0);
     if let Some(defaults) = ctx.mir.field_defaults.get(&layout.canonical_name) {
         for (fname, cval) in defaults {
             if let Some(sf) = layout.fields.iter().find(|f| f.name == *fname) {
@@ -310,8 +311,13 @@ pub(super) fn define_object_comp_blob(
     if let Some(ci) = init {
         for (fname, fexpr) in &ci.fields {
             if let Some(sf) = layout.fields.iter().find(|f| f.name == *fname)
-                && let Some(cval) =
-                    eval_const_hir_expr(fexpr, &ctx.enums_by_name, &ctx.consts_by_name)
+                && let Some(cval) = eval_const_hir_expr_for_ty(
+                    fexpr,
+                    Some(&sf.ty),
+                    &ctx.enums_by_name,
+                    &ctx.consts_by_name,
+                    &ctx.mir.layouts,
+                )
             {
                 write_const_val_to_buf(&mut blob, sf, &cval, ctx.mir);
             }
@@ -719,7 +725,7 @@ pub(super) fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitErr
             if l.is_stream {
                 let cgv = ctx.obj_mod.declare_data_in_func(l.comp_desc_id, b.func);
                 let ro_cd = b.ins().symbol_value(ptr_ty, cgv);
-                let _s_rc = call_vtable(
+                let s_rc = call_vtable(
                     &ctx.obj_mod,
                     &mut b,
                     api_ptr,
@@ -729,6 +735,19 @@ pub(super) fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitErr
                     ptr_ty,
                     call_conv,
                     &[load_ctx, ro_cd, comp_out],
+                );
+                let s_ok = b.ins().icmp_imm_s(IntCC::Equal, s_rc, 0);
+                let reg_mark_bb = b.create_block();
+                b.ins().brif(s_ok, reg_mark_bb, &[], next_l_bb, &[]);
+
+                b.switch_to_block(reg_mark_bb);
+                b.seal_block(reg_mark_bb);
+                let msg_kind_v = b.ins().iconst(types::I8, 2);
+                b.ins().store(
+                    MemFlagsData::trusted(),
+                    msg_kind_v,
+                    state_addr,
+                    ctx.state_layout.res_flag_offset(lidx) as i32,
                 );
             }
             b.ins().jump(next_l_bb, &[]);
@@ -1167,6 +1186,54 @@ pub(super) fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitErr
             b.seal_block(ok_bb);
         }
 
+        if ctx.uses_child_of {
+            let co_out = b
+                .ins()
+                .iadd_imm_s(state_addr, ctx.state_layout.child_of_comp_off as i64);
+            let inv_co = b.ins().iconst(types::I32, i64::from(BAM_COMPONENT_INVALID));
+            b.ins().store(MemFlagsData::trusted(), inv_co, co_out, 0);
+            let null_uuid = b.ins().iconst(ptr_ty, 0);
+            let co_cstr = ctx.intern_cstr(bamabi_sys::BAM_CHILD_OF_NAME)?;
+            let co_gv = ctx.obj_mod.declare_data_in_func(co_cstr, b.func);
+            let co_nptr = b.ins().symbol_value(ptr_ty, co_gv);
+            let rc1 = call_vtable(
+                &ctx.obj_mod,
+                &mut b,
+                api_ptr,
+                api_slots::RESOLVE_COMPONENT,
+                &[ptr_ty, ptr_ty, ptr_ty, ptr_ty],
+                Some(types::I32),
+                ptr_ty,
+                call_conv,
+                &[host_ctx, co_nptr, null_uuid, co_out],
+            );
+            let rc1_ok = b.ins().icmp_imm_s(IntCC::Equal, rc1, 0);
+            let fallback_bb = b.create_block();
+            let co_done_bb = b.create_block();
+            b.ins().brif(rc1_ok, co_done_bb, &[], fallback_bb, &[]);
+
+            b.switch_to_block(fallback_bb);
+            b.seal_block(fallback_bb);
+            let short_cstr = ctx.intern_cstr("ChildOf")?;
+            let short_gv = ctx.obj_mod.declare_data_in_func(short_cstr, b.func);
+            let short_nptr = b.ins().symbol_value(ptr_ty, short_gv);
+            let _rc2 = call_vtable(
+                &ctx.obj_mod,
+                &mut b,
+                api_ptr,
+                api_slots::RESOLVE_COMPONENT,
+                &[ptr_ty, ptr_ty, ptr_ty, ptr_ty],
+                Some(types::I32),
+                ptr_ty,
+                call_conv,
+                &[host_ctx, short_nptr, null_uuid, co_out],
+            );
+            b.ins().jump(co_done_bb, &[]);
+
+            b.switch_to_block(co_done_bb);
+            b.seal_block(co_done_bb);
+        }
+
         // Step 4: Register reactive observers (`Slot 36`).
         let obs_slot = alloc_zero_slot(&mut b, structs::OBSERVER_DESC_SIZE, ptr_ty);
         let obs_ptr = b.ins().stack_addr(ptr_ty, obs_slot, 0);
@@ -1368,7 +1435,7 @@ pub(super) fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitErr
             }
             let _ = max_set_edges;
 
-            let _rc = call_vtable(
+            let _rc = call_vtable_opt(
                 &ctx.obj_mod,
                 &mut b,
                 api_ptr,
@@ -1462,6 +1529,26 @@ pub(super) fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitErr
             );
             b.ins()
                 .stack_store(ptr_ty, sched_v, sdesc_slot, structs::SYS_SCHEDULE as i32);
+            let mut startup_before_ids: Vec<DataId> = Vec::new();
+            for s in &ctx.systems {
+                if s.schedule_id == ScheduleId::STARTUP.0
+                    && !startup_before_ids.contains(&s.name_data_id)
+                {
+                    startup_before_ids.push(s.name_data_id);
+                }
+            }
+            if !startup_before_ids.is_empty() {
+                populate_cstr_ptr_array(
+                    &ctx.obj_mod,
+                    &mut b,
+                    &startup_before_ids,
+                    sdesc_slot,
+                    structs::SYS_BEFORE,
+                    structs::SYS_BEFORE_COUNT,
+                    ptr_ty,
+                    ptr_bytes,
+                );
+            }
 
             let rc = call_vtable(
                 &ctx.obj_mod,
@@ -1672,7 +1759,7 @@ pub(super) fn emit_bamabi_init(ctx: &mut ModuleContext<'_>) -> Result<(), JitErr
 
                 b.switch_to_block(mount_bb);
                 b.seal_block(mount_bb);
-                let _mrc = call_vtable(
+                let _mrc = call_vtable_opt(
                     &ctx.obj_mod,
                     &mut b,
                     api_ptr,
@@ -1782,23 +1869,31 @@ fn emit_populate_fn_query_descs(
     b.def_var(q_idx_var, z_ptr);
 
     for (qi, wq) in sys.wire_queries.iter().take(SYSTEM_QUERY_CAP).enumerate() {
-        let mut term_items = Vec::new();
+        let mut term_items: Vec<(usize, u32, u16)> = Vec::new();
         for t in &wq.terms {
             let mode_u = if t.changed && t.mode == TermAccessMode::Read {
                 ACCESS_MODE_CHANGED
             } else {
                 access_mode_u32(t.mode)
             };
-            term_items.push((t.layout_idx, mode_u));
+            let flags_u = if t.added { BAM_TERM_FLAG_ADDED } else { 0 };
+            term_items.push((t.layout_idx, mode_u, flags_u));
         }
         for &wf in &wq.with_filters {
-            term_items.push((wf, AccessMode::FILTER_ONLY.0));
+            term_items.push((wf, AccessMode::FILTER_ONLY.0, 0));
         }
         for &wof in &wq.without_filters {
-            term_items.push((wof, AccessMode::WITHOUT.0));
+            term_items.push((wof, AccessMode::WITHOUT.0, 0));
         }
         for &cf in &wq.extra_changed_filters {
-            term_items.push((cf, ACCESS_MODE_CHANGED));
+            term_items.push((cf, ACCESS_MODE_CHANGED, 0));
+        }
+        for &af in &wq.extra_added_filters {
+            if let Some(existing) = term_items.iter_mut().find(|(li, _, _)| *li == af) {
+                existing.2 |= BAM_TERM_FLAG_ADDED;
+            } else {
+                term_items.push((af, AccessMode::FILTER_ONLY.0, BAM_TERM_FLAG_ADDED));
+            }
         }
         if term_items.len() > QUERY_TERM_CAP {
             return Err(JitError::Codegen(format!(
@@ -2108,22 +2203,53 @@ pub(super) fn emit_register_net_system(
         ACCESS_MODE_CHANGED
     };
     let mut q_total = 1usize;
-    for &c_lidx in nsys
-        .comp_layout_indices
+    for strata in nsys
+        .comp_stratum_groups
         .iter()
         .take(SYSTEM_QUERY_CAP.saturating_sub(1))
     {
-        emit_fill_query_slot(
-            b,
-            state_addr,
-            &ctx.state_layout,
-            qdescs_ptr,
-            q_total,
-            &[(c_lidx, comp_mode_u)],
-            0,
-            ptr_ty,
-        );
-        q_total += 1;
+        if strata.len() <= 1 {
+            if let Some(&c_lidx) = strata.first() {
+                emit_fill_query_slot(
+                    b,
+                    state_addr,
+                    &ctx.state_layout,
+                    qdescs_ptr,
+                    q_total,
+                    &[(c_lidx, comp_mode_u, 0)],
+                    0,
+                    ptr_ty,
+                );
+                q_total += 1;
+            }
+        } else {
+            let mut terms: Vec<(usize, u32, u16)> = Vec::with_capacity(strata.len());
+            for (si, &s_lidx) in strata.iter().take(QUERY_TERM_CAP).enumerate() {
+                let mode = if is_rx {
+                    if si == 0 {
+                        AccessMode::WRITE.0
+                    } else {
+                        AccessMode::OPTIONAL_WRITE.0
+                    }
+                } else if si == 0 {
+                    AccessMode::READ.0
+                } else {
+                    AccessMode::OPTIONAL_READ.0
+                };
+                terms.push((s_lidx, mode, 0));
+            }
+            emit_fill_query_slot(
+                b,
+                state_addr,
+                &ctx.state_layout,
+                qdescs_ptr,
+                q_total,
+                &terms,
+                0,
+                ptr_ty,
+            );
+            q_total += 1;
+        }
     }
 
     let ssz = b.ins().iconst(types::I32, structs::SYSTEM_DESC_SIZE as i64);
@@ -2214,13 +2340,13 @@ pub(super) fn emit_fill_query_slot(
     state_layout: &StateLayout,
     qdescs_ptr: Value,
     q_idx: usize,
-    terms: &[(usize, u32)],
+    terms: &[(usize, u32, u16)],
     param_set_group: u32,
     ptr_ty: Type,
 ) {
     let terms_slot = alloc_zero_slot(b, terms.len() * structs::TERM_DESC_SIZE, ptr_ty);
     let terms_ptr = b.ins().stack_addr(ptr_ty, terms_slot, 0);
-    for (ti, &(lidx, mode_u)) in terms.iter().enumerate() {
+    for (ti, &(lidx, mode_u, flags_u)) in terms.iter().enumerate() {
         let base = (ti * structs::TERM_DESC_SIZE) as i32;
         let comp_h = b.ins().load(
             types::I32,
@@ -2237,6 +2363,11 @@ pub(super) fn emit_fill_query_slot(
         );
         b.ins()
             .stack_store(ptr_ty, mv, terms_slot, base + structs::TERM_MODE as i32);
+        if flags_u != 0 {
+            let fv = b.ins().iconst(types::I16, i64::from(flags_u));
+            b.ins()
+                .stack_store(ptr_ty, fv, terms_slot, base + structs::TERM_FLAGS as i32);
+        }
     }
     let q_off = (q_idx * structs::QUERY_DESC_SIZE) as i32;
     let qsz = b.ins().iconst(types::I32, structs::QUERY_DESC_SIZE as i64);
