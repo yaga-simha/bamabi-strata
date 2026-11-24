@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -42,25 +42,25 @@ redundant_clone = "warn"
 match_same_arms = "warn"
 
 [workspace.dependencies]
-bamabi_sys = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
-bamabi_macros = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
-bamabi_sdk_gen = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
-bamabi_guest_sys = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
-bamabi_guest = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
-bamabi_host = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-core.git", branch = "main" }
-bamabi_manifest = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-tools.git", branch = "main" }
-bamabi_trust = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-tools.git", branch = "main", features = ["keygen"] }
+bamabi_sys = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_macros = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_sdk_gen = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_guest_sys = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_guest = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_host = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-core.git", branch = "main" }
+bamabi_manifest = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-tools.git", branch = "main" }
+bamabi_trust = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-tools.git", branch = "main", features = ["keygen"] }
 bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
 bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
 bevy_reflect = { version = "0.20.1", default-features = false, features = ["std"] }
-strata_syntax = { version = "0.3.0", path = "crates/strata_syntax" }
-strata_sema = { version = "0.3.0", path = "crates/strata_sema" }
-strata_mir = { version = "0.3.0", path = "crates/strata_mir" }
-strata_codegen = { version = "0.3.0", path = "crates/strata_codegen" }
-strata_jit = { version = "0.3.0", path = "crates/strata_jit" }
-strata_lsp = { version = "0.3.0", path = "crates/strata_lsp" }
-stratac = { version = "0.3.0", path = "crates/stratac" }
-bamabi_native_rt = { version = "0.3.0", path = "crates/bamabi_native_rt" }
+strata_syntax = { version = "0.4.0", path = "crates/strata_syntax" }
+strata_sema = { version = "0.4.0", path = "crates/strata_sema" }
+strata_mir = { version = "0.4.0", path = "crates/strata_mir" }
+strata_codegen = { version = "0.4.0", path = "crates/strata_codegen" }
+strata_jit = { version = "0.4.0", path = "crates/strata_jit" }
+strata_lsp = { version = "0.4.0", path = "crates/strata_lsp" }
+stratac = { version = "0.4.0", path = "crates/stratac" }
+bamabi_native_rt = { version = "0.4.0", path = "crates/bamabi_native_rt" }
 logos = "0.15"
 rowan = "0.16"
 salsa = "0.28.5"

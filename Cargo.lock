@@ -74,7 +74,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -85,14 +85,14 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "anyhow"
-version = "1.0.104"
+version = "1.0.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+checksum = "2cb931c189b85683d69a5cfad41d4d418671e1ac413dd209f3f2fc31e3cfd902"
 
 [[package]]
 name = "arbitrary"
@@ -206,8 +206,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bamabi_host"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-core.git?branch=main#6335e80dc2e5d3c36b21e676dc7ec8eac5c1e7e8"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-core.git?branch=main#182a7f3e040e8d861f3c458909c7f2a0fb6bbd30"
 dependencies = [
  "bamabi_host_sys",
  "bamabi_macros",
@@ -223,8 +223,8 @@ dependencies = [
 
 [[package]]
 name = "bamabi_host_sys"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-core.git?branch=main#6335e80dc2e5d3c36b21e676dc7ec8eac5c1e7e8"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-core.git?branch=main#182a7f3e040e8d861f3c458909c7f2a0fb6bbd30"
 dependencies = [
  "arc-swap",
  "bamabi_sys",
@@ -241,9 +241,10 @@ dependencies = [
 
 [[package]]
 name = "bamabi_macros"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
 dependencies = [
+ "bamabi_schema",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -252,8 +253,8 @@ dependencies = [
 
 [[package]]
 name = "bamabi_manifest"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-tools.git?branch=main#e57356615fb356619c7a5194bc928dddf909cf85"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-tools.git?branch=main#040b4696127461ee0b58b7f2b8205bf0e663d3cf"
 dependencies = [
  "bamabi_sys",
  "semver",
@@ -263,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "bamabi_native_rt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_host",
  "bamabi_macros",
@@ -278,22 +279,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamabi_schema"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
+
+[[package]]
 name = "bamabi_sdk_gen"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
 dependencies = [
  "bamabi_sys",
 ]
 
 [[package]]
 name = "bamabi_sys"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
+dependencies = [
+ "bamabi_schema",
+]
 
 [[package]]
 name = "bamabi_trust"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-tools.git?branch=main#e57356615fb356619c7a5194bc928dddf909cf85"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-tools.git?branch=main#040b4696127461ee0b58b7f2b8205bf0e663d3cf"
 dependencies = [
  "ed25519-dalek",
  "sha2",
@@ -434,7 +443,7 @@ dependencies = [
  "spin 0.12.3",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -874,7 +883,7 @@ dependencies = [
  "cranelift-entity",
  "cranelift-isle",
  "gimli",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "libm",
  "log",
  "regalloc2",
@@ -929,7 +938,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b00cf9b20096b09b3499d19f82cca658c13c6988ecbc54881caf12a2f01b2f8c"
 dependencies = [
  "cranelift-codegen",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "log",
  "smallvec",
  "target-lexicon",
@@ -976,9 +985,9 @@ checksum = "7ed086d4ea76eb20e03b689abcc9a34bacaec54b1fc3e04269004acbed4587f0"
 
 [[package]]
 name = "crc32fast"
-version = "1.5.5"
+version = "1.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
+checksum = "fd9ae8fcb3ea71b0b26338b4ffb13006bb175de8fd07921089a906ce7e5e6945"
 dependencies = [
  "cfg-if",
 ]
@@ -1140,9 +1149,9 @@ checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
 dependencies = [
  "cfg-if",
  "hashbrown 0.14.5",
- "lock_api",
+ "lock_api 0.4.14",
  "once_cell",
- "parking_lot_core",
+ "parking_lot_core 0.9.12",
 ]
 
 [[package]]
@@ -1318,7 +1327,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1386,12 +1395,13 @@ checksum = "5905ec755cc8386d7928353e4d356d2be3e89e81e5ca01fe630a1ca4d08dc175"
 
 [[package]]
 name = "flate2"
-version = "1.1.9"
+version = "1.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+checksum = "626d4928326b646e70f65ed36fc7cf9f206bdb68a0019ee7c6b4709da4e084c4"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -1609,9 +1619,9 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 dependencies = [
  "allocator-api2",
  "equivalent",
@@ -1624,7 +1634,7 @@ version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
 ]
 
 [[package]]
@@ -1830,7 +1840,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "serde",
  "serde_core",
 ]
@@ -1984,6 +1994,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lock_api"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
 name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2044,9 +2063,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "miniz_oxide"
-version = "0.8.9"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
@@ -2076,7 +2095,7 @@ version = "30.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "14474170feb673cfb18b3565111a9869797cc1d290fb9ec969c53f5e1e231c6d"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "indexmap",
  "rustc-hash 1.1.0",
  "serde",
@@ -2243,7 +2262,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
 dependencies = [
  "crc32fast",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "indexmap",
  "memchr",
 ]
@@ -2322,12 +2341,12 @@ checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "parking_lot"
-version = "0.12.5"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
+checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
 dependencies = [
- "lock_api",
- "parking_lot_core",
+ "lock_api 0.5.0",
+ "parking_lot_core 0.10.0",
 ]
 
 [[package]]
@@ -2338,7 +2357,19 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall",
+ "redox_syscall 0.5.18",
+ "smallvec",
+ "windows-link",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
+dependencies = [
+ "libc",
+ "redox_syscall 0.9.5",
  "smallvec",
  "windows-link",
 ]
@@ -2654,6 +2685,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_syscall"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
 name = "regalloc2"
 version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2661,7 +2701,7 @@ checksum = "34f923657880712029496c2e68bb40bef163806b2011adde559b28bbcedc82ea"
 dependencies = [
  "allocator-api2",
  "bumpalo",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "log",
  "rustc-hash 2.1.3",
  "smallvec",
@@ -2782,7 +2822,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2805,14 +2845,14 @@ dependencies = [
 
 [[package]]
 name = "salsa"
-version = "0.28.5"
+version = "0.28.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27d2e6e19e39591cd99c01ac4141544b4d012cfd0831348629b8187fa9fe6d34"
+checksum = "71bb6122eeb456512d11ce279cbe1eb5f6e2a23f7082ef5f2fb1ad72e9c85533"
 dependencies = [
  "boxcar",
  "crossbeam-queue",
  "crossbeam-utils",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "hashlink",
  "indexmap",
  "intrusive-collections",
@@ -2826,20 +2866,19 @@ dependencies = [
  "smallvec",
  "thin-vec",
  "tracing",
- "typeid",
 ]
 
 [[package]]
 name = "salsa-macro-rules"
-version = "0.28.5"
+version = "0.28.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baf90a551c38f25ed8489111d3d5827aa18e1b85963f5e6a298505b1d1e2cb7e"
+checksum = "1bc5f7bf0901845dbf61e7f7ce586f74209a7621a7c30c453cecab9b92b15969"
 
 [[package]]
 name = "salsa-macros"
-version = "0.28.5"
+version = "0.28.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69dd77f86ec10e72e314f4ddf7c44c8d349e73cdff1aad524ba9668603fb0549"
+checksum = "6d6dcd603d6a99b0aefabac0961957a9311ae7fb57db233ec631ef47526ada9b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2880,6 +2919,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"
@@ -2973,9 +3016,9 @@ dependencies = [
 
 [[package]]
 name = "simd-adler32"
-version = "0.3.9"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "slab"
@@ -3014,7 +3057,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3104,7 +3147,7 @@ checksum = "5c0e04424e733e69714ca1bbb9204c1a57f09f5493439520f9f68c132ad25eec"
 
 [[package]]
 name = "strata_bench"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_host",
  "bamabi_native_rt",
@@ -3124,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "strata_codegen"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_sdk_gen",
  "bamabi_sys",
@@ -3139,11 +3182,11 @@ dependencies = [
 
 [[package]]
 name = "strata_docs"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "strata_jit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_sys",
  "cranelift-codegen",
@@ -3165,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "strata_lsp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_sys",
  "criterion",
@@ -3182,7 +3225,7 @@ dependencies = [
 
 [[package]]
 name = "strata_mir"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_sys",
  "criterion",
@@ -3198,7 +3241,7 @@ dependencies = [
 
 [[package]]
 name = "strata_profile"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_host",
  "bamabi_native_rt",
@@ -3214,7 +3257,7 @@ dependencies = [
 
 [[package]]
 name = "strata_sema"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_sys",
  "criterion",
@@ -3231,7 +3274,7 @@ dependencies = [
 
 [[package]]
 name = "strata_syntax"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "logos",
  "proptest",
@@ -3243,7 +3286,7 @@ dependencies = [
 
 [[package]]
 name = "stratac"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_host",
  "bamabi_manifest",
@@ -3329,7 +3372,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3832,7 +3875,7 @@ version = "48.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1463b7c70e14ab1db19709f29f298affc1f0ea50ea59b519d8aec8a6f5a56453"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "libm",
 ]
 
@@ -3897,7 +3940,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4021,7 +4064,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "yoke"
@@ -4125,6 +4168,12 @@ dependencies = [
  "quote",
  "syn 3.0.10",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa76918995d776d9dd34d371030be228d021137449771493d56e29f77e4148ac"
 
 [[package]]
 name = "zmij"
