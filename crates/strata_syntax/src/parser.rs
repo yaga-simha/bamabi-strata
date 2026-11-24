@@ -1483,20 +1483,7 @@ impl<'a> Parser<'a> {
             return;
         }
         if self.at(SyntaxKind::LParen) {
-            self.start_node(SyntaxKind::TupleType);
-            self.bump(); // (
-            while !self.at(SyntaxKind::RParen) && !self.at_eof() {
-                let guard = self.nt_cursor;
-                self.parse_type();
-                if !self.eat(SyntaxKind::Comma) {
-                    break;
-                }
-                if self.nt_cursor == guard {
-                    break;
-                }
-            }
-            self.expect(SyntaxKind::RParen);
-            self.finish_node();
+            self.parse_tuple_type();
             return;
         }
 
@@ -1513,6 +1500,23 @@ impl<'a> Parser<'a> {
         if self.at(SyntaxKind::Lt) {
             self.parse_generic_args();
         }
+        self.finish_node();
+    }
+
+    fn parse_tuple_type(&mut self) {
+        self.start_node(SyntaxKind::TupleType);
+        self.bump(); // (
+        while !self.at(SyntaxKind::RParen) && !self.at_eof() {
+            let guard = self.nt_cursor;
+            self.parse_type();
+            if !self.eat(SyntaxKind::Comma) {
+                break;
+            }
+            if self.nt_cursor == guard {
+                break;
+            }
+        }
+        self.expect(SyntaxKind::RParen);
         self.finish_node();
     }
 
@@ -1584,6 +1588,10 @@ impl<'a> Parser<'a> {
             self.parse_expr(true);
             self.expect(SyntaxKind::RBracket);
             self.finish_node();
+            return;
+        }
+        if self.at(SyntaxKind::LParen) {
+            self.parse_tuple_type();
             return;
         }
         self.start_node(SyntaxKind::TypeRef);
@@ -2579,5 +2587,65 @@ net_sim_test "empty_opts"() {
             assert!(!p.ok(), "expected error on {bad:?}");
             assert_eq!(p.syntax().text().to_string(), bad);
         }
+    }
+
+    /// Verifies tuple types inside `GenericArgs` (e.g. `SmallVec<(u32, f32), 4>`) parse into
+    /// `TupleType` CST nodes cleanly across flat, nested, unit, and `>>`-split generic args.
+    #[test]
+    fn generic_args_parse_tuple_types_and_nested_generics() {
+        for src in [
+            "component Bag { items: SmallVec<(u32, f32), 4> }\n",
+            "struct Pair { a: Option<(u32, f32)>, b: SmallVec<(u32, (f32, bool)), 4> }\n",
+            "struct Nested { x: Option<SmallVec<(u32, f32), 4>>, y: Result<SmallVec<(), 2>, (u32,)> }\n",
+        ] {
+            let p = parse(src);
+            assert!(
+                p.errors().is_empty(),
+                "errors for {src:?}: {:?}",
+                p.errors()
+            );
+            assert_eq!(p.syntax().text().to_string(), src);
+            let has_tuple_in_generic = p
+                .syntax()
+                .descendants()
+                .filter(|n| n.kind() == SyntaxKind::GenericArgs)
+                .any(|ga| ga.children().any(|c| c.kind() == SyntaxKind::TupleType));
+            assert!(
+                has_tuple_in_generic,
+                "expected TupleType directly inside GenericArgs for {src:?}"
+            );
+        }
+
+        let wrapped_src =
+            "fn f(p: Option<&mut (u32, f32)>) -> SmallVec<[(u32, f32); 2], 4> { return []; }\n";
+        let wp = parse(wrapped_src);
+        assert!(wp.errors().is_empty(), "errors: {:?}", wp.errors());
+        assert_eq!(wp.syntax().text().to_string(), wrapped_src);
+        assert!(
+            wp.syntax()
+                .descendants()
+                .filter(|n| n.kind() == SyntaxKind::GenericArgs)
+                .all(|ga| ga.descendants().any(|d| d.kind() == SyntaxKind::TupleType)),
+            "expected TupleType nested inside GenericArgs for {wrapped_src:?}"
+        );
+
+        // Verify exact CST structure of `SmallVec<(u32, f32), 4>`.
+        let p = parse("component Bag { items: SmallVec<(u32, f32), 4> }\n");
+        let ga = p
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::GenericArgs)
+            .expect("GenericArgs");
+        let tuple = ga
+            .children()
+            .find(|n| n.kind() == SyntaxKind::TupleType)
+            .expect("TupleType inside GenericArgs");
+        assert_eq!(tuple.text().to_string(), "(u32, f32)");
+        let elem_names: Vec<String> = tuple
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::TypeRef)
+            .map(|n| n.text().to_string())
+            .collect();
+        assert_eq!(elem_names, vec!["u32", "f32"]);
     }
 }

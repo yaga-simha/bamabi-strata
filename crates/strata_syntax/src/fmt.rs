@@ -543,6 +543,8 @@ step_net(5);
             "fn f<T: Box<Box<u32>>>(x: T) {}\n",
             "struct S<T: Box<Box<Box<u32>>>> { x: T }\n",
             "fn f() { let s = server_res<Box<SimClock> >(); }\n",
+            "component Bag { items: SmallVec<(u32, f32), 4> }\n",
+            "struct Nested { x: Option<SmallVec<(u32, f32), 4>> }\n",
         ] {
             let parsed = parse(src);
             assert!(

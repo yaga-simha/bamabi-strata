@@ -1,10 +1,10 @@
 use strata_syntax::graph_ir::{
     ComponentPayload, CurvePointIr, FieldIr, FsmStateIr, FsmTransitionIr, GraphAttrArg,
     GraphAttribute, GraphIrDelta, GraphIrDocument, GraphIrError, GraphIrNode, GraphIrPatch,
-    GraphLayoutSidecar, GraphNodeKind, GraphNodePayload, NodeLayout, ScheduleNodeIr, TableRowIr,
-    TimelineWindowIr, apply_graph_document, apply_graph_patch, export_graph_ir,
-    export_graph_ir_with_sidecar, fallback_schema_fingerprint, load_sidecar, merge_sidecar,
-    save_sidecar, sidecar_path_for,
+    GraphLayoutSidecar, GraphNodeKind, GraphNodePayload, NodeLayout, ScheduleNodeIr,
+    SchedulePayload, TableRowIr, TimelineEventIr, TimelineWindowIr, apply_graph_document,
+    apply_graph_patch, export_graph_ir, export_graph_ir_with_sidecar, fallback_schema_fingerprint,
+    load_sidecar, merge_sidecar, save_sidecar, sidecar_path_for,
 };
 use strata_syntax::parse;
 
@@ -1026,4 +1026,392 @@ component A { x: f32 }
         matches!(doc_node_err, GraphIrError::InvalidNode { ref id, .. } if id == "m::A"),
         "expected InvalidNode for non-finite document node position, got {doc_node_err:?}"
     );
+}
+
+#[test]
+fn duplicate_schedule_labels_disambiguate_and_roundtrip_idempotently() {
+    let src = r#"module test::multi_sched;
+
+sys alpha() {}
+sys beta() {}
+sys gamma() {}
+
+// First FixedUpdate schedule
+schedule FixedUpdate {
+    alpha
+}
+
+// Second FixedUpdate schedule
+schedule FixedUpdate {
+    seq Sub {
+        beta
+    }
+}
+
+schedule Update {
+    gamma
+}
+"#;
+
+    let doc = export_graph_ir(src, None).expect("export multi-schedule");
+    let sched_ids: Vec<&str> = doc.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(
+        sched_ids,
+        vec![
+            "test::multi_sched::FixedUpdate",
+            "test::multi_sched::FixedUpdate#2",
+            "test::multi_sched::Update",
+        ]
+    );
+    assert_eq!(doc.nodes[0].name, "FixedUpdate");
+    assert_eq!(doc.nodes[1].name, "FixedUpdate");
+    assert_eq!(doc.nodes[2].name, "Update");
+
+    // Edges must originate from the disambiguated schedule node IDs.
+    assert!(doc.edges.iter().any(|e| {
+        e.from == "test::multi_sched::FixedUpdate"
+            && e.to == "test::multi_sched::alpha"
+            && e.kind == "schedules"
+    }));
+    assert!(doc.edges.iter().any(|e| {
+        e.from == "test::multi_sched::FixedUpdate#2"
+            && e.to == "test::multi_sched::beta"
+            && e.kind == "schedules"
+            && e.label.as_deref() == Some("Sub")
+    }));
+
+    // Self-roundtrip (with layout positions) must produce 0-byte diff.
+    let mut positioned = doc.clone();
+    for (idx, n) in positioned.nodes.iter_mut().enumerate() {
+        n.position = Some(NodeLayout {
+            x: (idx as f64) * 100.0,
+            y: 50.0,
+            collapsed: None,
+        });
+    }
+    let noop = apply_graph_document(src, &positioned).expect("self-roundtrip");
+    assert!(!noop.source_modified);
+    assert_eq!(noop.source, src);
+    assert_eq!(noop.sidecar_updates.len(), 3);
+
+    // Editing only the second duplicate schedule updates it cleanly while preserving the first.
+    let mut edited = doc.clone();
+    if let GraphNodePayload::Schedule(ref mut sch) = edited.nodes[1].payload
+        && let ScheduleNodeIr::Group { children, .. } = &mut sch.nodes[0]
+    {
+        children.push(ScheduleNodeIr::Leaf {
+            target: "gamma".to_owned(),
+            modifiers: vec![],
+        });
+    }
+    let updated = apply_graph_document(src, &edited).expect("update duplicate schedule");
+    assert!(updated.source_modified);
+    assert_eq!(
+        updated.updated_nodes,
+        vec!["test::multi_sched::FixedUpdate#2"]
+    );
+    assert!(updated.source.contains("// First FixedUpdate schedule"));
+    assert!(
+        updated
+            .source
+            .contains("schedule FixedUpdate {\n    alpha\n}")
+    );
+    assert!(parse(&updated.source).ok());
+
+    let reexported = export_graph_ir(&updated.source, None).expect("re-export");
+    let reapplied = apply_graph_document(&updated.source, &reexported).expect("re-apply");
+    assert!(!reapplied.source_modified);
+
+    // Adding a third `FixedUpdate` via Delta is accepted and roundtrips.
+    let add_delta = GraphIrPatch::Delta(GraphIrDelta {
+        upsert: vec![GraphIrNode {
+            id: "test::multi_sched::FixedUpdate#3".to_owned(),
+            kind: GraphNodeKind::Schedule,
+            name: "FixedUpdate".to_owned(),
+            group: None,
+            attributes: vec![],
+            payload: GraphNodePayload::Schedule(SchedulePayload {
+                modifiers: vec![],
+                nodes: vec![ScheduleNodeIr::Leaf {
+                    target: "alpha".to_owned(),
+                    modifiers: vec![],
+                }],
+            }),
+            span: None,
+            position: None,
+            previous_id: None,
+        }],
+        ..Default::default()
+    });
+    let added = apply_graph_patch(src, &add_delta).expect("add third FixedUpdate");
+    assert!(parse(&added.source).ok());
+    let doc3 = export_graph_ir(&added.source, None).expect("export 3 schedules");
+    assert_eq!(
+        doc3.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+        vec![
+            "test::multi_sched::FixedUpdate",
+            "test::multi_sched::FixedUpdate#2",
+            "test::multi_sched::Update",
+            "test::multi_sched::FixedUpdate#3",
+        ]
+    );
+
+    // Deleting the first duplicate removes only the first block.
+    let mut del_first = doc;
+    del_first.nodes.remove(0);
+    let del_res = apply_graph_document(src, &del_first).expect("delete first duplicate");
+    assert_eq!(
+        del_res.removed_nodes,
+        vec!["test::multi_sched::FixedUpdate"]
+    );
+    assert!(del_res.source.contains("// Second FixedUpdate schedule"));
+    assert!(parse(&del_res.source).ok());
+
+    // Invalid schedule suffixes and non-schedule `#N` suffixes must still be rejected.
+    for bad_id in [
+        "test::multi_sched::FixedUpdate#0",
+        "test::multi_sched::FixedUpdate#1",
+        "test::multi_sched::FixedUpdate#02",
+        "test::multi_sched::FixedUpdate#abc",
+        "test::multi_sched::Other",
+    ] {
+        let err = apply_graph_patch(
+            src,
+            &GraphIrPatch::Delta(GraphIrDelta {
+                upsert: vec![GraphIrNode {
+                    id: bad_id.to_owned(),
+                    kind: GraphNodeKind::Schedule,
+                    name: "FixedUpdate".to_owned(),
+                    group: None,
+                    attributes: vec![],
+                    payload: GraphNodePayload::Schedule(SchedulePayload {
+                        modifiers: vec![],
+                        nodes: vec![],
+                    }),
+                    span: None,
+                    position: None,
+                    previous_id: None,
+                }],
+                ..Default::default()
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GraphIrError::InvalidNode { .. }),
+            "expected InvalidNode for `{bad_id}`, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn timeline_compound_statements_roundtrip_without_spurious_semicolons() {
+    let src = r#"module test::tl_compound;
+
+event Hit {}
+
+timeline BossTl {
+    at 1_f => while false { let a: i32 = 1; }
+    at 2_f => atomic { let b: i32 = 2; }
+    at 3_f => atomic { let c: i32 = 3; } on_rollback { let r: i32 = 0; }
+    at 4_f => loop { break; }
+    at 5_f => for i in 0..3 { let d: i32 = i; }
+    at 6_f => if true { let e: i32 = 4; } else { let e: i32 = 5; }
+    at 7_f => match 1 { 0 => { let m: i32 = 0; }, _ => { let m: i32 = 1; } }
+    at 8_f => abort_if false { return; }
+    at 9_f => race { branch { wait 1_f; } }
+    at 10_f => while false {
+        let multi: i32 = 9;
+    }
+}
+"#;
+
+    let mut doc = export_graph_ir(src, None).expect("export timeline");
+    if let GraphNodePayload::Timeline(ref mut tl) = doc.nodes[0].payload {
+        // Also test an expression action supplied without trailing semicolon gets `;`,
+        // while a struct-RHS assignment without `;` also gets `;`.
+        tl.events.push(TimelineEventIr {
+            frame: "11_f".to_owned(),
+            action: "trigger(self, Hit {})".to_owned(),
+        });
+        tl.events.push(TimelineEventIr {
+            frame: "12_f".to_owned(),
+            action: "if false { let added: i32 = 1; }".to_owned(),
+        });
+    } else {
+        panic!("expected Timeline payload");
+    }
+
+    let applied = apply_graph_document(src, &doc).expect("apply timeline compound edits");
+    assert!(applied.source_modified);
+    assert!(
+        parse(&applied.source).ok(),
+        "syntax errors in:\n{}\n{:?}",
+        applied.source,
+        parse(&applied.source).errors()
+    );
+    assert!(!applied.source.contains("};"));
+    assert!(
+        applied
+            .source
+            .contains("at 10_f => while false {\n        let multi: i32 = 9;\n    }")
+    );
+    assert!(applied.source.contains("at 11_f => trigger(self, Hit {});"));
+    assert!(
+        applied
+            .source
+            .contains("at 12_f => if false { let added: i32 = 1; }\n")
+    );
+
+    // Re-export -> re-apply must be idempotent (0-byte diff).
+    let reexported = export_graph_ir(&applied.source, None).expect("re-export timeline");
+    let reapplied = apply_graph_document(&applied.source, &reexported).expect("re-apply timeline");
+    assert!(
+        !reapplied.source_modified,
+        "expected 0-byte diff on re-apply:\n{}",
+        reapplied.source
+    );
+    assert_eq!(reapplied.source, applied.source);
+}
+
+#[test]
+fn graph_ir_patch_rejects_malformed_documents_and_unknown_delta_keys() {
+    let src = "module m;\n\ncomponent A { x: f32 = 1.0 }\ncomponent B { y: i32 = 2 }\n";
+    let doc = export_graph_ir(src, None).expect("export");
+    let doc_val = serde_json::to_value(&doc).expect("doc to value");
+
+    // 1. Unknown key in Delta must fail deserialization (not silently become a no-op).
+    for bad_delta in [
+        r#"{"remove_typo":["m::A"]}"#,
+        r#"{"upsert_typo":[]}"#,
+        r#"{"positions_typo":{"m::A":{"x":1.0,"y":2.0}}}"#,
+        r#"{"remove":["m::B"],"extra":true}"#,
+    ] {
+        let err_patch = serde_json::from_str::<GraphIrPatch>(bad_delta);
+        assert!(
+            err_patch.is_err(),
+            "expected GraphIrPatch error for `{bad_delta}`"
+        );
+        let err_delta = serde_json::from_str::<GraphIrDelta>(bad_delta);
+        assert!(
+            err_delta.is_err(),
+            "expected GraphIrDelta error for `{bad_delta}`"
+        );
+    }
+
+    // 2. Malformed GraphIrDocument missing required fields must not silently fall back to Delta.
+    for missing_field in ["version", "module_path", "schema_fingerprint", "edges"] {
+        let mut obj = doc_val.as_object().expect("doc object").clone();
+        obj.remove(missing_field);
+        // Also drop node B so silent Delta fallback would have failed to remove B.
+        if let Some(nodes) = obj.get_mut("nodes").and_then(|v| v.as_array_mut()) {
+            nodes.truncate(1);
+        }
+        let raw = serde_json::to_string(&obj).expect("serialize malformed doc");
+        let parsed = serde_json::from_str::<GraphIrPatch>(&raw);
+        assert!(
+            parsed.is_err(),
+            "expected malformed document missing `{missing_field}` to fail deserialization"
+        );
+    }
+    // Missing `nodes` alone must also fail.
+    {
+        let mut obj = doc_val.as_object().expect("doc object").clone();
+        obj.remove("nodes");
+        let raw = serde_json::to_string(&obj).expect("serialize doc without nodes");
+        assert!(serde_json::from_str::<GraphIrPatch>(&raw).is_err());
+    }
+
+    // 3. Valid GraphIrDocument and all valid GraphIrDelta schema shapes remain accepted.
+    let valid_doc_patch: GraphIrPatch =
+        serde_json::from_value(doc_val).expect("valid GraphIrDocument");
+    assert!(
+        !apply_graph_patch(src, &valid_doc_patch)
+            .unwrap()
+            .source_modified
+    );
+
+    let nodes_alias_delta: GraphIrPatch = serde_json::from_str(
+        r#"{"nodes":[{"id":"m::C","kind":"component","name":"C","payload":{"type":"component","is_unit":true}}]}"#,
+    )
+    .expect("valid delta with nodes alias");
+    let res_alias = apply_graph_patch(src, &nodes_alias_delta).expect("apply nodes-alias delta");
+    assert!(res_alias.source.contains("component C;"));
+
+    let remove_delta: GraphIrPatch =
+        serde_json::from_str(r#"{"remove":["m::B"]}"#).expect("valid remove delta");
+    let res_rm = apply_graph_patch(src, &remove_delta).expect("apply remove delta");
+    assert!(!res_rm.source.contains("component B"));
+}
+
+#[test]
+fn fallback_schema_fingerprint_ignores_visual_attributes_like_node_group_pos_and_node_pure() {
+    let base = r#"module test::vis_fp;
+
+component Hero {
+    hp: f32 = 100.0,
+}
+
+fn scale(x: f32) -> f32 {
+    return x * 2.0;
+}
+
+timeline Tl {
+    at 1_f => let a: i32 = 1;
+}
+"#;
+
+    let with_group_a = r#"module test::vis_fp;
+
+@node_group("A")
+@pos(10.0, 20.0)
+component Hero {
+    hp: f32 = 100.0,
+}
+
+@node_pure
+@node_group(name = "Math")
+@pos(x = 50.0, y = 60.0)
+fn scale(x: f32) -> f32 {
+    return x * 2.0;
+}
+
+@node_group("Sequences")
+timeline Tl {
+    at 1_f => let a: i32 = 1;
+}
+"#;
+
+    let with_group_b = r#"module test::vis_fp;
+
+@node_group("B")
+@pos(999.0, -40.0)
+component Hero {
+    hp: f32 = 100.0,
+}
+
+@node_pure
+@node_group("PureFns")
+fn scale(x: f32) -> f32 {
+    return x * 99.0;
+}
+
+timeline Tl @node_group("Other") {
+    at 1_f => let a: i32 = 1;
+}
+"#;
+
+    let fp_base = fallback_schema_fingerprint(base);
+    let fp_a = fallback_schema_fingerprint(with_group_a);
+    let fp_b = fallback_schema_fingerprint(with_group_b);
+    assert_eq!(fp_a, fp_base);
+    assert_eq!(fp_b, fp_base);
+
+    let doc_a = export_graph_ir(with_group_a, None).expect("export A");
+    let doc_b = export_graph_ir(with_group_b, None).expect("export B");
+    assert_eq!(doc_a.schema_fingerprint, fp_base);
+    assert_eq!(doc_b.schema_fingerprint, fp_base);
+
+    // Non-visual schema attributes (e.g. `@net` or `@sparse`) MUST still alter the fingerprint.
+    let with_sparse = with_group_b.replace("component Hero {", "@sparse\ncomponent Hero {");
+    assert_ne!(fallback_schema_fingerprint(&with_sparse), fp_base);
 }

@@ -131,7 +131,8 @@ pub struct GraphAttrArg {
 /// Single exported or patched Graph IR node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphIrNode {
-    /// Canonical symbol ID (`"{module_path}::{name}"`).
+    /// Canonical symbol ID (`"{module_path}::{name}"`, or `"{module_path}::{label}#N"` for
+    /// duplicate `schedule` declarations).
     pub id: String,
     /// Node construct kind.
     pub kind: GraphNodeKind,
@@ -520,6 +521,7 @@ pub enum GraphIrPatch {
 
 /// Partial patch updating, adding, or removing nodes and/or layout positions.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphIrDelta {
     /// Nodes to update or insert.
     #[serde(default, alias = "nodes")]
@@ -612,7 +614,9 @@ pub fn export_graph_ir_with_sidecar(
     let mut declared_symbols: HashMap<String, String> = HashMap::new();
 
     for entry in &extracted {
-        declared_symbols.insert(entry.node.name.clone(), entry.node.id.clone());
+        declared_symbols
+            .entry(entry.node.name.clone())
+            .or_insert_with(|| entry.node.id.clone());
         let mut ir_node = entry.node.clone();
         if let Some(sc) = sidecar
             && let Some(pos) = sc.nodes.get(&ir_node.id)
@@ -952,8 +956,9 @@ pub fn merge_sidecar(
 
 /// Computes a deterministic 64-bit FNV-1a schema fingerprint (`"0x..."`) directly from the CST.
 ///
-/// Mirrors `strata_sema`'s early-cutoff rules: ignores trivia/comments, ignores `sim_test` and
-/// `net_sim_test` declarations, and ignores `sys`/`obs`/`fn` block bodies.
+/// Mirrors `strata_sema`'s early-cutoff rules: ignores trivia/comments, ignores visual-only
+/// attributes (`@node_group`, `@pos`, `@node_pure`), ignores `sim_test` and `net_sim_test`
+/// declarations, and ignores `sys`/`obs`/`fn` block bodies.
 pub fn fallback_schema_fingerprint(src: &str) -> String {
     let parsed = crate::parse(src);
     let root = parsed.syntax();
@@ -989,26 +994,55 @@ fn fnv1a_byte(hash: &mut u64, b: u8) {
     *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
 }
 
+fn is_visual_only_attribute(node: &SyntaxNode) -> bool {
+    let Some(attr) = Attribute::cast(node.clone()) else {
+        return false;
+    };
+    matches!(
+        attr.name_text().as_deref(),
+        Some("node_group" | "pos" | "node_pure")
+    )
+}
+
 fn hash_node_tokens(node: &SyntaxNode, stop_at: Option<rowan::TextSize>, hash: &mut u64) {
-    for el in node.descendants_with_tokens() {
-        if let Some(tok) = el.into_token() {
-            if let Some(limit) = stop_at
-                && tok.text_range().start() >= limit
-            {
-                break;
-            }
-            if tok.kind().is_trivia() {
-                continue;
-            }
-            let raw = (tok.kind() as u16).to_le_bytes();
-            fnv1a_byte(hash, raw[0]);
-            fnv1a_byte(hash, raw[1]);
-            for &b in tok.text().as_bytes() {
-                fnv1a_byte(hash, b);
-            }
-            fnv1a_byte(hash, 0x1f);
+    fn visit(node: &SyntaxNode, stop_at: Option<rowan::TextSize>, hash: &mut u64) -> bool {
+        if let Some(limit) = stop_at
+            && node.text_range().start() >= limit
+        {
+            return false;
         }
+        if is_visual_only_attribute(node) {
+            return true;
+        }
+        for el in node.children_with_tokens() {
+            match el {
+                rowan::NodeOrToken::Node(sub) => {
+                    if !visit(&sub, stop_at, hash) {
+                        return false;
+                    }
+                }
+                rowan::NodeOrToken::Token(tok) => {
+                    if let Some(limit) = stop_at
+                        && tok.text_range().start() >= limit
+                    {
+                        return false;
+                    }
+                    if tok.kind().is_trivia() {
+                        continue;
+                    }
+                    let raw = (tok.kind() as u16).to_le_bytes();
+                    fnv1a_byte(hash, raw[0]);
+                    fnv1a_byte(hash, raw[1]);
+                    for &b in tok.text().as_bytes() {
+                        fnv1a_byte(hash, b);
+                    }
+                    fnv1a_byte(hash, 0x1f);
+                }
+            }
+        }
+        true
     }
+    let _ = visit(node, stop_at, hash);
     fnv1a_byte(hash, 0x1e);
 }
 
@@ -1041,8 +1075,24 @@ fn canonical_id(module_path: &str, name: &str) -> String {
     format!("{module_path}::{name}")
 }
 
+fn schedule_canonical_id(
+    module_path: &str,
+    label: &str,
+    counts: &mut HashMap<String, usize>,
+) -> String {
+    let count = counts.entry(label.to_owned()).or_insert(0);
+    *count += 1;
+    let base = canonical_id(module_path, label);
+    if *count == 1 {
+        base
+    } else {
+        format!("{base}#{count}")
+    }
+}
+
 fn extract_items(sf: &SourceFile, module_path: &str, src: &str) -> Vec<ExtractedItem> {
     let mut out = Vec::new();
+    let mut schedule_counts: HashMap<String, usize> = HashMap::new();
     for item in sf.items() {
         match item {
             Item::Component(c) => {
@@ -1081,7 +1131,7 @@ fn extract_items(sf: &SourceFile, module_path: &str, src: &str) -> Vec<Extracted
                 }
             }
             Item::Schedule(s) => {
-                if let Some(ext) = extract_schedule(&s, module_path) {
+                if let Some(ext) = extract_schedule(&s, module_path, &mut schedule_counts) {
                     out.push(ext);
                 }
             }
@@ -1313,7 +1363,8 @@ fn extract_timeline(t: &TimelineDecl, module_path: &str, src: &str) -> Option<Ex
             let action = if let Some(b) = block_opt {
                 dedent_block(&b, src)
             } else {
-                act_node.text().to_string().trim().to_owned()
+                let raw = act_node.text().to_string();
+                dedent_from_offset(raw.trim(), usize::from(act_node.text_range().start()), src)
             };
             Some(TimelineEventIr { frame, action })
         })
@@ -1654,8 +1705,13 @@ fn extract_schedule_node(n: &ScheduleNode) -> Option<ScheduleNodeIr> {
     }
 }
 
-fn extract_schedule(s: &ScheduleDecl, module_path: &str) -> Option<ExtractedItem> {
+fn extract_schedule(
+    s: &ScheduleDecl,
+    module_path: &str,
+    schedule_counts: &mut HashMap<String, usize>,
+) -> Option<ExtractedItem> {
     let name = s.label_text().filter(|l| !l.is_empty())?;
+    let id = schedule_canonical_id(module_path, &name, schedule_counts);
     let (group, group_attr_range, attributes) = split_attrs_and_group(&s.attributes());
     let modifiers = s
         .modifiers()
@@ -1668,7 +1724,7 @@ fn extract_schedule(s: &ScheduleDecl, module_path: &str) -> Option<ExtractedItem
         item_range: s.text_range(),
         group_attr_range,
         node: GraphIrNode {
-            id: canonical_id(module_path, &name),
+            id,
             kind: GraphNodeKind::Schedule,
             name,
             group,
@@ -1738,6 +1794,7 @@ fn extract_edges(
 ) -> Vec<GraphIrEdge> {
     let mut raw_edges: Vec<GraphIrEdge> = Vec::new();
     let mut seen: BTreeSet<(String, String, String, Option<String>)> = BTreeSet::new();
+    let mut schedule_counts: HashMap<String, usize> = HashMap::new();
 
     let mut push_edge = |from: &str, to: String, kind: &str, label: Option<String>| {
         let key = (from.to_owned(), to.clone(), kind.to_owned(), label.clone());
@@ -1898,10 +1955,10 @@ fn extract_edges(
                 }
             }
             Item::Schedule(s) => {
-                let Some(label) = s.label_text() else {
+                let Some(label) = s.label_text().filter(|l| !l.is_empty()) else {
                     continue;
                 };
-                let from = canonical_id(module_path, &label);
+                let from = schedule_canonical_id(module_path, &label, &mut schedule_counts);
                 for m in s.modifiers() {
                     collect_schedule_mod_edge(
                         &m,
@@ -2221,6 +2278,21 @@ fn collect_schedule_node_edges(
 // CST Diff, Targeted Splicing & Node Rendering
 // ---------------------------------------------------------------------------
 
+fn is_valid_schedule_id(id: &str, expected_base: &str) -> bool {
+    if id == expected_base {
+        return true;
+    }
+    let Some(rest) = id
+        .strip_prefix(expected_base)
+        .and_then(|s| s.strip_prefix('#'))
+    else {
+        return false;
+    };
+    rest.parse::<usize>()
+        .ok()
+        .is_some_and(|n| n >= 2 && rest == n.to_string())
+}
+
 fn validate_patch_node(module_path: &str, node: &GraphIrNode) -> Result<(), GraphIrError> {
     if node.id.trim().is_empty() {
         return Err(GraphIrError::InvalidNode {
@@ -2235,7 +2307,12 @@ fn validate_patch_node(module_path: &str, node: &GraphIrNode) -> Result<(), Grap
         });
     }
     let expected_id = canonical_id(module_path, &node.name);
-    if node.id != expected_id {
+    let id_valid = if node.kind == GraphNodeKind::Schedule {
+        is_valid_schedule_id(&node.id, &expected_id)
+    } else {
+        node.id == expected_id
+    };
+    if !id_valid {
         return Err(GraphIrError::InvalidNode {
             id: node.id.clone(),
             reason: format!(
@@ -2441,17 +2518,14 @@ fn line_indent_at(src: &str, byte_pos: usize) -> String {
         .collect()
 }
 
-fn dedent_block(block: &Block, src: &str) -> String {
-    let range = block.text_range();
-    let start = usize::from(range.start());
-    let base_indent = line_indent_at(src, start);
-    let raw = block.syntax().text().to_string();
+fn dedent_from_offset(raw: &str, byte_start: usize, src: &str) -> String {
+    let base_indent = line_indent_at(src, byte_start);
     if base_indent.is_empty() || !raw.contains('\n') {
-        return raw;
+        return raw.to_owned();
     }
     let mut lines = raw.lines();
     let Some(first) = lines.next() else {
-        return raw;
+        return raw.to_owned();
     };
     let mut out = String::from(first);
     for line in lines {
@@ -2465,21 +2539,21 @@ fn dedent_block(block: &Block, src: &str) -> String {
     out
 }
 
-fn reindent_block(block_text: &str, target_indent: &str) -> String {
-    let trimmed = block_text.trim();
-    let wrapped = if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        trimmed.to_owned()
-    } else if trimmed.is_empty() {
-        "{}".to_owned()
-    } else {
-        format!("{{\n    {trimmed}\n}}")
-    };
-    if target_indent.is_empty() || !wrapped.contains('\n') {
-        return wrapped;
+fn dedent_block(block: &Block, src: &str) -> String {
+    dedent_from_offset(
+        &block.syntax().text().to_string(),
+        usize::from(block.text_range().start()),
+        src,
+    )
+}
+
+fn reindent_tail_lines(text: &str, target_indent: &str) -> String {
+    if target_indent.is_empty() || !text.contains('\n') {
+        return text.to_owned();
     }
-    let mut lines = wrapped.lines();
+    let mut lines = text.lines();
     let Some(first) = lines.next() else {
-        return wrapped;
+        return text.to_owned();
     };
     let mut out = String::from(first);
     for line in lines {
@@ -2490,6 +2564,59 @@ fn reindent_block(block_text: &str, target_indent: &str) -> String {
         out.push_str(line);
     }
     out
+}
+
+fn reindent_block(block_text: &str, target_indent: &str) -> String {
+    let trimmed = block_text.trim();
+    let wrapped = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        trimmed.to_owned()
+    } else if trimmed.is_empty() {
+        "{}".to_owned()
+    } else {
+        format!("{{\n    {trimmed}\n}}")
+    };
+    reindent_tail_lines(&wrapped, target_indent)
+}
+
+fn is_brace_terminated_timeline_action(trimmed: &str) -> bool {
+    if trimmed.is_empty() || trimmed.ends_with(';') {
+        return false;
+    }
+    let wrapped = format!("fn _t() {{\n{trimmed}\n}}");
+    let parsed = crate::parse(&wrapped);
+    let Some(sf) = SourceFile::cast(parsed.syntax()) else {
+        return false;
+    };
+    let Some(Item::Fn(func)) = sf.items().next() else {
+        return false;
+    };
+    let Some(block) = func.body() else {
+        return false;
+    };
+    let mut children = block.syntax().children();
+    let Some(stmt) = children.next() else {
+        return false;
+    };
+    if children.next().is_some() {
+        return false;
+    }
+    let node = if stmt.kind() == SyntaxKind::ExprStmt {
+        stmt.children().next().unwrap_or(stmt)
+    } else {
+        stmt
+    };
+    match node.kind() {
+        SyntaxKind::Block
+        | SyntaxKind::WhileStmt
+        | SyntaxKind::LoopStmt
+        | SyntaxKind::AtomicStmt
+        | SyntaxKind::AbortIfStmt
+        | SyntaxKind::RaceStmt
+        | SyntaxKind::IfExpr
+        | SyntaxKind::MatchExpr => true,
+        SyntaxKind::ForExpr => ast::child::<Block>(&node).is_some(),
+        _ => false,
+    }
 }
 
 fn escape_strata_string(s: &str) -> String {
@@ -2643,12 +2770,13 @@ fn render_node(node: &GraphIrNode, indent: &str) -> String {
                 out.push_str(&format!("{inner}window {} = {};\n", w.name, w.expr));
             }
             for ev in &p.events {
-                let act = if ev.action.trim_start().starts_with('{') {
+                let trimmed = ev.action.trim();
+                let act = if trimmed.starts_with('{') {
                     reindent_block(&ev.action, &inner)
-                } else if ev.action.trim_end().ends_with(';') {
-                    ev.action.trim().to_owned()
+                } else if trimmed.ends_with(';') || is_brace_terminated_timeline_action(trimmed) {
+                    reindent_tail_lines(trimmed, &inner)
                 } else {
-                    format!("{};", ev.action.trim())
+                    reindent_tail_lines(&format!("{trimmed};"), &inner)
                 };
                 out.push_str(&format!("{inner}at {} => {act}\n", ev.frame));
             }
