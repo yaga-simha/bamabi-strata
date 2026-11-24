@@ -4838,10 +4838,10 @@ pub(super) fn emit_runtime_write_ty_into_bytes(
             "if ({off_expr}) + 8 <= {buf_var}.len() {{ let _v = {val_var}.as_uvec2(); {buf_var}[{off_expr}..{off_expr} + 4].copy_from_slice(&_v[0].to_le_bytes()); {buf_var}[{off_expr} + 4..{off_expr} + 8].copy_from_slice(&_v[1].to_le_bytes()); }}"
         ),
         Ty::Mat3 => format!(
-            "if let StrataVal::Arr(ref _xs) = {val_var} {{ for (_j, _f) in _xs.iter().take(9).enumerate() {{ if ({off_expr}) + _j * 4 + 4 <= {buf_var}.len() {{ {buf_var}[{off_expr} + _j * 4..{off_expr} + _j * 4 + 4].copy_from_slice(&_f.as_f32().to_le_bytes()); }} }} }}"
+            "if let StrataVal::Arr(_xs) = &{val_var} {{ for (_j, _f) in _xs.iter().take(9).enumerate() {{ if ({off_expr}) + _j * 4 + 4 <= {buf_var}.len() {{ {buf_var}[{off_expr} + _j * 4..{off_expr} + _j * 4 + 4].copy_from_slice(&_f.as_f32().to_le_bytes()); }} }} }}"
         ),
         Ty::Mat4 => format!(
-            "if let StrataVal::Arr(ref _xs) = {val_var} {{ for (_j, _f) in _xs.iter().take(16).enumerate() {{ if ({off_expr}) + _j * 4 + 4 <= {buf_var}.len() {{ {buf_var}[{off_expr} + _j * 4..{off_expr} + _j * 4 + 4].copy_from_slice(&_f.as_f32().to_le_bytes()); }} }} }}"
+            "if let StrataVal::Arr(_xs) = &{val_var} {{ for (_j, _f) in _xs.iter().take(16).enumerate() {{ if ({off_expr}) + _j * 4 + 4 <= {buf_var}.len() {{ {buf_var}[{off_expr} + _j * 4..{off_expr} + _j * 4 + 4].copy_from_slice(&_f.as_f32().to_le_bytes()); }} }} }}"
         ),
         Ty::BitSet(bits) => {
             let words = (*bits).div_ceil(32).max(1);
@@ -4870,7 +4870,7 @@ pub(super) fn emit_runtime_write_ty_into_bytes(
                 }
             } else {
                 format!(
-                    "if let StrataVal::Obj(ref _o) = {val_var} {{ let _ob = _o.read_le_bytes(); let _n = _ob.len().min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_ob[.._n]); }} else if let StrataVal::Bytes(ref _ob) = {val_var} {{ let _n = _ob.len().min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_ob[.._n]); }}"
+                    "if let StrataVal::Obj(_o) = &{val_var} {{ let _ob = _o.read_le_bytes(); let _n = _ob.len().min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_ob[.._n]); }} else if let StrataVal::Bytes(_ob) = &{val_var} {{ let _n = _ob.len().min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_ob[.._n]); }}"
                 )
             }
         }
@@ -4881,7 +4881,7 @@ pub(super) fn emit_runtime_write_ty_into_bytes(
             let elem_w =
                 emit_runtime_write_ty_into_bytes(buf_var, "_a_eoff", "_a_el", elem, elem_sz, mir);
             format!(
-                "match {val_var} {{ StrataVal::Arr(ref _items) => {{ for (_ai, _a_el) in _items.iter().take({len}).enumerate() {{ let _a_eoff = ({off_expr}) + _ai * {elem_stride}; {elem_w} }} }} StrataVal::Bytes(ref _bs) => {{ let _n = _bs.len().min({byte_size}).min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_bs[.._n]); }} _ => {{}} }}"
+                "match &{val_var} {{ StrataVal::Arr(_items) => {{ for (_ai, _a_el) in _items.iter().take({len}).enumerate() {{ let _a_eoff = ({off_expr}) + _ai * {elem_stride}; {elem_w} }} }} StrataVal::Bytes(_bs) => {{ let _n = _bs.len().min({byte_size}).min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_bs[.._n]); }} _ => {{}} }}"
             )
         }
         Ty::SmallVec { elem, cap } => {
@@ -4891,11 +4891,11 @@ pub(super) fn emit_runtime_write_ty_into_bytes(
             let elem_w =
                 emit_runtime_write_ty_into_bytes(buf_var, "_sv_eoff", "_sv_el", elem, elem_sz, mir);
             format!(
-                "match {val_var} {{ StrataVal::Arr(ref _items) => {{ let _cnt = _items.len().min({cap}); let _end = ({off_expr} + {byte_size}).min({buf_var}.len()); if ({off_expr}) < _end {{ {buf_var}[({off_expr}).._end].fill(0); }} if ({off_expr}) + 4 <= {buf_var}.len() {{ {buf_var}[({off_expr})..({off_expr}) + 4].copy_from_slice(&(_cnt as u32).to_le_bytes()); }} for (_i, _sv_el) in _items.iter().take({cap}).enumerate() {{ let _sv_eoff = ({off_expr}) + 8 + _i * {elem_stride}; {elem_w} }} }} StrataVal::Bytes(ref _bs) => {{ let _n = _bs.len().min({byte_size}).min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_bs[.._n]); }} StrataVal::Words(ref _ws) => {{ let mut _raw = Vec::with_capacity(_ws.len() * 4); for _w in _ws {{ _raw.extend_from_slice(&_w.to_le_bytes()); }} let _n = _raw.len().min({byte_size}).min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_raw[.._n]); }} _ => {{}} }}"
+                "match &{val_var} {{ StrataVal::Arr(_items) => {{ let _cnt = _items.len().min({cap}); let _end = ({off_expr} + {byte_size}).min({buf_var}.len()); if ({off_expr}) < _end {{ {buf_var}[({off_expr}).._end].fill(0); }} if ({off_expr}) + 4 <= {buf_var}.len() {{ {buf_var}[({off_expr})..({off_expr}) + 4].copy_from_slice(&(_cnt as u32).to_le_bytes()); }} for (_i, _sv_el) in _items.iter().take({cap}).enumerate() {{ let _sv_eoff = ({off_expr}) + 8 + _i * {elem_stride}; {elem_w} }} }} StrataVal::Bytes(_bs) => {{ let _n = _bs.len().min({byte_size}).min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_bs[.._n]); }} StrataVal::Words(_ws) => {{ let mut _raw = Vec::with_capacity(_ws.len() * 4); for _w in _ws {{ _raw.extend_from_slice(&_w.to_le_bytes()); }} let _n = _raw.len().min({byte_size}).min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_raw[.._n]); }} _ => {{}} }}"
             )
         }
         Ty::InputBuffer { .. } => format!(
-            "match {val_var} {{ StrataVal::Bytes(ref _bs) => {{ let _n = _bs.len().min({byte_size}).min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_bs[.._n]); }} StrataVal::Words(ref _ws) => {{ let mut _raw = Vec::with_capacity(_ws.len() * 4); for _w in _ws {{ _raw.extend_from_slice(&_w.to_le_bytes()); }} let _n = _raw.len().min({byte_size}).min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_raw[.._n]); }} _ => {{}} }}"
+            "match &{val_var} {{ StrataVal::Bytes(_bs) => {{ let _n = _bs.len().min({byte_size}).min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_bs[.._n]); }} StrataVal::Words(_ws) => {{ let mut _raw = Vec::with_capacity(_ws.len() * 4); for _w in _ws {{ _raw.extend_from_slice(&_w.to_le_bytes()); }} let _n = _raw.len().min({byte_size}).min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_raw[.._n]); }} _ => {{}} }}"
         ),
         Ty::Tuple(items) => {
             let mut cursor = 0usize;
@@ -4916,7 +4916,7 @@ pub(super) fn emit_runtime_write_ty_into_bytes(
                 cursor += sz;
             }
             format!(
-                "match {val_var} {{ StrataVal::Tuple(ref _items) => {{ {} }} StrataVal::Bytes(ref _bs) => {{ let _n = _bs.len().min({byte_size}).min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_bs[.._n]); }} _ => {{}} }}",
+                "match &{val_var} {{ StrataVal::Tuple(_items) => {{ {} }} StrataVal::Bytes(_bs) => {{ let _n = _bs.len().min({byte_size}).min({buf_var}.len().saturating_sub({off_expr})); {buf_var}[({off_expr})..({off_expr}) + _n].copy_from_slice(&_bs[.._n]); }} _ => {{}} }}",
                 writes.join(" ")
             )
         }

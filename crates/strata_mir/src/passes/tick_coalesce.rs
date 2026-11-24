@@ -231,8 +231,8 @@ fn instrument_chunk_loop_selective(
                     let mut cur = Some(s_idx);
                     while let Some(id) = cur {
                         if scope_slots[id].is_none() {
-                            let d = func.alloc_local("tx_dirty", MirType::Bool);
-                            let r = func.alloc_local("tx_dirty_row", MirType::U32);
+                            let d = func.alloc_local("tx_dirty", MirType::MutPtr);
+                            let r = func.alloc_local("tx_dirty_row", MirType::MutPtr);
                             scope_slots[id] = Some((d, r));
                         }
                         deferred_ckpt_inits.insert(id);
@@ -273,12 +273,50 @@ fn instrument_chunk_loop_selective(
         func.blocks[bb_idx].stmts = new_stmts;
     }
 
-    // Wire active `atomic` scopes (innermost-to-outermost): reset `tx_dirty = false` just before
-    // `CmdCheckpoint` and emit conditional commit recording ONLY on non-rollback commit edges!
+    // Wire active `atomic` scopes (innermost-to-outermost): allocate dominating stack slots
+    // in entry block `blocks[0]`, reset `tx_dirty = false` just before `CmdCheckpoint`, and emit
+    // conditional commit recording ONLY on non-rollback commit edges!
     for s_idx in (0..atomic_scopes.len()).rev() {
         let Some((tx_dirty, tx_row)) = scope_slots[s_idx] else {
             continue;
         };
+        let cf0 = func.alloc_local("tx_dirty_entry0", MirType::Bool);
+        let cz0 = func.alloc_local("tx_row_entry0", MirType::U32);
+        let entry_allocs = [
+            MirStmt {
+                dst: Some(tx_dirty),
+                inst: Inst::SlotAlloc { ty: MirType::Bool },
+            },
+            MirStmt {
+                dst: Some(tx_row),
+                inst: Inst::SlotAlloc { ty: MirType::U32 },
+            },
+            MirStmt {
+                dst: Some(cf0),
+                inst: Inst::ConstBool { value: false },
+            },
+            MirStmt {
+                dst: None,
+                inst: Inst::SlotStore {
+                    slot: tx_dirty,
+                    val: cf0,
+                },
+            },
+            MirStmt {
+                dst: Some(cz0),
+                inst: Inst::ConstInt { value: 0 },
+            },
+            MirStmt {
+                dst: None,
+                inst: Inst::SlotStore {
+                    slot: tx_row,
+                    val: cz0,
+                },
+            },
+        ];
+        func.blocks[BlockId(0).0 as usize]
+            .stmts
+            .splice(0..0, entry_allocs);
         let scope = &atomic_scopes[s_idx];
         // Initialize `tx_dirty = false`, `tx_row = 0` immediately before `CmdCheckpoint`.
         let ckpt_idx = scope.ckpt_bb.0 as usize;

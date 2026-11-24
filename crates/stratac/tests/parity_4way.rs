@@ -4326,7 +4326,8 @@ sim_test "iter7_sim_match_expect_and_optional_term" {
             "{label} loop_s_d_pos"
         );
         assert_eq!(read_i32(mp_off("fsm_ticks")), 2, "{label} fsm_ticks");
-        assert_eq!(read_i32(mp_off("task_ticks")), 2, "{label} task_ticks");
+        // Single-shot task with trailing `yield_tick;` executes tick 1, suspends, and completes on tick 2 (GF-04).
+        assert_eq!(read_i32(mp_off("task_ticks")), 1, "{label} task_ticks");
     }
 
     let _parity_wg = PARITY_ALLOC_GATE.write().unwrap_or_else(|e| e.into_inner());
