@@ -1,0 +1,391 @@
+================================================================================
+Timelines, tasks, and finite state machines
+================================================================================
+
+timeline Slash @rate(60_hz) {
+    window active = 2_f..6_f;
+    at 2_f => trigger(self, Hit { dmg: 10.0 });
+}
+
+task Dash(speed: mps = 20.0_mps)
+    on (vel: &mut Vel2D.dxy)
+    .with<Alive>()
+    using (clk: &res SimClock)
+{
+    abort_if speed.raw() <= 0.0 { return; }
+    race {
+        branch {
+            yield_tick;
+        }
+        branch {
+            wait 100ms;
+            wait_until true;
+        }
+    }
+}
+
+fsm GuardFsm(clk: &res SimClock) @require(Pos2D) {
+    initial Patrol { step: 0 };
+    state Patrol {
+        step: u32 = 0,
+        on_enter { let a = 1; }
+        on_tick { let b = 2; }
+        on_exit { let c = 3; }
+        to Chase when clk.dt > 0.0_s;
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (timeline_declaration
+    name: (type_identifier)
+    (attribute
+      name: (identifier)
+      arguments: (attribute_argument_list
+        (attribute_argument
+          value: (unit_literal))))
+    body: (timeline_body
+      (timeline_window
+        name: (identifier)
+        range: (range_expression
+          left: (unit_literal)
+          right: (unit_literal)))
+      (timeline_at
+        time: (unit_literal)
+        action: (expression_statement
+          (call_expression
+            function: (identifier)
+            arguments: (argument_list
+              (self)
+              (struct_literal
+                type: (identifier)
+                body: (field_initializer_list
+                  (field_initializer_items
+                    (field_initializer
+                      field: (field_identifier)
+                      value: (float_literal)))))))))))
+  (task_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type_identifier)
+        default: (unit_literal)))
+    (query_term_list
+      (query_term
+        alias: (identifier)
+        type: (reference_type
+          type: (field_projection_type
+            type: (type_identifier)
+            field: (field_identifier)))))
+    (query_filter_method
+      name: (field_identifier)
+      type_arguments: (generic_args
+        (type_identifier))
+      arguments: (argument_list))
+    using_parameters: (system_parameter_list
+      (system_parameter
+        name: (identifier)
+        type: (reference_type
+          type: (type_identifier))))
+    body: (block
+      (abort_if_statement
+        condition: (binary_expression
+          left: (call_expression
+            function: (field_expression
+              value: (identifier)
+              field: (field_identifier))
+            arguments: (argument_list))
+          right: (float_literal))
+        consequence: (block
+          (return_statement)))
+      (race_statement
+        (branch_statement
+          body: (block
+            (yield_tick_statement)))
+        (branch_statement
+          body: (block
+            (wait_statement
+              duration: (unit_literal))
+            (wait_until_statement
+              condition: (boolean_literal)))))))
+  (fsm_declaration
+    name: (type_identifier)
+    parameters: (system_parameter_list
+      (system_parameter
+        name: (identifier)
+        type: (reference_type
+          type: (type_identifier))))
+    (require_clause
+      (require_item
+        component: (path
+          segment: (identifier))))
+    body: (fsm_body
+      (fsm_initial
+        state: (identifier)
+        arguments: (field_initializer_list
+          (field_initializer_items
+            (field_initializer
+              field: (field_identifier)
+              value: (int_literal)))))
+      (state_declaration
+        name: (identifier)
+        (field_declaration
+          name: (field_identifier)
+          type: (type_identifier)
+          default: (int_literal))
+        (state_hook
+          body: (block
+            (let_statement
+              pattern: (identifier_pattern
+                (identifier))
+              value: (int_literal))))
+        (state_hook
+          body: (block
+            (let_statement
+              pattern: (identifier_pattern
+                (identifier))
+              value: (int_literal))))
+        (state_hook
+          body: (block
+            (let_statement
+              pattern: (identifier_pattern
+                (identifier))
+              value: (int_literal))))
+        (transition_declaration
+          target: (identifier)
+          guard: (binary_expression
+            left: (field_expression
+              value: (identifier)
+              field: (field_identifier))
+            right: (unit_literal)))))))
+
+================================================================================
+Systems, observers, migrations, schedules, assertions, and simulation tests
+================================================================================
+
+@par(chunk = 1024)
+sys step_world(clk: &res SimClock) effects(writes: [Pos3D]) {
+    uniform let dt = clk.dt;
+    for row in query(hp: &mut? Hull.hp, opt: ?&Shield, caps: &Hull::caps) {
+        row.hp += 1.0;
+    }
+}
+
+obs on_hit(trg: &Trigger<HitEvent>) {
+    despawn_all<With<Temp>>();
+    remove<Shield>(trg.target);
+    insert @if_new(trg.target, Stunned {});
+}
+
+migrate Hull from 1.0.0 to 2.0.0(old: &HullV1) -> Hull {
+    Hull { hp: old.hp as f32 }
+}
+
+assert_layout(Hull::hot, size == 16);
+assert_par(step_world, audit_world);
+
+schedule FixedUpdate run_if(res<SimClock>().dt > 0.0_s) {
+    seq Core {
+        par Jobs { step_world }
+    }
+}
+
+sim_test "ticks_cleanly" {
+    step_fixed(1);
+}
+
+net_sim_test "syncs"(latency: 40ms, clients: 2) {
+    let q = client_query(0, h: &Hull).on(Hero);
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (sys_declaration
+    (attribute
+      name: (identifier)
+      arguments: (attribute_argument_list
+        (attribute_argument
+          key: (identifier)
+          value: (int_literal))))
+    name: (identifier)
+    parameters: (system_parameter_list
+      (system_parameter
+        name: (identifier)
+        type: (reference_type
+          type: (type_identifier))))
+    effects: (effects_clause
+      (effect_entry
+        kind: (identifier)
+        (path
+          segment: (identifier))))
+    body: (block
+      (uniform_let_statement
+        pattern: (identifier_pattern
+          (identifier))
+        value: (field_expression
+          value: (identifier)
+          field: (field_identifier)))
+      (expression_statement
+        (for_expression
+          pattern: (identifier_pattern
+            (identifier))
+          iterator: (query_expression
+            (query_term_list
+              (query_term
+                alias: (identifier)
+                type: (reference_type
+                  type: (field_projection_type
+                    type: (type_identifier)
+                    field: (field_identifier))))
+              (query_term
+                alias: (identifier)
+                type: (optional_type
+                  type: (reference_type
+                    type: (type_identifier))))
+              (query_term
+                alias: (identifier)
+                type: (reference_type
+                  type: (scoped_type_identifier
+                    path: (type_identifier)
+                    name: (type_identifier))))))
+          body: (block
+            (expression_statement
+              (assignment_expression
+                left: (field_expression
+                  value: (identifier)
+                  field: (field_identifier))
+                right: (float_literal))))))))
+  (obs_declaration
+    name: (identifier)
+    parameters: (system_parameter_list
+      (system_parameter
+        name: (identifier)
+        type: (reference_type
+          type: (generic_type
+            type: (type_identifier)
+            type_arguments: (generic_args
+              (type_identifier))))))
+    body: (block
+      (expression_statement
+        (despawn_all_expression
+          type_arguments: (generic_args
+            (generic_type
+              type: (type_identifier)
+              type_arguments: (generic_args
+                (type_identifier))))
+          arguments: (argument_list)))
+      (expression_statement
+        (remove_expression
+          type_arguments: (generic_args
+            (type_identifier))
+          arguments: (argument_list
+            (field_expression
+              value: (identifier)
+              field: (field_identifier)))))
+      (expression_statement
+        (insert_expression
+          (attribute
+            name: (identifier))
+          arguments: (argument_list
+            (field_expression
+              value: (identifier)
+              field: (field_identifier))
+            (struct_literal
+              type: (identifier)
+              body: (field_initializer_list)))))))
+  (migrate_declaration
+    target: (path
+      segment: (identifier))
+    from_version: (semver)
+    to_version: (semver)
+    parameter: (identifier)
+    parameter_type: (reference_type
+      type: (type_identifier))
+    return_type: (path
+      segment: (identifier))
+    body: (block
+      (struct_literal
+        type: (identifier)
+        body: (field_initializer_list
+          (field_initializer_items
+            (field_initializer
+              field: (field_identifier)
+              value: (cast_expression
+                value: (field_expression
+                  value: (identifier)
+                  field: (field_identifier))
+                type: (type_identifier))))))))
+  (assert_layout_declaration
+    target: (path
+      segment: (identifier)
+      segment: (identifier))
+    (binary_expression
+      left: (identifier)
+      right: (int_literal)))
+  (assert_par_declaration
+    (path
+      segment: (identifier))
+    (path
+      segment: (identifier)))
+  (schedule_declaration
+    name: (path
+      segment: (identifier))
+    (schedule_modifier
+      condition: (binary_expression
+        left: (field_expression
+          value: (call_expression
+            function: (generic_function
+              function: (identifier)
+              type_arguments: (generic_args
+                (type_identifier)))
+            arguments: (argument_list))
+          field: (field_identifier))
+        right: (unit_literal)))
+    body: (schedule_body
+      (schedule_node
+        name: (identifier)
+        body: (schedule_body
+          (schedule_node
+            name: (identifier)
+            body: (schedule_body
+              (schedule_node
+                target: (path
+                  segment: (identifier)))))))))
+  (sim_test_declaration
+    name: (string_literal
+      (string_content))
+    body: (block
+      (expression_statement
+        (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (int_literal))))))
+  (net_sim_test_declaration
+    name: (string_literal
+      (string_content))
+    parameters: (net_sim_parameter_list
+      (net_sim_parameter
+        name: (identifier)
+        value: (unit_literal))
+      (net_sim_parameter
+        name: (identifier)
+        value: (int_literal)))
+    body: (block
+      (let_statement
+        pattern: (identifier_pattern
+          (identifier))
+        value: (call_expression
+          function: (field_expression
+            value: (query_expression
+              client: (int_literal)
+              (query_term_list
+                (query_term
+                  alias: (identifier)
+                  type: (reference_type
+                    type: (type_identifier)))))
+            field: (field_identifier))
+          arguments: (argument_list
+            (identifier)))))))

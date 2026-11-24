@@ -1,0 +1,20 @@
+[package]
+name = "zed_strata"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+authors = ["bamabi authors"]
+description = "Zed editor extension for the Strata v2.0 ECS gameplay language."
+repository = "https://github.com/yaga-simha/bamabi-strata"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"
+
+# Isolated standalone workspace so Cargo never modifies the root `bamabi-strata`
+# workspace `Cargo.toml` or `Cargo.lock`.
+[workspace]

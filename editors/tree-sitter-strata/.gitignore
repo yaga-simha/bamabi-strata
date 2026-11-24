@@ -1,0 +1,8 @@
+node_modules/
+target/
+Cargo.lock
+*.wasm
+*.so
+*.dylib
+*.dll
+log.html

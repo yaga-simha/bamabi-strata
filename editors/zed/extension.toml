@@ -1,0 +1,29 @@
+id = "strata"
+name = "Strata"
+description = "Strata v2.0 ECS gameplay language support: syntax highlighting, code outline, auto-indentation, runnable simulation tests, and strata-lsp integration."
+version = "0.3.0"
+schema_version = 1
+authors = ["bamabi authors"]
+repository = "https://github.com/yaga-simha/bamabi-strata"
+
+[grammars.strata]
+repository = "https://github.com/yaga-simha/bamabi-strata"
+rev = "main"
+path = "editors/tree-sitter-strata"
+
+# Local uncommitted grammar development (`zed: install dev extension`):
+# When editing `editors/tree-sitter-strata` locally before pushing to GitHub,
+# replace `[grammars.strata]` above with a `file://` URL pointing to a git
+# repository containing the committed grammar (see `editors/zed/README.md`):
+#
+# [grammars.strata]
+# repository = "file:///ABSOLUTE/PATH/TO/strata"
+# rev = "HEAD"
+# path = "editors/tree-sitter-strata"
+
+[language_servers.strata-lsp]
+name = "strata-lsp"
+languages = ["Strata"]
+
+[language_servers.strata-lsp.language_ids]
+Strata = "strata"

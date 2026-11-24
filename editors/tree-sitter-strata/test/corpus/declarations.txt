@@ -1,0 +1,344 @@
+================================================================================
+Modules, imports, structs, enums, types, and units
+================================================================================
+
+module demo::mod @version(1.0.0) @deterministic;
+
+use engine::math::{Vec3, Quat as Rotation};
+use engine::ecs::*;
+
+unit Accel = m / s^2;
+type Nested<T> = Option<SmallVec<(T, f32), 4>>;
+
+struct Pair<T: Box<u32>> {
+    first: T,
+    second: [f32; 4],
+}
+
+enum Action {
+    Idle = 0,
+    Move(vec2),
+    Cast { spell_id: u16 },
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (module_declaration
+    name: (path
+      segment: (identifier)
+      segment: (identifier))
+    (attribute
+      name: (identifier)
+      arguments: (attribute_argument_list
+        (attribute_argument
+          (semver))))
+    (attribute
+      name: (identifier)))
+  (use_declaration
+    argument: (scoped_use_list
+      path: (scoped_identifier
+        path: (identifier)
+        name: (identifier))
+      list: (use_list
+        (identifier)
+        (use_as_clause
+          path: (identifier)
+          alias: (identifier)))))
+  (use_declaration
+    argument: (use_wildcard
+      path: (scoped_identifier
+        path: (identifier)
+        name: (identifier))))
+  (unit_declaration
+    name: (type_identifier)
+    type: (dimensional_type
+      left: (type_identifier)
+      right: (dimensional_type
+        base: (type_identifier)
+        exponent: (int_literal))))
+  (type_alias_declaration
+    name: (type_identifier)
+    type_parameters: (generic_parameters
+      (generic_parameter
+        name: (type_identifier)))
+    type: (generic_type
+      type: (type_identifier)
+      type_arguments: (generic_args
+        (generic_type
+          type: (type_identifier)
+          type_arguments: (generic_args
+            (tuple_type
+              (type_identifier)
+              (type_identifier))
+            (int_literal))))))
+  (struct_declaration
+    name: (type_identifier)
+    type_parameters: (generic_parameters
+      (generic_parameter
+        name: (type_identifier)
+        bound: (generic_type
+          type: (type_identifier)
+          type_arguments: (generic_args
+            (type_identifier)))))
+    body: (field_declaration_list
+      (field_declaration
+        name: (field_identifier)
+        type: (type_identifier))
+      (field_declaration
+        name: (field_identifier)
+        type: (array_type
+          element: (type_identifier)
+          length: (int_literal)))))
+  (enum_declaration
+    name: (type_identifier)
+    body: (enum_variant_list
+      (enum_variant
+        name: (identifier)
+        value: (int_literal))
+      (enum_variant
+        name: (identifier)
+        (type_identifier))
+      (enum_variant
+        name: (identifier)
+        body: (field_declaration_list
+          (field_declaration
+            name: (field_identifier)
+            type: (type_identifier)))))))
+
+================================================================================
+ECS components, SoA strata, resources, events, streams, RPCs, relations
+================================================================================
+
+@soa @summary_tick
+component Hull @require(Pos3D) {
+    hot {
+        hp: f32 = 100.0,
+    }
+    cold telemetry {
+        code: InlineStr<32>,
+    }
+}
+
+component Marker;
+tag Alive, Boss;
+resource SimClock { dt: sec = 16.6667_ms }
+event DiedEvent;
+stream Digest { count: u32 }
+@net_rpc(direction = client_to_server)
+rpc MoveCmd { @quantize(min = -1.0, max = 1.0, bits = 8) dx: f32 }
+relation ChildOf [exclusive, cascade_despawn] { slot: u8 }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (component_declaration
+    (attribute
+      name: (identifier))
+    (attribute
+      name: (identifier))
+    name: (type_identifier)
+    (require_clause
+      (require_item
+        component: (path
+          segment: (identifier))))
+    body: (component_body
+      (stratum_block
+        body: (field_declaration_list
+          (field_declaration
+            name: (field_identifier)
+            type: (type_identifier)
+            default: (float_literal))))
+      (stratum_block
+        name: (identifier)
+        body: (field_declaration_list
+          (field_declaration
+            name: (field_identifier)
+            type: (generic_type
+              type: (type_identifier)
+              type_arguments: (generic_args
+                (int_literal))))))))
+  (component_declaration
+    name: (type_identifier))
+  (tag_declaration
+    name: (type_identifier)
+    name: (type_identifier))
+  (resource_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        name: (field_identifier)
+        type: (type_identifier)
+        default: (unit_literal))))
+  (event_declaration
+    name: (type_identifier))
+  (stream_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        name: (field_identifier)
+        type: (type_identifier))))
+  (rpc_declaration
+    (attribute
+      name: (identifier)
+      arguments: (attribute_argument_list
+        (attribute_argument
+          key: (identifier)
+          value: (identifier))))
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        (attribute
+          name: (identifier)
+          arguments: (attribute_argument_list
+            (attribute_argument
+              key: (identifier)
+              value: (unary_expression
+                operand: (float_literal)))
+            (attribute_argument
+              key: (identifier)
+              value: (float_literal))
+            (attribute_argument
+              key: (identifier)
+              value: (int_literal))))
+        name: (field_identifier)
+        type: (type_identifier))))
+  (relation_declaration
+    name: (type_identifier)
+    flags: (relation_flags
+      (identifier)
+      (identifier))
+    body: (field_declaration_list
+      (field_declaration
+        name: (field_identifier)
+        type: (type_identifier)))))
+
+================================================================================
+Tables, curves, spatial indexes, aspects, prefabs, objects, zones
+================================================================================
+
+table Stats by Kind { cost: u32 } = {
+    Basic => { cost: 10 },
+};
+
+curve Falloff(meters -> f32) = [(0.0_m, 1.0), (10.0_m, 0.2)];
+
+spatial_grid EnemyGrid(cell_size: 4.0_m) over Enemy by Pos2D.xy;
+spatial_history HitHist(frames: 16) over Alive by Pos3D.xyz cache (cap: HitBox);
+hash_index Lookup(capacity: 64) over Item by key(ItemId.raw);
+aspect Movable(pos: &mut Pos3D) .without<Frozen>() where pos.xyz.y > 0.0;
+prefab Crate { Pos3D { xyz: vec3::ZERO } }
+object Hero { Pos3D {} }
+zone Arena { id: u16 = 1 }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (table_declaration
+    name: (type_identifier)
+    key: (path
+      segment: (identifier))
+    columns: (field_declaration_list
+      (field_declaration
+        name: (field_identifier)
+        type: (type_identifier)))
+    (table_row
+      key: (identifier)
+      values: (field_initializer_list
+        (field_initializer_items
+          (field_initializer
+            field: (field_identifier)
+            value: (int_literal))))))
+  (curve_declaration
+    name: (type_identifier)
+    domain: (type_identifier)
+    codomain: (type_identifier)
+    (curve_point
+      x: (unit_literal)
+      y: (float_literal))
+    (curve_point
+      x: (unit_literal)
+      y: (float_literal)))
+  (spatial_grid_declaration
+    name: (type_identifier)
+    (field_initializer_items
+      (field_initializer
+        field: (field_identifier)
+        value: (unit_literal)))
+    target: (path
+      segment: (identifier))
+    field: (field_path
+      segment: (identifier)
+      segment: (identifier)))
+  (spatial_history_declaration
+    name: (type_identifier)
+    (field_initializer_items
+      (field_initializer
+        field: (field_identifier)
+        value: (int_literal)))
+    target: (path
+      segment: (identifier))
+    field: (field_path
+      segment: (identifier)
+      segment: (identifier))
+    (query_term_list
+      (query_term
+        alias: (identifier)
+        type: (type_identifier))))
+  (hash_index_declaration
+    name: (type_identifier)
+    (field_initializer_items
+      (field_initializer
+        field: (field_identifier)
+        value: (int_literal)))
+    target: (path
+      segment: (identifier))
+    field: (field_path
+      segment: (identifier)
+      segment: (identifier)))
+  (aspect_declaration
+    name: (type_identifier)
+    (query_term_list
+      (query_term
+        alias: (identifier)
+        type: (reference_type
+          type: (type_identifier))))
+    (query_filter_method
+      name: (field_identifier)
+      type_arguments: (generic_args
+        (type_identifier))
+      arguments: (argument_list))
+    guard: (binary_expression
+      left: (field_expression
+        value: (field_expression
+          value: (identifier)
+          field: (field_identifier))
+        field: (field_identifier))
+      right: (float_literal)))
+  (prefab_declaration
+    name: (type_identifier)
+    body: (component_initializer_list
+      (component_initializer
+        type: (path
+          segment: (identifier))
+        fields: (field_initializer_list
+          (field_initializer_items
+            (field_initializer
+              field: (field_identifier)
+              value: (scoped_identifier
+                path: (identifier)
+                name: (identifier))))))))
+  (object_declaration
+    name: (type_identifier)
+    body: (component_initializer_list
+      (component_initializer
+        type: (path
+          segment: (identifier))
+        fields: (field_initializer_list))))
+  (zone_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        name: (field_identifier)
+        type: (type_identifier)
+        default: (int_literal)))))

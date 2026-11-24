@@ -1,0 +1,466 @@
+================================================================================
+Control flow, atomic rollback, spawn/bundle literals, reduce, and operators
+================================================================================
+
+sys complex_flow() {
+    spawn_batch(100) |i| {
+        {
+            Pos3D { xyz: vec3::ZERO },
+            Alive,
+        }
+    };
+
+    atomic {
+        let Some(x) = query_one(p: &Pos3D).on(Hero) else { return; };
+        spawn @persistent { Pos3D { xyz: x.p.xyz } };
+    } on_rollback {
+        emit(Failed {});
+    }
+
+    let total = for d in query(hp: &Hull.hp).with<Alive>()
+    reduce (
+        sum_hp: sum(0.0, d.hp),
+    );
+
+    let shifted = (1 << 3) >> 1;
+    let cmp_shift = a < b >> (c);
+    let rec = { alpha: 1.0, beta: 2.0 };
+    let f = |v: f32| -> f32 { return v * 2.0; };
+
+    match mode {
+        0 | 1 if total > 0.0 => { continue_op(); },
+        _ => {},
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (sys_declaration
+    name: (identifier)
+    parameters: (system_parameter_list)
+    body: (block
+      (expression_statement
+        (spawn_batch_expression
+          arguments: (argument_list
+            (int_literal))
+          parameter: (identifier_pattern
+            (identifier))
+          body: (block
+            (bundle_literal
+              (component_initializer
+                type: (path
+                  segment: (identifier))
+                fields: (field_initializer_list
+                  (field_initializer_items
+                    (field_initializer
+                      field: (field_identifier)
+                      value: (scoped_identifier
+                        path: (identifier)
+                        name: (identifier))))))
+              (component_initializer
+                type: (path
+                  segment: (identifier)))))))
+      (atomic_statement
+        body: (block
+          (let_statement
+            pattern: (tuple_struct_pattern
+              type: (identifier)
+              (identifier_pattern
+                (identifier)))
+            value: (call_expression
+              function: (field_expression
+                value: (query_expression
+                  (query_term_list
+                    (query_term
+                      alias: (identifier)
+                      type: (reference_type
+                        type: (type_identifier)))))
+                field: (field_identifier))
+              arguments: (argument_list
+                (identifier)))
+            alternative: (block
+              (return_statement)))
+          (expression_statement
+            (spawn_expression
+              (attribute
+                name: (identifier))
+              body: (component_initializer_list
+                (component_initializer
+                  type: (path
+                    segment: (identifier))
+                  fields: (field_initializer_list
+                    (field_initializer_items
+                      (field_initializer
+                        field: (field_identifier)
+                        value: (field_expression
+                          value: (field_expression
+                            value: (identifier)
+                            field: (field_identifier))
+                          field: (field_identifier))))))))))
+        rollback: (block
+          (expression_statement
+            (call_expression
+              function: (identifier)
+              arguments: (argument_list
+                (struct_literal
+                  type: (identifier)
+                  body: (field_initializer_list)))))))
+      (let_statement
+        pattern: (identifier_pattern
+          (identifier))
+        value: (for_expression
+          pattern: (identifier_pattern
+            (identifier))
+          iterator: (call_expression
+            function: (generic_function
+              function: (field_expression
+                value: (query_expression
+                  (query_term_list
+                    (query_term
+                      alias: (identifier)
+                      type: (reference_type
+                        type: (field_projection_type
+                          type: (type_identifier)
+                          field: (field_identifier))))))
+                field: (field_identifier))
+              type_arguments: (generic_args
+                (type_identifier)))
+            arguments: (argument_list))
+          reduce: (reduce_clause
+            (reduce_entry
+              name: (identifier)
+              value: (call_expression
+                function: (identifier)
+                arguments: (argument_list
+                  (float_literal)
+                  (field_expression
+                    value: (identifier)
+                    field: (field_identifier))))))))
+      (let_statement
+        pattern: (identifier_pattern
+          (identifier))
+        value: (binary_expression
+          left: (parenthesized_expression
+            (binary_expression
+              left: (int_literal)
+              right: (int_literal)))
+          right: (int_literal)))
+      (let_statement
+        pattern: (identifier_pattern
+          (identifier))
+        value: (binary_expression
+          left: (identifier)
+          right: (binary_expression
+            left: (identifier)
+            right: (parenthesized_expression
+              (identifier)))))
+      (let_statement
+        pattern: (identifier_pattern
+          (identifier))
+        value: (record_literal
+          (record_field
+            field: (field_identifier)
+            value: (float_literal))
+          (record_field
+            field: (field_identifier)
+            value: (float_literal))))
+      (let_statement
+        pattern: (identifier_pattern
+          (identifier))
+        value: (closure_expression
+          (closure_parameter
+            pattern: (identifier_pattern
+              (identifier))
+            type: (type_identifier))
+          return_type: (type_identifier)
+          body: (block
+            (return_statement
+              value: (binary_expression
+                left: (identifier)
+                right: (float_literal))))))
+      (expression_statement
+        (match_expression
+          value: (identifier)
+          (match_arm
+            pattern: (or_pattern
+              (literal_pattern
+                (int_literal))
+              (literal_pattern
+                (int_literal)))
+            guard: (binary_expression
+              left: (identifier)
+              right: (float_literal))
+            value: (block
+              (expression_statement
+                (call_expression
+                  function: (identifier)
+                  arguments: (argument_list)))))
+          (match_arm
+            pattern: (wildcard_pattern)
+            value: (block)))))))
+
+================================================================================
+Loops, patterns, tuples, arrays, ranges, casts, try, and compound assignments
+================================================================================
+
+pub fn extra_exprs(slice: &[u8]) -> (u32, [i32; 4]) {
+    let (mut a, _) = (0_u32, 1_u32);
+    let arr = [0_i32; 4];
+    let list = [1, 2, 3];
+    while let Some(Pos2D { xy, .. }) = next_item()? {
+        for idx in 0..=10 {
+            if idx == 2 {
+                continue;
+            } else if idx > 8 {
+                break;
+            }
+            a += idx as u32;
+            a >>= 1_u32;
+        }
+    }
+    loop {
+        if tl.in(active) {
+            break;
+        }
+    }
+    return (a, arr);
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (fn_declaration
+    (visibility_modifier)
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (reference_type
+          type: (slice_type
+            element: (type_identifier)))))
+    return_type: (tuple_type
+      (type_identifier)
+      (array_type
+        element: (type_identifier)
+        length: (int_literal)))
+    body: (block
+      (let_statement
+        pattern: (tuple_pattern
+          (identifier_pattern
+            (identifier))
+          (wildcard_pattern))
+        value: (tuple_expression
+          (int_literal)
+          (int_literal)))
+      (let_statement
+        pattern: (identifier_pattern
+          (identifier))
+        value: (array_expression
+          (int_literal)
+          length: (int_literal)))
+      (let_statement
+        pattern: (identifier_pattern
+          (identifier))
+        value: (array_expression
+          (int_literal)
+          (int_literal)
+          (int_literal)))
+      (while_statement
+        pattern: (tuple_struct_pattern
+          type: (identifier)
+          (struct_pattern
+            type: (identifier)
+            field: (field_identifier)))
+        condition: (try_expression
+          value: (call_expression
+            function: (identifier)
+            arguments: (argument_list)))
+        body: (block
+          (expression_statement
+            (for_expression
+              pattern: (identifier_pattern
+                (identifier))
+              iterator: (range_expression
+                left: (int_literal)
+                right: (int_literal))
+              body: (block
+                (expression_statement
+                  (if_expression
+                    condition: (binary_expression
+                      left: (identifier)
+                      right: (int_literal))
+                    consequence: (block
+                      (continue_statement))
+                    alternative: (if_expression
+                      condition: (binary_expression
+                        left: (identifier)
+                        right: (int_literal))
+                      consequence: (block
+                        (break_statement)))))
+                (expression_statement
+                  (assignment_expression
+                    left: (identifier)
+                    right: (cast_expression
+                      value: (identifier)
+                      type: (type_identifier))))
+                (expression_statement
+                  (assignment_expression
+                    left: (identifier)
+                    right: (int_literal))))))))
+      (loop_statement
+        body: (block
+          (expression_statement
+            (if_expression
+              condition: (call_expression
+                function: (field_expression
+                  value: (identifier)
+                  field: (field_identifier))
+                arguments: (argument_list
+                  (identifier)))
+              consequence: (block
+                (break_statement))))))
+      (return_statement
+        value: (tuple_expression
+          (identifier)
+          (identifier))))))
+
+================================================================================
+Contextual keywords as identifiers, parameters, assignments, fields, and calls
+================================================================================
+
+component CtxComp { hot: f32, cold: f32 }
+
+fn use_contextual_words(
+    uniform: u32,
+    abort_if: u32,
+    race: u32,
+    wait: u32,
+    wait_until: u32,
+    yield_tick: u32,
+    atomic: u32,
+    spawn: u32,
+    spawn_batch: u32,
+    despawn_all: u32,
+    insert: u32,
+    remove: u32,
+    query: u32,
+    query_one: u32,
+    server_query: u32,
+    client_query: u32,
+) -> u32 {
+    let mut acc = uniform + abort_if + race + wait + wait_until + yield_tick + atomic + spawn;
+    acc += spawn_batch + despawn_all + insert + remove + query + query_one + server_query + client_query;
+    let _ = wait(acc);
+    return acc;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (component_declaration
+    name: (type_identifier)
+    body: (component_body
+      (field_declaration
+        name: (field_identifier)
+        type: (type_identifier))
+      (field_declaration
+        name: (field_identifier)
+        type: (type_identifier))))
+  (fn_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier))
+      (parameter
+        name: (identifier)
+        type: (type_identifier)))
+    return_type: (type_identifier)
+    body: (block
+      (let_statement
+        pattern: (identifier_pattern
+          (identifier))
+        value: (binary_expression
+          left: (binary_expression
+            left: (binary_expression
+              left: (binary_expression
+                left: (binary_expression
+                  left: (binary_expression
+                    left: (binary_expression
+                      left: (identifier)
+                      right: (identifier))
+                    right: (identifier))
+                  right: (identifier))
+                right: (identifier))
+              right: (identifier))
+            right: (identifier))
+          right: (identifier)))
+      (expression_statement
+        (assignment_expression
+          left: (identifier)
+          right: (binary_expression
+            left: (binary_expression
+              left: (binary_expression
+                left: (binary_expression
+                  left: (binary_expression
+                    left: (binary_expression
+                      left: (binary_expression
+                        left: (identifier)
+                        right: (identifier))
+                      right: (identifier))
+                    right: (identifier))
+                  right: (identifier))
+                right: (identifier))
+              right: (identifier))
+            right: (identifier))))
+      (let_statement
+        pattern: (wildcard_pattern)
+        value: (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (identifier))))
+      (return_statement
+        value: (identifier)))))

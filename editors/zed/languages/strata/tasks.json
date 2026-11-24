@@ -1,0 +1,36 @@
+[
+  {
+    "label": "Strata: Run Simulation Tests ($ZED_FILENAME)",
+    "command": "stratac",
+    "args": ["test", "$ZED_FILE"],
+    "tags": ["strata-test"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Strata: Check Module ($ZED_FILENAME)",
+    "command": "stratac",
+    "args": ["check", "$ZED_FILE"],
+    "tags": ["strata-module"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "Strata: Solve AbiPod Layouts ($ZED_FILENAME)",
+    "command": "stratac",
+    "args": ["layout", "$ZED_FILE"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "Strata: Explain Theorem 0.1 Concurrency ($ZED_FILENAME)",
+    "command": "stratac",
+    "args": ["explain-par", "$ZED_FILE"],
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  }
+]

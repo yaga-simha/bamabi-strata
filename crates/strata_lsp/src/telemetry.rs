@@ -11,7 +11,8 @@ pub use bamabi_sys::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{BuildHasher, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -193,6 +194,7 @@ impl From<TelemetrySliceError> for TelemetryError {
 }
 
 /// Decodes and validates a canonical 64-byte little-endian [`SystemTelemetryDigest64`] wire packet.
+#[inline]
 pub fn decode_digest_slice(bytes: &[u8]) -> Result<SystemTelemetryDigest64, TelemetryError> {
     SystemTelemetryDigest64::from_le_slice(bytes).map_err(TelemetryError::from)
 }
@@ -371,6 +373,41 @@ pub fn parse_brp_schema_json(payload: &str) -> Result<Vec<BrpSchemaEntry>, Telem
     ))
 }
 
+/// Pass-through hasher for keys that are already uniform 64-bit FNV-1a digests (`system_hash`).
+#[derive(Debug, Default, Clone, Copy)]
+struct IdentityBuildHasher;
+
+#[derive(Default)]
+struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01B3) ^ u64::from(b);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+}
+
+impl BuildHasher for IdentityBuildHasher {
+    type Hasher = IdentityHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> Self::Hasher {
+        IdentityHasher(0)
+    }
+}
+
 /// Thread-safe store holding latest monotonic [`SystemTelemetryDigest64`] samples keyed by
 /// `system_hash` together with ingested BRP component schemas.
 #[derive(Debug, Clone, Default)]
@@ -380,10 +417,11 @@ pub struct TelemetryStore {
 
 #[derive(Debug, Default)]
 struct TelemetryInner {
-    by_hash: BTreeMap<u64, SystemTelemetryDigest64>,
+    by_hash: HashMap<u64, SystemTelemetryDigest64, IdentityBuildHasher>,
     schemas: BTreeMap<String, BrpSchemaEntry>,
 }
 
+#[inline]
 fn insert_if_newer(guard: &mut TelemetryInner, digest: SystemTelemetryDigest64) {
     match guard.by_hash.get_mut(&digest.system_hash) {
         Some(existing) if existing.frame_seq > digest.frame_seq => {}
@@ -397,7 +435,12 @@ fn insert_if_newer(guard: &mut TelemetryInner, digest: SystemTelemetryDigest64) 
 impl TelemetryStore {
     /// Creates an empty [`TelemetryStore`].
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Arc::new(RwLock::new(TelemetryInner {
+                by_hash: HashMap::with_capacity_and_hasher(64, IdentityBuildHasher),
+                schemas: BTreeMap::new(),
+            })),
+        }
     }
 
     /// Ingests one raw 64-byte [`SystemTelemetryDigest64`] wire packet, preserving monotonic
@@ -475,6 +518,36 @@ impl TelemetryStore {
             if let Some(d) = guard.by_hash.get(&empty_mod_hash).copied() {
                 return Some((d, "bare"));
             }
+        }
+        None
+    }
+
+    /// Zero-allocation lookup for `(module_path, system_name)` checking the canonical
+    /// `fnv1a_64_hash_system(module_path, system_name)` first, then bare `system_name` and
+    /// unscoped `"" :: system_name`.
+    pub fn get_for_module_system(
+        &self,
+        module_path: &str,
+        system_name: &str,
+    ) -> Option<(SystemTelemetryDigest64, &'static str)> {
+        let Ok(guard) = self.inner.read() else {
+            return None;
+        };
+        let canon_hash = if system_name.contains("::") {
+            fnv1a_64_str(system_name)
+        } else {
+            fnv1a_64_hash_system(module_path, system_name)
+        };
+        if let Some(d) = guard.by_hash.get(&canon_hash).copied() {
+            return Some((d, "canonical"));
+        }
+        let short_hash = fnv1a_64_str(system_name);
+        if let Some(d) = guard.by_hash.get(&short_hash).copied() {
+            return Some((d, "bare"));
+        }
+        let empty_mod_hash = fnv1a_64_hash_system("", system_name);
+        if let Some(d) = guard.by_hash.get(&empty_mod_hash).copied() {
+            return Some((d, "bare"));
         }
         None
     }

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "strata",
+      "camelcase": "Strata",
+      "title": "Strata",
+      "scope": "source.strata",
+      "path": ".",
+      "file-types": [
+        "strata"
+      ],
+      "highlights": "queries/highlights.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.3.0",
+    "license": "MIT OR Apache-2.0",
+    "description": "Tree-sitter grammar for Strata v2.0",
+    "authors": [
+      {
+        "name": "bamabi authors"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/yaga-simha/bamabi-strata"
+    }
+  },
+  "bindings": {
+    "c": true,
+    "go": false,
+    "node": true,
+    "python": false,
+    "rust": true,
+    "swift": false,
+    "zig": false
+  }
+}

@@ -8,10 +8,15 @@
 //! live 64-byte [`SystemTelemetryDigest64`] (`"BAMT"`) IPC subscription, and `bam/*` BRP schema
 //! CodeLens annotations.
 
+pub mod ide;
 pub mod kani_proofs;
 pub mod server;
 pub mod telemetry;
 
+pub use ide::{
+    compute_completions, compute_definition, compute_document_highlights, compute_document_symbols,
+    compute_inlay_hints, compute_references, parse_telemetry_endpoint,
+};
 pub use server::{
     GraphNodeTelemetry, GraphTelemetryParams, GraphTelemetryResponse, IngestTelemetryParams,
     IngestTelemetryResponse, StrataLspBackend, TelemetryFrameInput, build_lsp_service,

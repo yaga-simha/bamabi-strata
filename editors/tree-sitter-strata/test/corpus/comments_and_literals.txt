@@ -1,0 +1,104 @@
+================================================================================
+Comments and doc comments
+================================================================================
+
+/// Outer doc comment
+//! Inner doc comment
+// Regular line comment
+/* Nested /* block /* comment */ here */ end */
+module demo::comments @version(1.0.0);
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (doc_comment)
+  (doc_comment)
+  (line_comment)
+  (block_comment)
+  (module_declaration
+    name: (path
+      segment: (identifier)
+      segment: (identifier))
+    (attribute
+      name: (identifier)
+      arguments: (attribute_argument_list
+        (attribute_argument
+          (semver))))))
+
+================================================================================
+Numeric, SI unit, boolean, char, and string literals
+================================================================================
+
+const DEC: u32 = 1_000_u32;
+const HEX: u64 = 0x2A_u64;
+const BIN: i16 = 0b1010_0101_i16;
+const OCT: u16 = 0o77_u16;
+const FLT: f32 = 3.14e-2_f32;
+const ACC: mps2 = -9.81_mps2;
+const RATE: hz = 60Hz;
+const DUR: sec = 50ms;
+const FLAG: bool = true;
+
+fn text_demo() -> str {
+    let ch = '\n';
+    return "hello\tworld\"!\x41";
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (const_declaration
+    name: (identifier)
+    type: (type_identifier)
+    value: (int_literal))
+  (const_declaration
+    name: (identifier)
+    type: (type_identifier)
+    value: (int_literal))
+  (const_declaration
+    name: (identifier)
+    type: (type_identifier)
+    value: (int_literal))
+  (const_declaration
+    name: (identifier)
+    type: (type_identifier)
+    value: (int_literal))
+  (const_declaration
+    name: (identifier)
+    type: (type_identifier)
+    value: (float_literal))
+  (const_declaration
+    name: (identifier)
+    type: (type_identifier)
+    value: (unary_expression
+      operand: (unit_literal)))
+  (const_declaration
+    name: (identifier)
+    type: (type_identifier)
+    value: (unit_literal))
+  (const_declaration
+    name: (identifier)
+    type: (type_identifier)
+    value: (unit_literal))
+  (const_declaration
+    name: (identifier)
+    type: (type_identifier)
+    value: (boolean_literal))
+  (fn_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    return_type: (type_identifier)
+    body: (block
+      (let_statement
+        pattern: (identifier_pattern
+          (identifier))
+        value: (char_literal
+          (escape_sequence)))
+      (return_statement
+        value: (string_literal
+          (string_content)
+          (escape_sequence)
+          (string_content)
+          (escape_sequence)
+          (string_content)
+          (escape_sequence))))))

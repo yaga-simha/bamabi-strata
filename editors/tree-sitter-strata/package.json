@@ -1,0 +1,41 @@
+{
+  "name": "tree-sitter-strata",
+  "version": "0.3.0",
+  "description": "Tree-sitter grammar for Strata v2.0",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yaga-simha/bamabi-strata.git",
+    "directory": "editors/tree-sitter-strata"
+  },
+  "keywords": [
+    "tree-sitter",
+    "parser",
+    "strata",
+    "ecs",
+    "bevy"
+  ],
+  "files": [
+    "grammar.js",
+    "tree-sitter.json",
+    "queries/*",
+    "src/**"
+  ],
+  "scripts": {
+    "generate": "tree-sitter generate --abi 14",
+    "test": "tree-sitter test",
+    "build:wasm": "tree-sitter build --wasm"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "^0.25.0"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.strata",
+      "file-types": [
+        "strata"
+      ],
+      "highlights": "queries/highlights.scm"
+    }
+  ]
+}

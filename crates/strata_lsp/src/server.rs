@@ -1,22 +1,37 @@
 //! `tower-lsp` [`LanguageServer`] implementation backed by `strata_sema` and `strata_syntax`.
 
+use crate::ide::{
+    DeclEntry, DocCommentIndex, DotCompletionIndex, IndexedWorkspaceSymbol, LineIndex,
+    build_all_inlay_hints, build_dot_completion_index, build_ident_token_index,
+    build_symbols_and_decls, build_workspace_symbols_for_doc, byte_offset_to_position,
+    compute_completions_cached, compute_definition_cached, compute_document_highlights_cached,
+    compute_references_cached, compute_rich_hover_with_index, filter_inlay_hints,
+    filter_workspace_symbols, needs_dot_completion_index, parse_telemetry_endpoint,
+    position_to_byte_offset,
+};
 use crate::telemetry::{
     SystemTelemetryDigest64, SystemTelemetryDigestJson, TELEMETRY_FLAG_QUARANTINED, TelemetryError,
-    TelemetryStore, decode_digest_slice,
+    TelemetryStore, TelemetrySubscription, decode_digest_slice, spawn_telemetry_subscriber,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use strata_sema::db::Setter;
 use strata_sema::{AnalyzedModule, SemaDb, Severity, SourceFile, analyze_source};
 use strata_syntax::fmt::format_source;
 use tower_lsp::jsonrpc::{Error as JsonRpcError, Result as LspResult};
 use tower_lsp::lsp_types::{
-    CodeLens, Command, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams, Hover,
-    HoverContents, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    MarkupContent, MarkupKind, MessageType, NumberOrString, Position, Range, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
+    CodeLens, Command, CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
+    DiagnosticSeverity, DidChangeConfigurationParams, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams, DocumentSymbol,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    InlayHint, InlayHintParams, Location, MessageType, NumberOrString, OneOf, Position, Range,
+    ReferenceParams, SaveOptions, ServerCapabilities, ServerInfo, SymbolInformation,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TextEdit, Url, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, ClientSocket, LanguageServer, LspService};
 
@@ -171,9 +186,196 @@ fn collect_document_node_ids(source: &str, analyzed: &AnalyzedModule) -> BTreeSe
     ids
 }
 
+struct DocEntry {
+    sf: SourceFile,
+    line_index: Option<Arc<LineIndex>>,
+    symbols_and_decls: Option<(Arc<Vec<DocumentSymbol>>, Arc<Vec<DeclEntry>>)>,
+    workspace_symbols: Option<(String, Arc<Vec<IndexedWorkspaceSymbol>>)>,
+    ident_tokens: Option<Arc<HashMap<String, Vec<(Range, bool)>>>>,
+    dot_index: Option<Arc<DotCompletionIndex>>,
+    doc_comments: Option<Arc<DocCommentIndex>>,
+    inlay_hints: Option<Arc<Vec<InlayHint>>>,
+    graph_node_ids: Option<(String, Arc<BTreeSet<String>>)>,
+}
+
+impl DocEntry {
+    fn new(sf: SourceFile) -> Self {
+        Self {
+            sf,
+            line_index: None,
+            symbols_and_decls: None,
+            workspace_symbols: None,
+            ident_tokens: None,
+            dot_index: None,
+            doc_comments: None,
+            inlay_hints: None,
+            graph_node_ids: None,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.line_index = None;
+        self.symbols_and_decls = None;
+        self.workspace_symbols = None;
+        self.ident_tokens = None;
+        self.dot_index = None;
+        self.doc_comments = None;
+        self.inlay_hints = None;
+        self.graph_node_ids = None;
+    }
+}
+
 struct LspState {
     db: SemaDb,
-    files: HashMap<Url, SourceFile>,
+    files: HashMap<Url, DocEntry>,
+}
+
+impl LspState {
+    fn upsert_document(&mut self, uri: &Url, text: String) -> SourceFile {
+        if let Some(entry) = self.files.get_mut(uri) {
+            let sf = entry.sf;
+            if sf.text(&self.db) != &text {
+                sf.set_text(&mut self.db).to(text);
+                entry.invalidate();
+            }
+            sf
+        } else {
+            let sf = self.db.new_source(uri.to_string(), text);
+            self.files.insert(uri.clone(), DocEntry::new(sf));
+            sf
+        }
+    }
+
+    fn ensure_line_index(&mut self, uri: &Url) -> Option<(SourceFile, Arc<LineIndex>)> {
+        let entry = self.files.get_mut(uri)?;
+        let sf = entry.sf;
+        if let Some(ref li) = entry.line_index {
+            return Some((sf, Arc::clone(li)));
+        }
+        let li = Arc::new(LineIndex::new(sf.text(&self.db)));
+        entry.line_index = Some(Arc::clone(&li));
+        Some((sf, li))
+    }
+
+    fn ensure_symbols_and_decls(
+        &mut self,
+        uri: &Url,
+    ) -> Option<(Arc<Vec<DocumentSymbol>>, Arc<Vec<DeclEntry>>)> {
+        if let Some(ref cached) = self.files.get(uri)?.symbols_and_decls {
+            return Some((Arc::clone(&cached.0), Arc::clone(&cached.1)));
+        }
+        let (sf, line_index) = self.ensure_line_index(uri)?;
+        let parsed = self.db.parse_file(sf);
+        let analyzed = self.db.analyze_file(sf);
+        let (syms, decls) =
+            build_symbols_and_decls(sf.text(&self.db), &line_index, &parsed.syntax(), &analyzed);
+        let pair = (Arc::new(syms), Arc::new(decls));
+        if let Some(entry) = self.files.get_mut(uri) {
+            entry.symbols_and_decls = Some((Arc::clone(&pair.0), Arc::clone(&pair.1)));
+        }
+        Some(pair)
+    }
+
+    fn ensure_workspace_symbols(
+        &mut self,
+        uri: &Url,
+    ) -> Option<(String, Arc<Vec<IndexedWorkspaceSymbol>>)> {
+        if let Some(ref cached) = self.files.get(uri)?.workspace_symbols {
+            return Some((cached.0.clone(), Arc::clone(&cached.1)));
+        }
+        let (_, decls) = self.ensure_symbols_and_decls(uri)?;
+        let sf = self.files.get(uri)?.sf;
+        let analyzed = self.db.analyze_file(sf);
+        let lower_mod = analyzed.module_path.to_ascii_lowercase();
+        let indexed = Arc::new(build_workspace_symbols_for_doc(
+            uri,
+            &analyzed.module_path,
+            &decls,
+        ));
+        if let Some(entry) = self.files.get_mut(uri) {
+            entry.workspace_symbols = Some((lower_mod.clone(), Arc::clone(&indexed)));
+        }
+        Some((lower_mod, indexed))
+    }
+
+    fn ensure_ident_tokens(
+        &mut self,
+        uri: &Url,
+    ) -> Option<Arc<HashMap<String, Vec<(Range, bool)>>>> {
+        if let Some(ref cached) = self.files.get(uri)?.ident_tokens {
+            return Some(Arc::clone(cached));
+        }
+        let (sf, line_index) = self.ensure_line_index(uri)?;
+        let parsed = self.db.parse_file(sf);
+        let tokens = Arc::new(build_ident_token_index(
+            sf.text(&self.db),
+            &line_index,
+            &parsed.syntax(),
+        ));
+        if let Some(entry) = self.files.get_mut(uri) {
+            entry.ident_tokens = Some(Arc::clone(&tokens));
+        }
+        Some(tokens)
+    }
+
+    fn ensure_dot_index(&mut self, uri: &Url) -> Option<Arc<DotCompletionIndex>> {
+        if let Some(ref cached) = self.files.get(uri)?.dot_index {
+            return Some(Arc::clone(cached));
+        }
+        let sf = self.files.get(uri)?.sf;
+        let parsed = self.db.parse_file(sf);
+        let idx = Arc::new(build_dot_completion_index(&parsed.syntax()));
+        if let Some(entry) = self.files.get_mut(uri) {
+            entry.dot_index = Some(Arc::clone(&idx));
+        }
+        Some(idx)
+    }
+
+    fn ensure_doc_comments(&mut self, uri: &Url) -> Option<Arc<DocCommentIndex>> {
+        if let Some(ref cached) = self.files.get(uri)?.doc_comments {
+            return Some(Arc::clone(cached));
+        }
+        let sf = self.files.get(uri)?.sf;
+        let parsed = self.db.parse_file(sf);
+        let idx = Arc::new(DocCommentIndex::build(&parsed.syntax()));
+        if let Some(entry) = self.files.get_mut(uri) {
+            entry.doc_comments = Some(Arc::clone(&idx));
+        }
+        Some(idx)
+    }
+
+    fn ensure_inlay_hints(&mut self, uri: &Url) -> Option<Arc<Vec<InlayHint>>> {
+        if let Some(ref cached) = self.files.get(uri)?.inlay_hints {
+            return Some(Arc::clone(cached));
+        }
+        let (sf, line_index) = self.ensure_line_index(uri)?;
+        let parsed = self.db.parse_file(sf);
+        let analyzed = self.db.analyze_file(sf);
+        let hints = Arc::new(build_all_inlay_hints(
+            sf.text(&self.db),
+            &line_index,
+            &parsed.syntax(),
+            &analyzed,
+        ));
+        if let Some(entry) = self.files.get_mut(uri) {
+            entry.inlay_hints = Some(Arc::clone(&hints));
+        }
+        Some(hints)
+    }
+
+    fn ensure_graph_node_ids(&mut self, uri: &Url) -> Option<(String, Arc<BTreeSet<String>>)> {
+        if let Some(ref cached) = self.files.get(uri)?.graph_node_ids {
+            return Some((cached.0.clone(), Arc::clone(&cached.1)));
+        }
+        let sf = self.files.get(uri)?.sf;
+        let analyzed = self.db.analyze_file(sf);
+        let mp = analyzed.module_path.clone();
+        let ids = Arc::new(collect_document_node_ids(sf.text(&self.db), &analyzed));
+        if let Some(entry) = self.files.get_mut(uri) {
+            entry.graph_node_ids = Some((mp.clone(), Arc::clone(&ids)));
+        }
+        Some((mp, ids))
+    }
 }
 
 /// `tower-lsp` backend for Strata v2.0 `.strata` source files.
@@ -181,6 +383,7 @@ pub struct StrataLspBackend {
     client: Option<Client>,
     state: Arc<Mutex<LspState>>,
     telemetry: TelemetryStore,
+    telemetry_sub: Mutex<Option<TelemetrySubscription>>,
 }
 
 impl StrataLspBackend {
@@ -194,6 +397,7 @@ impl StrataLspBackend {
                 files: HashMap::new(),
             })),
             telemetry: TelemetryStore::new(),
+            telemetry_sub: Mutex::new(None),
         }
     }
 
@@ -207,6 +411,19 @@ impl StrataLspBackend {
                 files: HashMap::new(),
             })),
             telemetry,
+            telemetry_sub: Mutex::new(None),
+        }
+    }
+
+    fn apply_telemetry_config(&self, settings: &serde_json::Value) {
+        let Some(endpoint) = parse_telemetry_endpoint(settings) else {
+            return;
+        };
+        if let Ok(mut guard) = self.telemetry_sub.lock() {
+            if let Some(prev) = guard.take() {
+                prev.signal_stop();
+            }
+            *guard = Some(spawn_telemetry_subscriber(endpoint, self.telemetry.clone()));
         }
     }
 
@@ -262,14 +479,12 @@ impl StrataLspBackend {
         }
 
         let (module_path, known_ids) = if let Some(ref uri) = parsed_uri {
-            let guard = self
+            let mut guard = self
                 .state
                 .lock()
                 .map_err(|_| JsonRpcError::internal_error())?;
-            if let Some(&sf) = guard.files.get(uri) {
-                let analyzed = guard.db.analyze_file(sf);
-                let ids = collect_document_node_ids(sf.text(&guard.db), &analyzed);
-                (Some(analyzed.module_path.clone()), Some(ids))
+            if let Some((mp, ids)) = guard.ensure_graph_node_ids(uri) {
+                (Some(mp), Some(ids))
             } else {
                 (None, None)
             }
@@ -277,28 +492,18 @@ impl StrataLspBackend {
             (None, None)
         };
 
-        let targets: Vec<String> = match (params.node_ids, known_ids) {
-            (Some(requested), Some(known)) => requested
-                .into_iter()
-                .filter(|id| known.contains(id))
-                .collect(),
-            (Some(requested), None) => requested,
-            (None, Some(known)) => known.into_iter().collect(),
-            (None, None) => Vec::new(),
-        };
-
         let mut nodes = BTreeMap::new();
-        let mod_prefix = module_path.as_deref().map(|mp| format!("{mp}::"));
-        for node_id in targets {
-            let bare = mod_prefix
-                .as_deref()
-                .and_then(|prefix| node_id.strip_prefix(prefix))
+        let mp_ref = module_path.as_deref();
+        let mut record_node = |node_id: &str| {
+            let bare = mp_ref
+                .and_then(|mp| node_id.strip_prefix(mp)?.strip_prefix("::"))
                 .or_else(|| node_id.rsplit("::").next());
-            if let Some((digest, matched_by)) = self.telemetry.get_for_node(&node_id, bare) {
+            if let Some((digest, matched_by)) = self.telemetry.get_for_node(node_id, bare) {
+                let owned_id = node_id.to_owned();
                 nodes.insert(
-                    node_id.clone(),
+                    owned_id.clone(),
                     GraphNodeTelemetry {
-                        node_id,
+                        node_id: owned_id,
                         system_hash: digest.system_hash,
                         mod_id: digest.mod_id,
                         frame_seq: digest.frame_seq,
@@ -315,6 +520,27 @@ impl StrataLspBackend {
                     },
                 );
             }
+        };
+
+        match (params.node_ids, known_ids) {
+            (Some(requested), Some(known)) => {
+                for id in &requested {
+                    if known.contains(id) {
+                        record_node(id);
+                    }
+                }
+            }
+            (Some(requested), None) => {
+                for id in &requested {
+                    record_node(id);
+                }
+            }
+            (None, Some(known)) => {
+                for id in known.iter() {
+                    record_node(id);
+                }
+            }
+            (None, None) => {}
         }
 
         Ok(GraphTelemetryResponse {
@@ -359,81 +585,18 @@ pub fn build_lsp_service() -> (LspService<StrataLspBackend>, ClientSocket) {
         .finish()
 }
 
-/// Maps UTF-8 byte offsets into LSP `(line, utf16_col)` coordinates.
-fn byte_offset_to_position(source: &str, byte_offset: u32) -> Position {
-    let clamped = (byte_offset as usize).min(source.len());
-    let mut line = 0u32;
-    let mut col = 0u32;
-    for (idx, ch) in source.char_indices() {
-        if idx >= clamped {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += ch.len_utf16() as u32;
-        }
-    }
-    Position::new(line, col)
-}
-
-fn position_to_byte_offset(source: &str, pos: Position) -> usize {
-    let mut cur_line = 0u32;
-    let mut cur_col = 0u32;
-    for (idx, ch) in source.char_indices() {
-        if cur_line == pos.line && cur_col >= pos.character {
-            return idx;
-        }
-        if cur_line > pos.line {
-            return idx;
-        }
-        if ch == '\n' {
-            if cur_line == pos.line {
-                return idx;
-            }
-            cur_line += 1;
-            cur_col = 0;
-        } else {
-            cur_col += ch.len_utf16() as u32;
-        }
-    }
-    source.len()
-}
-
-fn word_at_position(source: &str, pos: Position) -> Option<String> {
-    let off = position_to_byte_offset(source, pos);
-    let bytes = source.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    let idx = off.min(bytes.len() - 1);
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let pivot = if is_ident(bytes[idx]) {
-        idx
-    } else if idx > 0 && is_ident(bytes[idx - 1]) {
-        idx - 1
-    } else {
-        return None;
-    };
-    let mut start = pivot;
-    while start > 0 && is_ident(bytes[start - 1]) {
-        start -= 1;
-    }
-    let mut end = pivot + 1;
-    while end < bytes.len() && is_ident(bytes[end]) {
-        end += 1;
-    }
-    Some(source[start..end].to_owned())
-}
-
 fn diagnostics_from_analyzed(source: &str, analyzed: &AnalyzedModule) -> Vec<Diagnostic> {
+    if analyzed.diagnostics.is_empty() {
+        return Vec::new();
+    }
+    let line_index = LineIndex::new(source);
     analyzed
         .diagnostics
         .iter()
         .map(|d| {
-            let start = byte_offset_to_position(source, d.span.byte_start);
-            let end = byte_offset_to_position(source, d.span.byte_end.max(d.span.byte_start + 1));
+            let start = line_index.byte_offset_to_position(source, d.span.byte_start);
+            let end = line_index
+                .byte_offset_to_position(source, d.span.byte_end.max(d.span.byte_start + 1));
             let severity = match d.severity {
                 Severity::Error => DiagnosticSeverity::ERROR,
                 Severity::Warning => DiagnosticSeverity::WARNING,
@@ -461,77 +624,27 @@ pub fn compute_diagnostics(source: &str) -> Vec<Diagnostic> {
     diagnostics_from_analyzed(source, &analyzed)
 }
 
-fn compute_hover_from_analyzed(
-    source: &str,
-    pos: Position,
-    analyzed: &AnalyzedModule,
-) -> Option<Hover> {
-    let ident = word_at_position(source, pos)?;
-
-    if let Some((_, layout)) = analyzed.layouts.iter().find(|(k, l)| {
-        *k == &ident
-            || l.canonical_name == ident
-            || l.canonical_name.rsplit("::").next() == Some(ident.as_str())
-    }) {
-        let md = format!(
-            "### `{}` (`{:?}`)\n\n\
-             - **Size:** `{} B` (`align {} B`)\n\
-             - **AbiPod:** `{}` (explicit padding: `{} B`)\n\
-             - **ComponentUuid:** `{}`\n\
-             - **Schema Fingerprint:** `0x{:016X}`",
-            layout.canonical_name,
-            layout.item_kind,
-            layout.size,
-            layout.align,
-            layout.is_abi_pod,
-            layout.explicit_pad_bytes,
-            layout.uuid_hex,
-            layout.schema_fingerprint
-        );
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: md,
-            }),
-            range: None,
-        });
-    }
-
-    if let Some(callable) = analyzed.callables.iter().find(|c| c.name == ident) {
-        let par_info = callable.par_chunk.map_or_else(
-            || "sequential".to_owned(),
-            |c| format!("`@par(chunk = {c})`"),
-        );
-        let md = format!(
-            "### `{} {}`\n\n\
-             - **Scheduling:** {}\n\
-             - **Queries:** `{}` | **Resources:** `{}` reads / `{}` writes",
-            if callable.is_observer { "obs" } else { "sys" },
-            callable.name,
-            par_info,
-            callable.access.queries.len(),
-            callable.access.res_reads.len(),
-            callable.access.res_writes.len(),
-        );
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: md,
-            }),
-            range: None,
-        });
-    }
-
-    None
-}
-
 /// Computes Markdown hover information showing solved `size`, `align`, `ComponentUuid`,
-/// `SCHEMA_FINGERPRINT`, explicit padding, or callable concurrency summary.
+/// `SCHEMA_FINGERPRINT`, explicit padding, field offsets, doc comments, `@attributes`,
+/// built-in types, keywords, or callable/function/enum/RPC summaries.
 #[must_use]
 pub fn compute_hover(source: &str, pos: Position) -> Option<Hover> {
-    let _ = word_at_position(source, pos)?;
+    let line_index = LineIndex::new(source);
+    let _ = line_index.word_at_position(source, pos)?;
+    let parsed = strata_syntax::parse(source);
+    let root = parsed.syntax();
+    let doc_comments = DocCommentIndex::build(&root);
     let analyzed = analyze_source("buffer.strata", source);
-    compute_hover_from_analyzed(source, pos, &analyzed)
+    let empty_telemetry = TelemetryStore::new();
+    compute_rich_hover_with_index(
+        source,
+        &line_index,
+        pos,
+        &analyzed,
+        &empty_telemetry,
+        Some(&doc_comments),
+        Some(&root),
+    )
 }
 
 /// Computes full-document `stratafmt` formatting edits when source differs from canonical output.
@@ -552,50 +665,52 @@ pub fn compute_formatting(source: &str) -> Vec<TextEdit> {
 
 fn compute_code_lenses_from_analyzed(
     source: &str,
+    line_index: &LineIndex,
     analyzed: &AnalyzedModule,
     telemetry: &TelemetryStore,
 ) -> Vec<CodeLens> {
-    let mut lenses = Vec::new();
+    let mut lenses = Vec::with_capacity(analyzed.callables.len());
 
     for callable in &analyzed.callables {
-        let pos = byte_offset_to_position(source, callable.byte_range.0);
+        let pos = line_index.byte_offset_to_position(source, callable.byte_range.0);
         let range = Range::new(pos, pos);
 
-        let par_tag = match callable.par_chunk {
-            Some(c) if callable.par_read_only => format!("@par(read_only, chunk={c})"),
-            Some(c) => format!("@par(chunk={c})"),
-            None => {
-                let conflict_cnt = analyzed
-                    .concurrency_graph
-                    .conflicts
-                    .iter()
-                    .filter(|e| e.system_a == callable.name || e.system_b == callable.name)
-                    .count();
-                format!("seq (conflicts={conflict_cnt})")
-            }
-        };
-
-        let canonical_id = qualify_node_id(&analyzed.module_path, &callable.name);
-        let title = if let Some((t, _)) =
-            telemetry.get_for_node(&canonical_id, Some(&callable.name))
+        let mut title = String::with_capacity(96);
+        if let Some((t, _)) = telemetry.get_for_module_system(&analyzed.module_path, &callable.name)
         {
+            write_par_tag(
+                &mut title,
+                callable.par_chunk,
+                callable.par_read_only,
+                &callable.name,
+                analyzed,
+            );
             let q_tag = if (t.flags & TELEMETRY_FLAG_QUARANTINED) != 0 {
                 " [QUARANTINED]"
             } else {
                 ""
             };
-            format!(
-                "{par_tag} | p50: {} us | p99: {} us | entities: {} | tables: {} | skipped: {} | cmds: {}{q_tag}",
+            let _ = write!(
+                title,
+                " | p50: {} us | p99: {} us | entities: {} | tables: {} | skipped: {} | cmds: {}{q_tag}",
                 t.p50_us,
                 t.p99_us,
                 t.matched_entities,
                 t.matched_tables,
                 t.skipped_summary_tick_tables,
                 t.commands_queued
-            )
+            );
         } else {
-            format!("strata: {par_tag} (no live telemetry)")
-        };
+            title.push_str("strata: ");
+            write_par_tag(
+                &mut title,
+                callable.par_chunk,
+                callable.par_read_only,
+                &callable.name,
+                analyzed,
+            );
+            title.push_str(" (no live telemetry)");
+        }
 
         lenses.push(CodeLens {
             range,
@@ -611,30 +726,81 @@ fn compute_code_lenses_from_analyzed(
     lenses
 }
 
+fn write_par_tag(
+    out: &mut String,
+    par_chunk: Option<u32>,
+    par_read_only: bool,
+    callable_name: &str,
+    analyzed: &AnalyzedModule,
+) {
+    match par_chunk {
+        Some(c) if par_read_only => {
+            let _ = write!(out, "@par(read_only, chunk={c})");
+        }
+        Some(c) => {
+            let _ = write!(out, "@par(chunk={c})");
+        }
+        None => {
+            let conflict_cnt = analyzed
+                .concurrency_graph
+                .conflicts
+                .iter()
+                .filter(|e| e.system_a == callable_name || e.system_b == callable_name)
+                .count();
+            let _ = write!(out, "seq (conflicts={conflict_cnt})");
+        }
+    }
+}
+
 /// Computes CodeLens annotations showing Theorem 0.1 `@par` concurrency and live
 /// `SystemTelemetryDigest64` frame timings / heap allocation counters.
 #[must_use]
 pub fn compute_code_lenses(source: &str, telemetry: &TelemetryStore) -> Vec<CodeLens> {
     let analyzed = analyze_source("buffer.strata", source);
-    compute_code_lenses_from_analyzed(source, &analyzed, telemetry)
+    let line_index = LineIndex::new(source);
+    compute_code_lenses_from_analyzed(source, &line_index, &analyzed, telemetry)
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for StrataLspBackend {
-    async fn initialize(&self, _: InitializeParams) -> LspResult<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
+        if let Some(opts) = params.initialization_options.as_ref() {
+            self.apply_telemetry_config(opts);
+        }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                            include_text: Some(true),
+                        })),
+                        ..TextDocumentSyncOptions::default()
+                    },
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
-                document_formatting_provider: Some(tower_lsp::lsp_types::OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".to_owned(), ":".to_owned(), "@".to_owned()]),
+                    resolve_provider: Some(false),
+                    ..CompletionOptions::default()
+                }),
+                definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
+                inlay_hint_provider: Some(OneOf::Left(true)),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 code_lens_provider: Some(tower_lsp::lsp_types::CodeLensOptions {
                     resolve_provider: Some(false),
                 }),
                 ..ServerCapabilities::default()
             },
-            ..InitializeResult::default()
+            server_info: Some(ServerInfo {
+                name: "strata-lsp".to_owned(),
+                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            }),
         })
     }
 
@@ -647,7 +813,16 @@ impl LanguageServer for StrataLspBackend {
     }
 
     async fn shutdown(&self) -> LspResult<()> {
+        if let Ok(mut guard) = self.telemetry_sub.lock()
+            && let Some(sub) = guard.take()
+        {
+            sub.signal_stop();
+        }
         Ok(())
+    }
+
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        self.apply_telemetry_config(&params.settings);
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -657,16 +832,7 @@ impl LanguageServer for StrataLspBackend {
             .state
             .lock()
             .map(|mut state| {
-                let sf = if let Some(&existing) = state.files.get(&uri) {
-                    if existing.text(&state.db) != &text {
-                        existing.set_text(&mut state.db).to(text);
-                    }
-                    existing
-                } else {
-                    let sf = state.db.new_source(uri.to_string(), text);
-                    state.files.insert(uri.clone(), sf);
-                    sf
-                };
+                let sf = state.upsert_document(&uri, text);
                 let analyzed = state.db.analyze_file(sf);
                 diagnostics_from_analyzed(sf.text(&state.db), &analyzed)
             })
@@ -695,7 +861,7 @@ impl LanguageServer for StrataLspBackend {
                     let mut buf = state
                         .files
                         .get(&uri)
-                        .map(|&sf| sf.text(&state.db).clone())
+                        .map(|entry| entry.sf.text(&state.db).clone())
                         .unwrap_or_default();
                     for change in params.content_changes {
                         if let Some(range) = change.range {
@@ -709,21 +875,29 @@ impl LanguageServer for StrataLspBackend {
                     buf
                 };
 
-                let sf = if let Some(&existing) = state.files.get(&uri) {
-                    if existing.text(&state.db) != &new_text {
-                        existing.set_text(&mut state.db).to(new_text);
-                    }
-                    existing
-                } else {
-                    let sf = state.db.new_source(uri.to_string(), new_text);
-                    state.files.insert(uri.clone(), sf);
-                    sf
-                };
+                let sf = state.upsert_document(&uri, new_text);
                 let analyzed = state.db.analyze_file(sf);
                 diagnostics_from_analyzed(sf.text(&state.db), &analyzed)
             })
             .unwrap_or_default();
         self.publish_diagnostics(uri, diags).await;
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let diags = self.state.lock().ok().and_then(|mut state| {
+            if let Some(text) = params.text {
+                let sf = state.upsert_document(&uri, text);
+                let analyzed = state.db.analyze_file(sf);
+                return Some(diagnostics_from_analyzed(sf.text(&state.db), &analyzed));
+            }
+            let sf = state.files.get(&uri)?.sf;
+            let analyzed = state.db.analyze_file(sf);
+            Some(diagnostics_from_analyzed(sf.text(&state.db), &analyzed))
+        });
+        if let Some(diags) = diags {
+            self.publish_diagnostics(uri, diags).await;
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -735,13 +909,204 @@ impl LanguageServer for StrataLspBackend {
     async fn hover(&self, params: tower_lsp::lsp_types::HoverParams) -> LspResult<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let result = self.state.lock().ok().and_then(|state| {
-            let sf = state.files.get(uri).copied()?;
-            let text = sf.text(&state.db);
-            let _ = word_at_position(text, pos)?;
+        let result = self.state.lock().ok().and_then(|mut state| {
+            let (sf, line_index) = state.ensure_line_index(uri)?;
+            let _ = line_index.word_at_position(sf.text(&state.db), pos)?;
+            let doc_comments = state.ensure_doc_comments(uri)?;
+            let parsed = state.db.parse_file(sf);
+            let root = parsed.syntax();
+            let analyzed = state.db.analyze_file(sf);
+            compute_rich_hover_with_index(
+                sf.text(&state.db),
+                &line_index,
+                pos,
+                &analyzed,
+                &self.telemetry,
+                Some(doc_comments.as_ref()),
+                Some(&root),
+            )
+        });
+        Ok(result)
+    }
+
+    async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let result = self.state.lock().ok().and_then(|mut state| {
+            let (sf, line_index) = state.ensure_line_index(uri)?;
+            let need_dot = needs_dot_completion_index(sf.text(&state.db), &line_index, pos);
+            let dot_index = if need_dot {
+                state.ensure_dot_index(uri)
+            } else {
+                None
+            };
             let _cst = state.db.parse_file(sf);
             let analyzed = state.db.analyze_file(sf);
-            compute_hover_from_analyzed(text, pos, &analyzed)
+            let items = compute_completions_cached(
+                sf.text(&state.db),
+                &line_index,
+                pos,
+                &analyzed,
+                dot_index.as_deref(),
+            );
+            Some(CompletionResponse::Array(items))
+        });
+        Ok(result)
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> LspResult<Option<GotoDefinitionResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let result = self.state.lock().ok().and_then(|mut state| {
+            let (sf, line_index) = state.ensure_line_index(uri)?;
+            let (_, active_decls) = state.ensure_symbols_and_decls(uri)?;
+            let parsed = state.db.parse_file(sf);
+            let root = parsed.syntax();
+            if let Some(loc) = compute_definition_cached(
+                uri,
+                sf.text(&state.db),
+                &line_index,
+                &root,
+                &active_decls,
+                &[],
+                pos,
+            ) {
+                return Some(GotoDefinitionResponse::Scalar(loc));
+            }
+            if state.files.len() <= 1 {
+                return None;
+            }
+            let other_uris: Vec<Url> = state
+                .files
+                .keys()
+                .filter(|other_uri| *other_uri != uri)
+                .cloned()
+                .collect();
+            let mut other_decls_owned: Vec<(Url, Arc<Vec<DeclEntry>>)> =
+                Vec::with_capacity(other_uris.len());
+            for other_uri in other_uris {
+                if let Some((_, decls)) = state.ensure_symbols_and_decls(&other_uri) {
+                    other_decls_owned.push((other_uri, decls));
+                }
+            }
+            let other_refs: Vec<(&Url, &[DeclEntry])> = other_decls_owned
+                .iter()
+                .map(|(u, d)| (u, d.as_slice()))
+                .collect();
+            compute_definition_cached(
+                uri,
+                sf.text(&state.db),
+                &line_index,
+                &root,
+                &active_decls,
+                &other_refs,
+                pos,
+            )
+            .map(GotoDefinitionResponse::Scalar)
+        });
+        Ok(result)
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> LspResult<Option<Vec<DocumentHighlight>>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let result = self.state.lock().ok().and_then(|mut state| {
+            let (sf, line_index) = state.ensure_line_index(uri)?;
+            let ident_tokens = state.ensure_ident_tokens(uri)?;
+            let highlights = compute_document_highlights_cached(
+                sf.text(&state.db),
+                &line_index,
+                &ident_tokens,
+                pos,
+            );
+            Some(highlights)
+        });
+        Ok(result)
+    }
+
+    async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let include_decl = params.context.include_declaration;
+        let result = self.state.lock().ok().and_then(|mut state| {
+            let (sf, line_index) = state.ensure_line_index(uri)?;
+            let active_tokens = state.ensure_ident_tokens(uri)?;
+            let other_uris: Vec<Url> = state
+                .files
+                .keys()
+                .filter(|other_uri| *other_uri != uri)
+                .cloned()
+                .collect();
+            let mut other_tokens_owned: Vec<(Url, Arc<HashMap<String, Vec<(Range, bool)>>>)> =
+                Vec::with_capacity(other_uris.len());
+            for other_uri in other_uris {
+                if let Some(tokens) = state.ensure_ident_tokens(&other_uri) {
+                    other_tokens_owned.push((other_uri, tokens));
+                }
+            }
+            let other_refs: Vec<(&Url, &HashMap<String, Vec<(Range, bool)>>)> = other_tokens_owned
+                .iter()
+                .map(|(u, t)| (u, t.as_ref()))
+                .collect();
+            Some(compute_references_cached(
+                uri,
+                sf.text(&state.db),
+                &line_index,
+                &active_tokens,
+                &other_refs,
+                pos,
+                include_decl,
+            ))
+        });
+        Ok(result)
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> LspResult<Option<DocumentSymbolResponse>> {
+        let uri = &params.text_document.uri;
+        let result = self.state.lock().ok().and_then(|mut state| {
+            let (syms, _) = state.ensure_symbols_and_decls(uri)?;
+            Some(DocumentSymbolResponse::Nested(syms.as_ref().clone()))
+        });
+        Ok(result)
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> LspResult<Option<Vec<SymbolInformation>>> {
+        let result = self.state.lock().ok().map(|mut state| {
+            let uris: Vec<Url> = state.files.keys().cloned().collect();
+            let mut docs_owned: Vec<(String, Arc<Vec<IndexedWorkspaceSymbol>>)> =
+                Vec::with_capacity(uris.len());
+            for uri in &uris {
+                if let Some(entry) = state.ensure_workspace_symbols(uri) {
+                    docs_owned.push(entry);
+                }
+            }
+            let doc_refs: Vec<(&str, &[IndexedWorkspaceSymbol])> = docs_owned
+                .iter()
+                .map(|(mp, syms)| (mp.as_str(), syms.as_slice()))
+                .collect();
+            filter_workspace_symbols(&doc_refs, &params.query)
+        });
+        Ok(result)
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> LspResult<Option<Vec<InlayHint>>> {
+        let uri = &params.text_document.uri;
+        let range = params.range;
+        let result = self.state.lock().ok().and_then(|mut state| {
+            let hints = state.ensure_inlay_hints(uri)?;
+            Some(filter_inlay_hints(&hints, range))
         });
         Ok(result)
     }
@@ -752,7 +1117,7 @@ impl LanguageServer for StrataLspBackend {
     ) -> LspResult<Option<Vec<TextEdit>>> {
         let uri = &params.text_document.uri;
         let result = self.state.lock().ok().and_then(|state| {
-            let sf = state.files.get(uri).copied()?;
+            let sf = state.files.get(uri)?.sf;
             Some(compute_formatting(sf.text(&state.db)))
         });
         Ok(result)
@@ -763,12 +1128,13 @@ impl LanguageServer for StrataLspBackend {
         params: tower_lsp::lsp_types::CodeLensParams,
     ) -> LspResult<Option<Vec<CodeLens>>> {
         let uri = &params.text_document.uri;
-        let result = self.state.lock().ok().and_then(|state| {
-            let sf = state.files.get(uri).copied()?;
+        let result = self.state.lock().ok().and_then(|mut state| {
+            let (sf, line_index) = state.ensure_line_index(uri)?;
             let _cst = state.db.parse_file(sf);
             let analyzed = state.db.analyze_file(sf);
             Some(compute_code_lenses_from_analyzed(
                 sf.text(&state.db),
+                &line_index,
                 &analyzed,
                 &self.telemetry,
             ))

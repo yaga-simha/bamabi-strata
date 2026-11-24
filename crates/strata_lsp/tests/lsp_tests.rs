@@ -1122,3 +1122,405 @@ async fn fetch_brp_component_schemas_parses_live_http_response() {
     let err = strata_lsp::decode_digest_slice(&[0u8; 64]);
     assert!(matches!(err, Err(TelemetryError::InvalidMagic { .. })));
 }
+
+#[test]
+fn ide_symbols_definition_references_highlights_completions_and_inlay_hints() {
+    use strata_lsp::{
+        compute_completions, compute_definition, compute_document_highlights,
+        compute_document_symbols, compute_inlay_hints, compute_references,
+        parse_telemetry_endpoint,
+    };
+    use tower_lsp::lsp_types::{DocumentHighlightKind, InlayHintLabel, Range, SymbolKind, Url};
+
+    let src = r#"module demo::zed_ide @version(1.0.0);
+
+enum Stance {
+    Idle = 0,
+    Guard = 1,
+}
+
+// Pos2D mentioned inside comment must not show up in references
+component Pos2D {
+    xy: vec2 = vec2::ZERO,
+}
+
+@node_pure
+fn double_x(v: f32) -> f32 {
+    return v * 2.0;
+}
+
+@par(chunk = 256)
+sys move_all() {
+    let s = Stance::Guard;
+    for e in query(p: &mut Pos2D) {
+        e.p.xy.x = double_x(e.p.xy.x);
+    }
+}
+
+schedule FixedUpdate { move_all }
+"#;
+
+    let uri = Url::parse("file:///workspace/demo.strata").expect("valid uri");
+
+    // 1. Hierarchical document symbols
+    let syms = compute_document_symbols(src);
+    assert!(
+        syms.iter()
+            .any(|s| s.name == "Pos2D" && s.kind == SymbolKind::STRUCT)
+    );
+    let stance_sym = syms
+        .iter()
+        .find(|s| s.name == "Stance" && s.kind == SymbolKind::ENUM)
+        .expect("enum symbol");
+    let variants = stance_sym.children.as_ref().expect("enum variants");
+    assert_eq!(variants.len(), 2);
+    assert_eq!(variants[1].name, "Guard");
+
+    // 2. Go-to-definition on `Pos2D` inside `query(p: &mut Pos2D)` (line 20)
+    let pos2d_usage = Position::new(20, 29);
+    let def = compute_definition(src, &uri, pos2d_usage).expect("Pos2D definition");
+    assert_eq!(def.uri, uri);
+    assert_eq!(def.range.start.line, 8);
+
+    // Qualified enum variant definition on `Stance::Guard` (line 19)
+    let guard_usage = Position::new(19, 21);
+    let guard_def = compute_definition(src, &uri, guard_usage).expect("Guard definition");
+    assert_eq!(guard_def.range.start.line, 4);
+
+    // 3. Document highlights & references skip comments and mark WRITE vs READ
+    let highlights = compute_document_highlights(src, pos2d_usage);
+    assert_eq!(highlights.len(), 2);
+    assert_eq!(highlights[0].kind, Some(DocumentHighlightKind::WRITE));
+    assert_eq!(highlights[1].kind, Some(DocumentHighlightKind::READ));
+
+    let refs_without_decl = compute_references(src, &uri, pos2d_usage, false);
+    assert_eq!(refs_without_decl.len(), 1);
+    assert_eq!(refs_without_decl[0].range.start.line, 20);
+
+    // 4. Context-aware completions (`@`, `::`, `.`, general)
+    let attr_src = "module a::b @version(1.0.0);\n@p";
+    let attr_items = compute_completions(attr_src, Position::new(1, 2));
+    assert!(attr_items.iter().any(|i| i.label == "par"));
+    assert!(attr_items.iter().any(|i| i.label == "persist"));
+
+    let scope_src = format!("{src}\nfn t() {{ let x = Stance:: }}");
+    let scope_line = scope_src.lines().count() as u32 - 1;
+    let scope_col = scope_src.lines().last().unwrap().find("::").unwrap() as u32 + 2;
+    let scope_items = compute_completions(&scope_src, Position::new(scope_line, scope_col));
+    assert!(scope_items.iter().any(|i| i.label == "Idle"));
+    assert!(scope_items.iter().any(|i| i.label == "Guard"));
+
+    let dot_src =
+        format!("{src}\nsys probe() {{ for e in query(p: &mut Pos2D) {{ let _ = e.p. }} }}");
+    let dot_line = dot_src.lines().count() as u32 - 1;
+    let dot_col = dot_src.lines().last().unwrap().find("e.p.").unwrap() as u32 + 4;
+    let dot_items = compute_completions(&dot_src, Position::new(dot_line, dot_col));
+    assert!(
+        dot_items.iter().any(|i| i.label == "xy"),
+        "expected Pos2D field `xy` in dot completions: {dot_items:?}"
+    );
+
+    // 5. Inlay hints show AbiPod layout + `@par` badge
+    let hints = compute_inlay_hints(src, Range::new(Position::new(0, 0), Position::new(40, 0)));
+    assert!(hints.iter().any(|h| matches!(
+        &h.label,
+        InlayHintLabel::String(s) if s.contains("8 B") && s.contains("AbiPod")
+    )));
+    assert!(hints.iter().any(|h| matches!(
+        &h.label,
+        InlayHintLabel::String(s) if s.contains("@par(chunk=256)")
+    )));
+
+    // 6. Rich hover includes field table for components and signatures for fn/enum
+    let comp_hover = compute_hover(src, Position::new(8, 12)).expect("component hover");
+    assert!(comp_hover.range.is_some());
+    let HoverContents::Markup(m) = comp_hover.contents else {
+        panic!("expected markdown hover");
+    };
+    assert!(m.value.contains("| Offset | Field | Type | Size |"));
+    assert!(m.value.contains("`xy`"));
+
+    let fn_hover = compute_hover(src, Position::new(13, 5)).expect("fn hover");
+    let HoverContents::Markup(fn_m) = fn_hover.contents else {
+        panic!("expected markdown hover");
+    };
+    assert!(fn_m.value.contains("fn double_x(v: f32) -> f32"));
+    assert!(fn_m.value.contains("@node_pure"));
+
+    let enum_hover = compute_hover(src, Position::new(2, 7)).expect("enum hover");
+    let HoverContents::Markup(enum_m) = enum_hover.contents else {
+        panic!("expected markdown hover");
+    };
+    assert!(enum_m.value.contains("Guard = 1"));
+
+    // 7. Telemetry endpoint parsing from Zed settings JSON
+    let tcp_cfg = serde_json::json!({ "telemetryEndpoint": "tcp://127.0.0.1:15703" });
+    assert!(matches!(
+        parse_telemetry_endpoint(&tcp_cfg),
+        Some(TelemetryEndpoint::Tcp(_))
+    ));
+    let unix_cfg =
+        serde_json::json!({ "strata": { "telemetry_endpoint": "unix:///tmp/strata.sock" } });
+    assert!(matches!(
+        parse_telemetry_endpoint(&unix_cfg),
+        Some(TelemetryEndpoint::Unix(_))
+    ));
+}
+
+#[tokio::test]
+async fn lsp_backend_initialize_advertises_full_zed_capabilities() {
+    use strata_lsp::{StrataLspBackend, TelemetryStore};
+    use tower_lsp::LanguageServer;
+    use tower_lsp::lsp_types::{
+        DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse,
+        GotoDefinitionParams, GotoDefinitionResponse, InitializeParams, InlayHintParams, Position,
+        Range, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+        WorkspaceSymbolParams,
+    };
+
+    let backend = StrataLspBackend::headless(TelemetryStore::new());
+    let init = backend
+        .initialize(InitializeParams::default())
+        .await
+        .expect("initialize ok");
+    assert_eq!(
+        init.server_info.as_ref().map(|s| s.name.as_str()),
+        Some("strata-lsp")
+    );
+    assert!(init.capabilities.definition_provider.is_some());
+    assert!(init.capabilities.references_provider.is_some());
+    assert!(init.capabilities.document_highlight_provider.is_some());
+    assert!(init.capabilities.document_symbol_provider.is_some());
+    assert!(init.capabilities.workspace_symbol_provider.is_some());
+    assert!(init.capabilities.completion_provider.is_some());
+    assert!(init.capabilities.inlay_hint_provider.is_some());
+    assert!(init.capabilities.hover_provider.is_some());
+    assert!(init.capabilities.document_formatting_provider.is_some());
+    assert!(init.capabilities.code_lens_provider.is_some());
+
+    let uri_a = Url::parse("file:///workspace/a.strata").expect("uri_a");
+    let uri_b = Url::parse("file:///workspace/b.strata").expect("uri_b");
+
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri_a.clone(),
+                language_id: "strata".to_owned(),
+                version: 1,
+                text: "module demo::a @version(1.0.0);\ncomponent SharedHp { hp: f32 = 100.0 }\n"
+                    .to_owned(),
+            },
+        })
+        .await;
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri_b.clone(),
+                language_id: "strata".to_owned(),
+                version: 1,
+                text: "module demo::b @version(1.0.0);\nsys heal() { for e in query(h: &mut SharedHp) { e.h.hp += 1.0; } }\n"
+                    .to_owned(),
+            },
+        })
+        .await;
+
+    // Cross-file go-to-definition from b.strata -> a.strata::SharedHp
+    let def = backend
+        .goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri_b.clone() },
+                position: Position::new(1, 38),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("goto_definition ok");
+    let Some(GotoDefinitionResponse::Scalar(loc)) = def else {
+        panic!("expected cross-file definition location");
+    };
+    assert_eq!(loc.uri, uri_a);
+    assert_eq!(loc.range.start.line, 1);
+
+    // Workspace symbol search finds SharedHp across files
+    let ws_syms = backend
+        .symbol(WorkspaceSymbolParams {
+            query: "Shared".to_owned(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("workspace/symbol ok")
+        .unwrap_or_default();
+    assert!(ws_syms.iter().any(|s| s.name == "SharedHp"));
+
+    // Document symbols & inlay hints on a.strata
+    let doc_syms = backend
+        .document_symbol(DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri: uri_a.clone() },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("document_symbol ok");
+    assert!(matches!(doc_syms, Some(DocumentSymbolResponse::Nested(v)) if !v.is_empty()));
+
+    let hints = backend
+        .inlay_hint(InlayHintParams {
+            text_document: TextDocumentIdentifier { uri: uri_a },
+            range: Range::new(Position::new(0, 0), Position::new(10, 0)),
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("inlay_hint ok")
+        .unwrap_or_default();
+    assert!(!hints.is_empty());
+}
+
+#[test]
+fn hover_renders_doc_comments_keywords_attributes_and_builtin_types() {
+    let hover_md = |src: &str, line: u32, col: u32| -> Option<String> {
+        let h = compute_hover(src, Position::new(line, col))?;
+        match h.contents {
+            HoverContents::Markup(m) => Some(m.value),
+            _ => None,
+        }
+    };
+
+    let src = r#"module demo::docs @version(1.0.0);
+
+/// This is simulation clock
+resource SimClock {
+    /// Fixed tick step in seconds
+    dt: sec = 16.6667_ms,
+}
+
+/// SoA combatant state
+/// stored in hot and cold strata
+@soa @summary_tick
+component CombatantBody {
+    hot {
+        /// Current health points
+        hp: f32 = 800.0,
+    }
+    cold caps {
+        max_hp: f32 = 800.0,
+    }
+}
+
+// Plain comment must NOT attach as doc comment
+component PlainComp {
+    raw: u32 = 0,
+}
+
+/// Detached doc separated by blank line
+
+component DetachedComp {
+    val: u32 = 0,
+}
+
+/** Combat action enum doc */
+enum CombatAction {
+    LightAttack = 0,
+}
+
+/// Helper clamping stamina
+@node_pure
+fn clamp_stamina(v: f32) -> f32 {
+    return v;
+}
+
+/// Regenerates combatant health
+@par(chunk = 256)
+sys regen_hp(clk: &res SimClock) {
+    uniform let step = clk.dt;
+    let label = "component in string";
+    for c in query(body: &mut CombatantBody) {
+        c.body.hp = clamp_stamina(c.body.hp);
+    }
+}
+
+timeline DodgeRoll @rate(60_hz) @duration(10_f) {
+    window iframes = 1_f .. 5_f;
+}
+"#;
+
+    // 1. Doc comment on `resource SimClock`
+    let clk_doc = hover_md(src, 3, 10).expect("SimClock hover");
+    assert!(clk_doc.contains("This is simulation clock"), "{clk_doc}");
+
+    // 2. Multi-line doc comment before `@soa @summary_tick` on `component CombatantBody`
+    let body_doc = hover_md(src, 11, 14).expect("CombatantBody hover");
+    assert!(
+        body_doc.contains("SoA combatant state\nstored in hot and cold strata"),
+        "{body_doc}"
+    );
+
+    // 3. Doc comment on `///` field (`hp` and `dt`)
+    let hp_doc = hover_md(src, 14, 9).expect("hp field hover");
+    assert!(hp_doc.contains("Current health points"), "{hp_doc}");
+    let dt_doc = hover_md(src, 5, 5).expect("dt field hover");
+    assert!(dt_doc.contains("Fixed tick step in seconds"), "{dt_doc}");
+
+    // 4. Plain `//` comment and blank-line-separated `///` must NOT attach
+    let plain_doc = hover_md(src, 22, 12).expect("PlainComp hover");
+    assert!(!plain_doc.contains("Plain comment"), "{plain_doc}");
+    let detached_doc = hover_md(src, 28, 12).expect("DetachedComp hover");
+    assert!(!detached_doc.contains("Detached doc"), "{detached_doc}");
+
+    // 5. Block `/** ... */`, `fn`, and `sys` doc comments
+    let enum_doc = hover_md(src, 33, 7).expect("CombatAction hover");
+    assert!(enum_doc.contains("Combat action enum doc"), "{enum_doc}");
+    let fn_doc = hover_md(src, 39, 5).expect("clamp_stamina hover");
+    assert!(fn_doc.contains("Helper clamping stamina"), "{fn_doc}");
+    let sys_doc = hover_md(src, 45, 5).expect("regen_hp hover");
+    assert!(
+        sys_doc.contains("Regenerates combatant health"),
+        "{sys_doc}"
+    );
+
+    // 6. Keywords & ECS intrinsics hover docs
+    for (kw, line, col) in [
+        ("resource", 3, 2),
+        ("component", 11, 2),
+        ("sys", 45, 1),
+        ("uniform", 46, 6),
+        ("query", 48, 15),
+        ("timeline", 53, 2),
+    ] {
+        let md = hover_md(src, line, col).unwrap_or_else(|| panic!("expected hover for `{kw}`"));
+        assert!(
+            md.contains(&format!("`{kw}`")),
+            "unexpected hover for {kw}: {md}"
+        );
+    }
+
+    // 7. `@attribute` hover docs
+    let soa_md = hover_md(src, 10, 2).expect("@soa hover");
+    assert!(soa_md.contains("`@soa`"), "{soa_md}");
+    let par_md = hover_md(src, 44, 2).expect("@par hover");
+    assert!(par_md.contains("`@par`"), "{par_md}");
+
+    // 8. Built-in types (`sec`, `f32`, plus `vec3`/`InputBuffer`)
+    let sec_md = hover_md(src, 5, 9).expect("sec hover");
+    assert!(sec_md.contains("`sec` (built-in type)"), "{sec_md}");
+    let f32_md = hover_md(src, 14, 13).expect("f32 hover");
+    assert!(f32_md.contains("`f32` (built-in type)"), "{f32_md}");
+
+    let extra_src =
+        "module m::t @version(1.0.0);\ncomponent C { pos: vec3, buf: InputBuffer<u8, 4> }\n";
+    let vec3_md = hover_md(extra_src, 1, 20).expect("vec3 hover");
+    assert!(vec3_md.contains("`vec3` (built-in type)"), "{vec3_md}");
+    let ib_md = hover_md(extra_src, 1, 32).expect("InputBuffer hover");
+    assert!(ib_md.contains("`InputBuffer` (built-in type)"), "{ib_md}");
+
+    // 9. Keywords inside comments or strings must NOT trigger hover
+    assert!(
+        hover_md(src, 21, 5).is_none(),
+        "plain comment word should not hover"
+    );
+    assert!(
+        hover_md(src, 47, 19).is_none(),
+        "keyword inside string literal should not hover"
+    );
+}
