@@ -1398,8 +1398,14 @@ int main(void) {{
     if (!lib) return 1;
     typedef BamResult (*InitFn)(const BamHostApi*, BamLoadCtx*, void**);
     typedef void (*ShutFn)(void*);
-    InitFn init_fn = (InitFn)dlsym(lib, "bamabi_init");
-    ShutFn shut_fn = (ShutFn)dlsym(lib, "bamabi_shutdown");
+    InitFn init_fn = NULL;
+    ShutFn shut_fn = NULL;
+    {{
+        void* p_init = dlsym(lib, "bamabi_init");
+        void* p_shut = dlsym(lib, "bamabi_shutdown");
+        memcpy(&init_fn, &p_init, sizeof(init_fn));
+        memcpy(&shut_fn, &p_shut, sizeof(shut_fn));
+    }}
     if (!init_fn || !shut_fn) return 2;
 
     BamHostApi api;
@@ -4407,8 +4413,14 @@ int main(void) {{
     if (!lib) {{ fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }}
     typedef BamResult (*InitFn)(const BamHostApi*, BamLoadCtx*, void**);
     typedef void (*ShutFn)(void*);
-    InitFn init_fn = (InitFn)dlsym(lib, "bamabi_init");
-    ShutFn shut_fn = (ShutFn)dlsym(lib, "bamabi_shutdown");
+    InitFn init_fn = NULL;
+    ShutFn shut_fn = NULL;
+    {{
+        void* p_init = dlsym(lib, "bamabi_init");
+        void* p_shut = dlsym(lib, "bamabi_shutdown");
+        memcpy(&init_fn, &p_init, sizeof(init_fn));
+        memcpy(&shut_fn, &p_shut, sizeof(shut_fn));
+    }}
     if (!init_fn || !shut_fn) return 2;
 
     BamHostApi api;
@@ -4695,8 +4707,14 @@ int main(void) {{
     if (!lib) {{ fprintf(stderr, "dlopen failed: %s\n", dlerror()); return 1; }}
     typedef BamResult (*InitFn)(const BamHostApi*, BamLoadCtx*, void**);
     typedef void (*ShutFn)(void*);
-    InitFn init_fn = (InitFn)dlsym(lib, "bamabi_init");
-    ShutFn shut_fn = (ShutFn)dlsym(lib, "bamabi_shutdown");
+    InitFn init_fn = NULL;
+    ShutFn shut_fn = NULL;
+    {{
+        void* p_init = dlsym(lib, "bamabi_init");
+        void* p_shut = dlsym(lib, "bamabi_shutdown");
+        memcpy(&init_fn, &p_init, sizeof(init_fn));
+        memcpy(&shut_fn, &p_shut, sizeof(shut_fn));
+    }}
     if (!init_fn || !shut_fn) return 2;
 
     BamHostApi api;
