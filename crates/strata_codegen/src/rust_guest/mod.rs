@@ -253,7 +253,7 @@ pub(crate) fn aligned_blob_type(byte_size: usize, align: usize) -> String {
     }
 }
 
-fn aligned_blob_default(byte_size: usize, align: usize) -> String {
+pub(crate) fn aligned_blob_default(byte_size: usize, align: usize) -> String {
     if byte_size == 0 {
         return "()".to_owned();
     }

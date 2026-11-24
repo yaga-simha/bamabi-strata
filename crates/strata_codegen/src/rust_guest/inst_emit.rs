@@ -81,7 +81,7 @@ pub(super) fn emit_cfg_body(
         return;
     }
 
-    let const_info = collect_guest_fn_const_info(func);
+    let const_info = collect_guest_fn_const_info(func, mir, cat);
 
     let fast_loops = if migrate_vars.is_none()
         && observer_vars.is_none()
@@ -405,9 +405,39 @@ pub(super) fn emit_inst(
                                 "StrataVal::Obj(StrataObj::{}({}::default()))",
                                 rc.variant_name, rc.struct_name
                             )
+                        } else if let Some(bits) = n
+                            .strip_prefix("BitSet<")
+                            .and_then(|s| s.strip_suffix('>'))
+                            .and_then(|s| s.parse::<usize>().ok())
+                        {
+                            format!("StrataVal::Words(vec![0u32; {}])", bits.div_ceil(32).max(1))
+                        } else if n.starts_with("InlineStr<") {
+                            "StrataVal::Str(String::new())".to_owned()
+                        } else if n == "mat3" || n == "Mat3" {
+                            "StrataVal::Arr(vec![StrataVal::F32(0.0); 9])".to_owned()
+                        } else if n == "mat4" || n == "Mat4" {
+                            "StrataVal::Arr(vec![StrataVal::F32(0.0); 16])".to_owned()
+                        } else if let Some(sty) = mir_ty_to_guest_ty_hint(ty, mir) {
+                            let (sz, _) = guest_ty_abi_size_align(&sty, mir);
+                            format!("StrataVal::Bytes(vec![0u8; {}])", sz.max(1))
                         } else {
                             default_strata_val_for_mir_ty(ty).to_owned()
                         }
+                    }
+                    MirType::Array { .. } => {
+                        let sz = if let Some(sty) = mir_ty_to_guest_ty_hint(ty, mir) {
+                            guest_ty_abi_size_align(&sty, mir).0
+                        } else {
+                            guest_mir_elem_byte_size(ty, cat)
+                        };
+                        format!("StrataVal::Bytes(vec![0u8; {}])", sz.max(1))
+                    }
+                    MirType::Tuple(items) => {
+                        let parts: Vec<String> = items
+                            .iter()
+                            .map(|it| default_strata_val_for_mir_ty(it).to_owned())
+                            .collect();
+                        format!("StrataVal::Tuple(vec![{}])", parts.join(", "))
                     }
                     _ => default_strata_val_for_mir_ty(ty).to_owned(),
                 };
@@ -421,17 +451,54 @@ pub(super) fn emit_inst(
             }
         }
         Inst::SlotLoad { slot } => {
-            assign_dst(
-                out,
-                &format!(
+            let expr = match const_info.slot_types.get(slot) {
+                Some(slot_ty @ MirType::Array { .. }) => {
+                    if let Some(sty) = mir_ty_to_guest_ty_hint(slot_ty, mir) {
+                        let (sz, _) = guest_ty_abi_size_align(&sty, mir);
+                        let unpack = emit_runtime_read_ty_from_bytes("_b", "0", &sty, sz, mir, cat);
+                        format!(
+                            "match locals[{s}].as_ptr() {{ StrataPtr::Slot {{ sid, .. }} => match &slots[sid] {{ StrataVal::Bytes(_b) => {unpack}, other => other.clone() }}, _ => locals[{s}].clone() }}",
+                            s = slot.0
+                        )
+                    } else {
+                        format!(
+                            "match locals[{s}].as_ptr() {{ StrataPtr::Slot {{ sid, .. }} => slots[sid].clone(), _ => locals[{s}].clone() }}",
+                            s = slot.0
+                        )
+                    }
+                }
+                _ => format!(
                     "match locals[{s}].as_ptr() {{ StrataPtr::Slot {{ sid, .. }} => slots[sid].clone(), _ => locals[{s}].clone() }}",
                     s = slot.0
                 ),
-            );
+            };
+            assign_dst(out, &expr);
         }
         Inst::SlotStore { slot, val } => {
             let val_expr = if let Some(slot_ty) = const_info.slot_types.get(slot) {
-                guest_coerce_val_expr_for_mir_ty(slot_ty, *val, func, const_info)
+                let raw_expr = guest_coerce_val_expr_for_mir_ty(slot_ty, *val, func, const_info);
+                match mir_ty_to_guest_ty_hint(slot_ty, mir) {
+                    Some(
+                        sty @ (Ty::Array { .. } | Ty::SmallVec { .. } | Ty::InputBuffer { .. }),
+                    ) => {
+                        let (sz, _) = guest_ty_abi_size_align(&sty, mir);
+                        let wr =
+                            emit_runtime_write_ty_into_bytes("_buf", "0", "_sv", &sty, sz, mir);
+                        format!(
+                            "{{ let _sv = {raw_expr}; if let StrataVal::Bytes(mut _b) = _sv {{ _b.resize({sz}, 0); StrataVal::Bytes(_b) }} else {{ let mut _buf = vec![0u8; {sz}]; {wr} StrataVal::Bytes(_buf) }} }}"
+                        )
+                    }
+                    Some(Ty::InlineStr(cap)) => format!(
+                        "match {raw_expr} {{ StrataVal::Bytes(ref _b) => strata_decode_inline_str_bytes(_b, {cap}), StrataVal::Words(ref _ws) => strata_decode_inline_str_words(_ws, {cap}), StrataVal::Str(mut _s) => {{ let mut _end = _s.len().min({cap}); while _end > 0 && !_s.is_char_boundary(_end) {{ _end -= 1; }} _s.truncate(_end); StrataVal::Str(_s) }}, other => other }}"
+                    ),
+                    Some(Ty::Mat3) => format!(
+                        "match {raw_expr} {{ StrataVal::Bytes(ref _b) => StrataVal::Arr((0..9).map(|_j| StrataVal::F32(strata_bytes_read_f32(_b, _j * 4))).collect()), other => other }}"
+                    ),
+                    Some(Ty::Mat4) => format!(
+                        "match {raw_expr} {{ StrataVal::Bytes(ref _b) => StrataVal::Arr((0..16).map(|_j| StrataVal::F32(strata_bytes_read_f32(_b, _j * 4))).collect()), other => other }}"
+                    ),
+                    _ => raw_expr,
+                }
             } else {
                 format!("locals[{}].clone()", val.0)
             };
@@ -464,10 +531,14 @@ pub(super) fn emit_inst(
         Inst::Cast { val, target_ty } => {
             let expr = match target_ty {
                 MirType::Bool => format!("StrataVal::Bool(locals[{}].as_bool())", val.0),
-                MirType::I8 | MirType::I16 | MirType::I32 => {
+                MirType::I8 => format!("StrataVal::I32(i32::from(locals[{}].as_i8()))", val.0),
+                MirType::I16 => format!("StrataVal::I32(i32::from(locals[{}].as_i16()))", val.0),
+                MirType::I32 => {
                     format!("StrataVal::I32(locals[{}].as_i32())", val.0)
                 }
-                MirType::U8 | MirType::U16 | MirType::U32 | MirType::Sym => {
+                MirType::U8 => format!("StrataVal::U32(u32::from(locals[{}].as_u8()))", val.0),
+                MirType::U16 => format!("StrataVal::U32(u32::from(locals[{}].as_u16()))", val.0),
+                MirType::U32 | MirType::Sym => {
                     format!("StrataVal::U32(locals[{}].as_u32())", val.0)
                 }
                 MirType::I64 => format!("StrataVal::I64(locals[{}].as_i64())", val.0),
@@ -502,28 +573,12 @@ pub(super) fn emit_inst(
             );
         }
         Inst::VecSwizzle { vec, lanes } => {
-            let expr = match lanes.len() {
-                1 => format!(
-                    "StrataVal::F32(locals[{}].as_vec4().get({}).copied().unwrap_or(0.0))",
-                    vec.0, lanes[0]
-                ),
-                2 => format!(
-                    "{{ let _a = locals[{}].as_vec4(); StrataVal::Vec2([_a.get({}).copied().unwrap_or(0.0), _a.get({}).copied().unwrap_or(0.0)]) }}",
-                    vec.0, lanes[0], lanes[1]
-                ),
-                3 => format!(
-                    "{{ let _a = locals[{}].as_vec4(); StrataVal::Vec3([_a.get({}).copied().unwrap_or(0.0), _a.get({}).copied().unwrap_or(0.0), _a.get({}).copied().unwrap_or(0.0)]) }}",
-                    vec.0, lanes[0], lanes[1], lanes[2]
-                ),
-                _ => format!(
-                    "{{ let _a = locals[{}].as_vec4(); StrataVal::Vec4([_a.get({}).copied().unwrap_or(0.0), _a.get({}).copied().unwrap_or(0.0), _a.get({}).copied().unwrap_or(0.0), _a.get({}).copied().unwrap_or(0.0)]) }}",
-                    vec.0,
-                    lanes.first().copied().unwrap_or(0),
-                    lanes.get(1).copied().unwrap_or(0),
-                    lanes.get(2).copied().unwrap_or(0),
-                    lanes.get(3).copied().unwrap_or(0)
-                ),
-            };
+            let lane_lits: Vec<String> = lanes.iter().map(|l| format!("{l}u8")).collect();
+            let expr = format!(
+                "strata_vec_swizzle_lanes(&locals[{}], &[{}])",
+                vec.0,
+                lane_lits.join(", ")
+            );
             assign_dst(out, &expr);
         }
         Inst::IntrinsicMath { name, args, .. } => {
@@ -641,32 +696,49 @@ pub(super) fn emit_inst(
             }
         }
         Inst::StructInit { type_name, fields } => {
-            let esc_ty = escape_rust_str(type_name);
-            let comp_opt = cat.resolve_comp(type_name);
-            writeln!(
-                out,
-                "                let mut _obj = StrataObj::default_for_name(\"{esc_ty}\");"
-            )
-            .ok();
-            for (fname, vid) in fields {
-                let esc_f = escape_rust_str(fname);
-                let val_expr = if let Some(sf) = comp_opt.and_then(|c| {
-                    c.layout
-                        .fields
-                        .iter()
-                        .find(|f| !f.is_padding && f.name == *fname)
-                }) {
-                    guest_coerce_val_expr_for_sema_ty(&sf.ty, *vid, func, const_info)
-                } else {
-                    format!("locals[{}].clone()", vid.0)
-                };
+            if type_name == "tuple" {
+                let mut parts = vec!["StrataVal::Unit".to_owned(); fields.len()];
+                for (pos, (fname, vid)) in fields.iter().enumerate() {
+                    let idx = fname
+                        .strip_prefix('_')
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(pos);
+                    if idx < parts.len() {
+                        parts[idx] = format!("locals[{}].clone()", vid.0);
+                    }
+                }
+                assign_dst(
+                    out,
+                    &format!("StrataVal::Tuple(vec![{}])", parts.join(", ")),
+                );
+            } else {
+                let esc_ty = escape_rust_str(type_name);
+                let comp_opt = cat.resolve_comp(type_name);
                 writeln!(
                     out,
-                    "                _obj.set_field(0, \"{esc_f}\", {val_expr});"
+                    "                let mut _obj = StrataObj::default_for_name(\"{esc_ty}\");"
                 )
                 .ok();
+                for (fname, vid) in fields {
+                    let esc_f = escape_rust_str(fname);
+                    let val_expr = if let Some(sf) = comp_opt.and_then(|c| {
+                        c.layout
+                            .fields
+                            .iter()
+                            .find(|f| !f.is_padding && f.name == *fname)
+                    }) {
+                        guest_coerce_val_expr_for_sema_ty(&sf.ty, *vid, func, const_info)
+                    } else {
+                        format!("locals[{}].clone()", vid.0)
+                    };
+                    writeln!(
+                        out,
+                        "                _obj.set_field(0, \"{esc_f}\", {val_expr});"
+                    )
+                    .ok();
+                }
+                assign_dst(out, "StrataVal::Obj(_obj)");
             }
-            assign_dst(out, "StrataVal::Obj(_obj)");
         }
         Inst::ArrayInit { elems } => {
             let parts: Vec<String> = elems
@@ -676,13 +748,63 @@ pub(super) fn emit_inst(
             assign_dst(out, &format!("StrataVal::Arr(vec![{}])", parts.join(", ")));
         }
         Inst::ArrayIndex { base, index } => {
-            assign_dst(
-                out,
-                &format!(
-                    "{{ let _idx = locals[{}].as_u32() as usize; match &locals[{}] {{ StrataVal::Arr(a) => a.get(_idx).cloned().unwrap_or_default(), StrataVal::Words(w) => StrataVal::U32(*w.get(_idx).unwrap_or(&0)), StrataVal::Vec2(v) => StrataVal::F32(*v.get(_idx).unwrap_or(&0.0)), StrataVal::Vec3(v) => StrataVal::F32(*v.get(_idx).unwrap_or(&0.0)), StrataVal::Vec4(v) => StrataVal::F32(*v.get(_idx).unwrap_or(&0.0)), _ => StrataVal::Unit }} }}",
-                    index.0, base.0
-                ),
-            );
+            let dst_is_ptr = matches!(dst_ty, MirType::Ptr | MirType::MutPtr);
+            if dst_is_ptr {
+                let elem_sema_opt = match const_info.ptr_sema_tys.get(base) {
+                    Some(Ty::Array { elem, .. } | Ty::SmallVec { elem, .. }) => {
+                        Some((**elem).clone())
+                    }
+                    _ => func.locals.get(base.0 as usize).and_then(|l| {
+                        if let MirType::Array { elem, .. } = &l.ty {
+                            mir_ty_to_guest_ty_hint(elem, mir)
+                        } else {
+                            None
+                        }
+                    }),
+                };
+                let stride = if let Some(ref ety) = elem_sema_opt {
+                    let (sz, al) = guest_ty_abi_size_align(ety, mir);
+                    let al = al.max(1);
+                    sz.div_ceil(al) * al
+                } else if let Some(MirType::Array { elem, .. }) =
+                    func.locals.get(base.0 as usize).map(|l| &l.ty)
+                {
+                    guest_mir_elem_byte_size(elem, cat)
+                } else {
+                    4
+                };
+                assign_dst(
+                    out,
+                    &format!(
+                        "{{ let _idx_i = locals[{}].as_i64(); if _idx_i >= 0 {{ StrataVal::Ptr(locals[{}].as_ptr().with_added_offset((_idx_i as usize).saturating_mul({stride}) as u32)) }} else {{ StrataVal::Ptr(StrataPtr::Null) }} }}",
+                        index.0, base.0
+                    ),
+                );
+            } else {
+                let elem_sty_opt = mir_ty_to_guest_ty_hint(&dst_ty, mir);
+                let (stride, ptr_read_expr, def_val) = if let Some(ref sty) = elem_sty_opt {
+                    let (sz, al) = guest_ty_abi_size_align(sty, mir);
+                    let al = al.max(1);
+                    (
+                        sz.div_ceil(al) * al,
+                        emit_runtime_read_ty_from_bytes("_b", "_r_off", sty, sz, mir, cat),
+                        default_strata_val_for_mir_ty(&dst_ty).to_owned(),
+                    )
+                } else {
+                    (
+                        guest_mir_elem_byte_size(&dst_ty, cat),
+                        "StrataVal::Unit".to_owned(),
+                        default_strata_val_for_mir_ty(&dst_ty).to_owned(),
+                    )
+                };
+                assign_dst(
+                    out,
+                    &format!(
+                        "{{ let _idx_i = locals[{}].as_i64(); if _idx_i < 0 {{ {def_val} }} else {{ let _idx = _idx_i as usize; match &locals[{}] {{ StrataVal::Arr(a) => a.get(_idx).cloned().unwrap_or_default(), StrataVal::Words(w) => StrataVal::U32(*w.get(_idx).unwrap_or(&0)), StrataVal::Vec2(v) => StrataVal::F32(*v.get(_idx).unwrap_or(&0.0)), StrataVal::Vec3(v) => StrataVal::F32(*v.get(_idx).unwrap_or(&0.0)), StrataVal::Vec4(v) => StrataVal::F32(*v.get(_idx).unwrap_or(&0.0)), StrataVal::IVec2(v) => StrataVal::I32(*v.get(_idx).unwrap_or(&0)), StrataVal::IVec3(v) => StrataVal::I32(*v.get(_idx).unwrap_or(&0)), StrataVal::UVec2(v) => StrataVal::U32(*v.get(_idx).unwrap_or(&0)), StrataVal::Ptr(_) => {{ let mut _res_v = {def_val}; strata_ptr_bytes_read(bridge, &locals[{}], &slots, &migrate_src, &migrate_dst, &trg_payload, world, handles, |_b, _base_off| {{ let _r_off = _base_off.saturating_add(_idx.saturating_mul({stride})); _res_v = {ptr_read_expr}; }}); _res_v }}, _ => StrataVal::Unit }} }} }}",
+                        index.0, base.0, base.0
+                    ),
+                );
+            }
         }
         Inst::ArrayStore {
             base_ptr,
@@ -690,8 +812,18 @@ pub(super) fn emit_inst(
             val,
             elem_ty,
         } => {
-            let elem_bytes = guest_mir_elem_byte_size(elem_ty, cat);
-            let write_fn = guest_mir_elem_write_bytes_expr(elem_ty);
+            let (elem_bytes, write_fn) = if let Some(sty) = mir_ty_to_guest_ty_hint(elem_ty, mir) {
+                let (sz, al) = guest_ty_abi_size_align(&sty, mir);
+                let al = al.max(1);
+                let stride = sz.div_ceil(al) * al;
+                let w = emit_runtime_write_ty_into_bytes("_buf", "_w_off", "_raw_v", &sty, sz, mir);
+                (stride, w)
+            } else {
+                (
+                    guest_mir_elem_byte_size(elem_ty, cat),
+                    guest_mir_elem_write_bytes_expr(elem_ty).to_owned(),
+                )
+            };
             let coerce_val = guest_mir_coerce_val_expr(elem_ty);
             writeln!(
                 out,
@@ -701,14 +833,9 @@ pub(super) fn emit_inst(
                  \x20                       let _idx = _idx_i as usize;\n\
                  \x20                       let _raw_v = locals[{}].clone();\n\
                  \x20                       match locals[{}].as_ptr() {{\n\
-                 \x20                           StrataPtr::Slot {{ sid, off }} => {{\n\
+                 \x20                           StrataPtr::Slot {{ sid, off }} if off == 0 && matches!(slots.get(sid), Some(StrataVal::Arr(_))) => {{\n\
                  \x20                               if let Some(StrataVal::Arr(arr)) = slots.get_mut(sid) {{\n\
                  \x20                                   if _idx < arr.len() {{ arr[_idx] = {coerce_val}; }}\n\
-                 \x20                               }} else {{\n\
-                 \x20                                   strata_ptr_bytes_mut(bridge, StrataPtr::Slot {{ sid, off }}, &mut slots, &mut migrate_dst, world, handles, |_buf, _base_off| {{\n\
-                 \x20                                       let _w_off = _base_off.saturating_add(_idx.saturating_mul({elem_bytes}));\n\
-                 \x20                                       {write_fn}\n\
-                 \x20                                   }});\n\
                  \x20                               }}\n\
                  \x20                           }}\n\
                  \x20                           _ptr => {{\n\
@@ -732,7 +859,7 @@ pub(super) fn emit_inst(
             assign_dst(
                 out,
                 &format!(
-                    "StrataVal::Ptr(locals[{}].as_ptr().set_exact_offset({offset_bytes}))",
+                    "StrataVal::Ptr(locals[{}].as_ptr().with_added_offset({offset_bytes}))",
                     base_ptr.0
                 ),
             );
@@ -753,18 +880,60 @@ pub(super) fn emit_inst(
         }
         Inst::FieldLoad {
             base_ptr,
+            layout_key,
             field,
             offset_bytes,
-            ..
+            field_ty,
         } => {
             let esc_f = escape_rust_str(field);
-            assign_dst(
-                out,
-                &format!(
-                    "strata_val_or_ptr_read(bridge, &locals[{}], {offset_bytes}, \"{esc_f}\", &slots, &migrate_src, &migrate_dst, &trg_payload, world, handles)",
-                    base_ptr.0
-                ),
+            let base_is_table = const_info.table_ptrs.contains_key(base_ptr);
+            let base_is_vec = matches!(
+                const_info.ptr_sema_tys.get(base_ptr),
+                Some(
+                    Ty::Vec2
+                        | Ty::Vec3
+                        | Ty::Vec3a
+                        | Ty::Vec4
+                        | Ty::Quat
+                        | Ty::Rgba
+                        | Ty::IVec2
+                        | Ty::IVec3
+                        | Ty::UVec2
+                )
             );
+            let base_is_tuple = matches!(const_info.ptr_sema_tys.get(base_ptr), Some(Ty::Tuple(_)))
+                || layout_key == "tuple";
+            let is_ptr_local = matches!(
+                func.locals.get(base_ptr.0 as usize).map(|l| &l.ty),
+                Some(MirType::Ptr | MirType::MutPtr)
+            );
+            if is_ptr_local
+                && const_info.sub_ptrs.contains(base_ptr)
+                && !base_is_table
+                && !base_is_vec
+                && !base_is_tuple
+                && *field_ty != MirType::Unit
+                && let Some(sty) = mir_ty_to_guest_ty_hint(field_ty, mir)
+            {
+                let (sz, _) = guest_ty_abi_size_align(&sty, mir);
+                let rd = emit_runtime_read_ty_from_bytes("_b", "_r_off", &sty, sz, mir, cat);
+                let def_v = default_strata_val_for_mir_ty(field_ty);
+                assign_dst(
+                    out,
+                    &format!(
+                        "{{ let mut _res_v = {def_v}; strata_ptr_bytes_read(bridge, &locals[{}], &slots, &migrate_src, &migrate_dst, &trg_payload, world, handles, |_b, _base_off| {{ let _r_off = _base_off.saturating_add({offset_bytes}); _res_v = {rd}; }}); _res_v }}",
+                        base_ptr.0
+                    ),
+                );
+            } else {
+                assign_dst(
+                    out,
+                    &format!(
+                        "strata_val_or_ptr_read(bridge, &locals[{}], {offset_bytes}, \"{esc_f}\", &slots, &migrate_src, &migrate_dst, &trg_payload, world, handles)",
+                        base_ptr.0
+                    ),
+                );
+            }
         }
         Inst::FieldStore {
             base_ptr,
@@ -774,19 +943,72 @@ pub(super) fn emit_inst(
             val,
         } => {
             let esc_f = escape_rust_str(field);
-            let val_expr = if let Some(fty) =
-                resolve_guest_field_ty_path(cat, layout_key, field, *offset_bytes)
-            {
+            let fty_opt = resolve_guest_field_ty_path(cat, layout_key, field, *offset_bytes)
+                .cloned()
+                .or_else(|| {
+                    const_info.ptr_sema_tys.get(base_ptr).and_then(|bt| {
+                        resolve_guest_ptr_field_ty(bt, layout_key, field, *offset_bytes, cat)
+                    })
+                })
+                .or_else(|| {
+                    func.locals
+                        .get(val.0 as usize)
+                        .and_then(|l| mir_ty_to_guest_ty_hint(&l.ty, mir))
+                });
+            let val_expr = if let Some(ref fty) = fty_opt {
                 guest_coerce_val_expr_for_sema_ty(fty, *val, func, const_info)
             } else {
                 format!("locals[{}].clone()", val.0)
             };
-            writeln!(
-                out,
-                "                strata_ptr_write(bridge, locals[{}].as_ptr(), {offset_bytes}, \"{esc_f}\", {val_expr}, &mut slots, &mut migrate_dst, world, handles);",
-                base_ptr.0
-            )
-            .ok();
+            let base_is_table = const_info.table_ptrs.contains_key(base_ptr);
+            let base_is_vec = matches!(
+                const_info.ptr_sema_tys.get(base_ptr),
+                Some(
+                    Ty::Vec2
+                        | Ty::Vec3
+                        | Ty::Vec3a
+                        | Ty::Vec4
+                        | Ty::Quat
+                        | Ty::Rgba
+                        | Ty::IVec2
+                        | Ty::IVec3
+                        | Ty::UVec2
+                )
+            );
+            let base_is_tuple = matches!(const_info.ptr_sema_tys.get(base_ptr), Some(Ty::Tuple(_)))
+                || layout_key == "tuple";
+            if const_info.sub_ptrs.contains(base_ptr)
+                && !base_is_table
+                && !base_is_vec
+                && !base_is_tuple
+                && let Some(ref fty) = fty_opt
+                && !matches!(fty, Ty::Asset(_))
+            {
+                let (sz, _) = guest_ty_abi_size_align(fty, mir);
+                let wr = emit_runtime_write_ty_into_bytes("_b", "_w_off", "_w_val", fty, sz, mir);
+                if !wr.is_empty() {
+                    writeln!(
+                        out,
+                        "                {{ let _w_val = {val_expr}; strata_ptr_bytes_mut(bridge, locals[{}].as_ptr(), &mut slots, &mut migrate_dst, world, handles, |_b, _base_off| {{ let _w_off = _base_off.saturating_add({offset_bytes}); {wr} }}); }}",
+                        base_ptr.0
+                    )
+                    .ok();
+                } else {
+                    writeln!(
+                        out,
+                        "                strata_ptr_write(bridge, locals[{}].as_ptr(), {offset_bytes}, \"{esc_f}\", {val_expr}, &mut slots, &mut migrate_dst, world, handles);",
+                        base_ptr.0
+                    )
+                    .ok();
+                }
+            } else {
+                writeln!(
+                    out,
+                    "                strata_ptr_write(bridge, locals[{}].as_ptr(), {offset_bytes}, \"{esc_f}\", {val_expr}, &mut slots, &mut migrate_dst, world, handles);",
+                    base_ptr.0
+                )
+                .ok();
+            }
         }
         Inst::ParForEachChunk { query_idx, .. } => {
             emit_par_chunks_dispatch(
@@ -1041,8 +1263,8 @@ pub(super) fn emit_inst(
             writeln!(
                 out,
                 "                {{\n\
-                 \x20                   let _rs = locals[{}].as_u32() as usize;\n\
-                 \x20                   let _rl = locals[{}].as_u32() as usize;\n\
+                 \x20                   let _rs = match locals[{}].as_ptr() {{ StrataPtr::Slot {{ sid, .. }} => slots[sid].as_u32(), _ => locals[{}].as_u32() }} as usize;\n\
+                 \x20                   let _rl = match locals[{}].as_ptr() {{ StrataPtr::Slot {{ sid, .. }} => slots[sid].as_u32(), _ => locals[{}].as_u32() }} as usize;\n\
                  \x20                   if _rl > 0 {{\n\
                  \x20                       match bridge {{\n\
                  \x20                           HostBridge::System(sys_ctx) => {{ if let Some(it) = sys_ctx.query_mut({eqi}) {{ let _ = it.mark_changed_range({phys_col}, _rs, _rl); }} }}\n\
@@ -1051,7 +1273,7 @@ pub(super) fn emit_inst(
                  \x20                       }}\n\
                  \x20                   }}\n\
                  \x20               }}",
-                run_start.0, run_len.0
+                run_start.0, run_start.0, run_len.0, run_len.0
             )
             .ok();
         }
@@ -1116,7 +1338,14 @@ pub(super) fn emit_inst(
         } => {
             let qi = *query_idx as usize;
             let eqi = remap_qi(query_remap, qi);
-            let rel_expr = if let Some(rel) = cat.resolve_rel(relation) {
+            let short_r = relation.rsplit("::").next().unwrap_or(relation.as_str());
+            let rel_expr = if relation == "ChildOf" || relation.ends_with("::ChildOf") {
+                "BamComponent::INVALID".to_owned()
+            } else if let Some(companion) =
+                cat.resolve_comp(&format!("__strata_rel_parent_{short_r}"))
+            {
+                format!("handles.{}", companion.handle_field)
+            } else if let Some(rel) = cat.resolve_rel(relation) {
                 format!("handles.{}", rel.handle_field)
             } else {
                 "BamComponent::INVALID".to_owned()
@@ -1363,13 +1592,19 @@ pub(super) fn emit_inst(
             .ok();
         }
         Inst::BitSetGet { ptr, words, bit } => {
-            assign_dst(
-                out,
-                &format!(
-                    "{{ let _bidx = locals[{}].as_u32(); if let StrataVal::Words(ref _ws) = locals[{}] {{ StrataVal::Bool(_ws.get((_bidx / 32) as usize).is_some_and(|w| (*w & (1u32 << (_bidx % 32))) != 0)) }} else {{ let mut _res_b = false; strata_ptr_bytes_read(bridge, &locals[{}], &slots, &migrate_src, &migrate_dst, &trg_payload, world, handles, |_b, _off| {{ _res_b = strata_bitset_get_bytes(_b, _off, {words}, _bidx); }}); StrataVal::Bool(_res_b) }} }}",
+            let expr = if let Some((tbl_row, fpath)) = const_info.table_ptrs.get(ptr) {
+                let esc_fp = escape_rust_str(fpath);
+                format!(
+                    "{{ let _bidx = locals[{}].as_u32(); match strata_val_or_ptr_read(bridge, &locals[{}], 0, \"{esc_fp}\", &slots, &migrate_src, &migrate_dst, &trg_payload, world, handles) {{ StrataVal::Words(ref _ws) => StrataVal::Bool(_ws.get((_bidx / 32) as usize).is_some_and(|w| (*w & (1u32 << (_bidx % 32))) != 0)), StrataVal::Arr(ref _xs) => StrataVal::Bool(_xs.get((_bidx / 32) as usize).is_some_and(|w| (w.as_u32() & (1u32 << (_bidx % 32))) != 0)), _ => StrataVal::Bool(false) }} }}",
+                    bit.0, tbl_row.0
+                )
+            } else {
+                format!(
+                    "{{ let _bidx = locals[{}].as_u32(); match &locals[{}] {{ StrataVal::Words(_ws) => StrataVal::Bool(_ws.get((_bidx / 32) as usize).is_some_and(|w| (*w & (1u32 << (_bidx % 32))) != 0)), StrataVal::Arr(_xs) => StrataVal::Bool(_xs.get((_bidx / 32) as usize).is_some_and(|w| (w.as_u32() & (1u32 << (_bidx % 32))) != 0)), _ => {{ let mut _res_b = false; strata_ptr_bytes_read(bridge, &locals[{}], &slots, &migrate_src, &migrate_dst, &trg_payload, world, handles, |_b, _off| {{ _res_b = strata_bitset_get_bytes(_b, _off, {words}, _bidx); }}); StrataVal::Bool(_res_b) }} }} }}",
                     bit.0, ptr.0, ptr.0
-                ),
-            );
+                )
+            };
+            assign_dst(out, &expr);
         }
         Inst::BitSetClear { ptr, words, bit } => {
             writeln!(
@@ -1652,20 +1887,43 @@ pub(super) fn emit_inst(
             if_new,
         } => {
             let e_idx = entity.0;
+            let is_child_of = component == "ChildOf" || component.ends_with("::ChildOf");
             if let Some(lid) = data {
-                writeln!(
-                    out,
-                    "                if let StrataVal::Obj(ref _o) = locals[{}] {{\n\
-                     \x20                   let _e = locals[{e_idx}].as_entity();\n\
-                     \x20                   match bridge {{\n\
-                     \x20                       HostBridge::System(sys_ctx) => _o.cmd_insert(sys_ctx.commands(), handles, _e, {if_new}),\n\
-                     \x20                       HostBridge::Commands(cmds) => _o.cmd_insert(cmds, handles, _e, {if_new}),\n\
-                     \x20                       _ => {{}}\n\
-                     \x20                   }}\n\
-                     \x20               }}",
-                    lid.0
-                )
-                .ok();
+                let l = lid.0;
+                if is_child_of {
+                    writeln!(
+                        out,
+                        "                {{\n\
+                         \x20                   let _e = locals[{e_idx}].as_entity();\n\
+                         \x20                   let _v = if matches!(locals[{l}], StrataVal::Ptr(_)) {{ strata_val_or_ptr_read(bridge, &locals[{l}], 0, \"\", &slots, &migrate_src, &migrate_dst, &trg_payload, world, handles) }} else {{ locals[{l}].clone() }};\n\
+                         \x20                   let _parent = match _v {{ StrataVal::Entity(pe) => pe, StrataVal::Obj(ref o) => o.get_field(0, \"parent\").as_entity(), _ => FfiEntity::NULL }};\n\
+                         \x20                   if !_parent.is_null() {{\n\
+                         \x20                       match bridge {{\n\
+                         \x20                           HostBridge::System(sys_ctx) => {{ let _ = sys_ctx.commands().add_child(_parent, _e); }}\n\
+                         \x20                           HostBridge::Commands(cmds) => {{ let _ = cmds.add_child(_parent, _e); }}\n\
+                         \x20                           _ => {{}}\n\
+                         \x20                       }}\n\
+                         \x20                   }}\n\
+                         \x20               }}"
+                    )
+                    .ok();
+                } else {
+                    writeln!(
+                        out,
+                        "                {{\n\
+                         \x20                   let _v = if matches!(locals[{l}], StrataVal::Ptr(_)) {{ strata_val_or_ptr_read(bridge, &locals[{l}], 0, \"\", &slots, &migrate_src, &migrate_dst, &trg_payload, world, handles) }} else {{ locals[{l}].clone() }};\n\
+                         \x20                   if let StrataVal::Obj(ref _o) = _v {{\n\
+                         \x20                       let _e = locals[{e_idx}].as_entity();\n\
+                         \x20                       match bridge {{\n\
+                         \x20                           HostBridge::System(sys_ctx) => _o.cmd_insert(sys_ctx.commands(), handles, _e, {if_new}),\n\
+                         \x20                           HostBridge::Commands(cmds) => _o.cmd_insert(cmds, handles, _e, {if_new}),\n\
+                         \x20                           _ => {{}}\n\
+                         \x20                       }}\n\
+                         \x20                   }}\n\
+                         \x20               }}"
+                    )
+                    .ok();
+                }
             } else if let Some(comp) = cat.resolve_comp(component) {
                 let sname = &comp.struct_name;
                 let hf = &comp.handle_field;
@@ -1685,7 +1943,21 @@ pub(super) fn emit_inst(
             }
         }
         Inst::CmdRemove { entity, component } => {
-            if let Some(comp) = cat.resolve_comp(component) {
+            if component == "ChildOf" || component.ends_with("::ChildOf") {
+                writeln!(
+                    out,
+                    "                {{\n\
+                     \x20                   let _e = locals[{}].as_entity();\n\
+                     \x20                   match bridge {{\n\
+                     \x20                       HostBridge::System(sys_ctx) => {{ let _ = sys_ctx.commands().remove_parent(_e); }}\n\
+                     \x20                       HostBridge::Commands(cmds) => {{ let _ = cmds.remove_parent(_e); }}\n\
+                     \x20                       _ => {{}}\n\
+                     \x20                   }}\n\
+                     \x20               }}",
+                    entity.0
+                )
+                .ok();
+            } else if let Some(comp) = cat.resolve_comp(component) {
                 writeln!(
                     out,
                     "                {{\n\
@@ -1712,16 +1984,19 @@ pub(super) fn emit_inst(
                 None => "None".to_owned(),
             };
             if let Some(p) = payload {
+                let pi = p.0;
                 writeln!(
                     out,
-                    "                if let StrataVal::Obj(ref _o) = locals[{}] {{\n\
-                     \x20                   match bridge {{\n\
-                     \x20                       HostBridge::System(sys_ctx) => _o.cmd_trigger(sys_ctx.commands(), handles, {tgt_expr}, {propagate}),\n\
-                     \x20                       HostBridge::Commands(cmds) => _o.cmd_trigger(cmds, handles, {tgt_expr}, {propagate}),\n\
-                     \x20                       _ => {{}}\n\
+                    "                {{\n\
+                     \x20                   let _pv = if matches!(locals[{pi}], StrataVal::Ptr(_)) {{ strata_val_or_ptr_read(bridge, &locals[{pi}], 0, \"\", &slots, &migrate_src, &migrate_dst, &trg_payload, world, handles) }} else {{ locals[{pi}].clone() }};\n\
+                     \x20                   if let StrataVal::Obj(ref _o) = _pv {{\n\
+                     \x20                       match bridge {{\n\
+                     \x20                           HostBridge::System(sys_ctx) => _o.cmd_trigger(sys_ctx.commands(), handles, {tgt_expr}, {propagate}),\n\
+                     \x20                           HostBridge::Commands(cmds) => _o.cmd_trigger(cmds, handles, {tgt_expr}, {propagate}),\n\
+                     \x20                           _ => {{}}\n\
+                     \x20                       }}\n\
                      \x20                   }}\n\
-                     \x20               }}",
-                    p.0
+                     \x20               }}"
                 )
                 .ok();
             } else if let Some(comp) = cat.resolve_comp(event) {
@@ -1743,12 +2018,15 @@ pub(super) fn emit_inst(
         }
         Inst::StreamEmit { stream, payload } => {
             let decl_idx = stream_decl_index(stream_decls, cat, stream);
+            let pi = payload.0;
             writeln!(
                 out,
-                "                if let StrataVal::Obj(ref _o) = locals[{}] {{\n\
-                 \x20                   if let HostBridge::System(sys_ctx) = bridge {{ _o.send_msg(sys_ctx, stream_base + {decl_idx}); }}\n\
-                 \x20               }}",
-                payload.0
+                "                {{\n\
+                 \x20                   let _sv = if matches!(locals[{pi}], StrataVal::Ptr(_)) {{ strata_val_or_ptr_read(bridge, &locals[{pi}], 0, \"\", &slots, &migrate_src, &migrate_dst, &trg_payload, world, handles) }} else {{ locals[{pi}].clone() }};\n\
+                 \x20                   if let StrataVal::Obj(ref _o) = _sv {{\n\
+                 \x20                       if let HostBridge::System(sys_ctx) = bridge {{ _o.send_msg(sys_ctx, stream_base + {decl_idx}); }}\n\
+                 \x20                   }}\n\
+                 \x20               }}"
             )
             .ok();
         }
@@ -1783,21 +2061,51 @@ pub(super) fn emit_inst(
             target,
             payload,
         } => {
-            if let Some(rel) = cat.resolve_rel(relation) {
+            let short_r = relation.rsplit("::").next().unwrap_or(relation.as_str());
+            let companion_opt = cat.resolve_comp(&format!("__strata_rel_parent_{short_r}"));
+            let companion_stmt = if let Some(comp) = companion_opt {
+                let sname = &comp.struct_name;
+                let hf = &comp.handle_field;
+                format!(
+                    "let mut _par_c = {sname}::default(); _par_c.strata_set(0, \"parent\", StrataVal::Entity(_t)); let _ = _cmds.insert(_e, handles.{hf}, &_par_c);"
+                )
+            } else {
+                String::new()
+            };
+            if relation == "ChildOf" || relation.ends_with("::ChildOf") {
+                writeln!(
+                    out,
+                    "                {{\n\
+                     \x20                   let _e = locals[{}].as_entity();\n\
+                     \x20                   let _t = locals[{}].as_entity();\n\
+                     \x20                   match bridge {{\n\
+                     \x20                       HostBridge::System(sys_ctx) => {{ let _ = sys_ctx.commands().add_child(_t, _e); }}\n\
+                     \x20                       HostBridge::Commands(cmds) => {{ let _ = cmds.add_child(_t, _e); }}\n\
+                     \x20                       _ => {{}}\n\
+                     \x20                   }}\n\
+                     \x20               }}",
+                    entity.0, target.0
+                )
+                .ok();
+            } else if let Some(rel) = cat.resolve_rel(relation) {
                 let rh = &rel.handle_field;
                 if let Some(pl) = payload {
+                    let pli = pl.0;
                     writeln!(
                         out,
-                        "                if let StrataVal::Obj(ref _o) = locals[{}] {{\n\
-                         \x20                   let _e = locals[{}].as_entity();\n\
-                         \x20                   let _t = locals[{}].as_entity();\n\
-                         \x20                   match bridge {{\n\
-                         \x20                       HostBridge::System(sys_ctx) => _o.cmd_insert_rel(sys_ctx.commands(), handles.{rh}, _e, _t),\n\
-                         \x20                       HostBridge::Commands(cmds) => _o.cmd_insert_rel(cmds, handles.{rh}, _e, _t),\n\
-                         \x20                       _ => {{}}\n\
+                        "                {{\n\
+                         \x20                   let _pv = if matches!(locals[{pli}], StrataVal::Ptr(_)) {{ strata_val_or_ptr_read(bridge, &locals[{pli}], 0, \"\", &slots, &migrate_src, &migrate_dst, &trg_payload, world, handles) }} else {{ locals[{pli}].clone() }};\n\
+                         \x20                   if let StrataVal::Obj(ref _o) = _pv {{\n\
+                         \x20                       let _e = locals[{}].as_entity();\n\
+                         \x20                       let _t = locals[{}].as_entity();\n\
+                         \x20                       match bridge {{\n\
+                         \x20                           HostBridge::System(sys_ctx) => {{ let _cmds = sys_ctx.commands(); _o.cmd_insert_rel(_cmds, handles.{rh}, _e, _t); {companion_stmt} }}\n\
+                         \x20                           HostBridge::Commands(_cmds) => {{ _o.cmd_insert_rel(_cmds, handles.{rh}, _e, _t); {companion_stmt} }}\n\
+                         \x20                           _ => {{}}\n\
+                         \x20                       }}\n\
                          \x20                   }}\n\
                          \x20               }}",
-                        pl.0, entity.0, target.0
+                        entity.0, target.0
                     )
                     .ok();
                 } else {
@@ -1807,8 +2115,8 @@ pub(super) fn emit_inst(
                          \x20                   let _e = locals[{}].as_entity();\n\
                          \x20                   let _t = locals[{}].as_entity();\n\
                          \x20                   match bridge {{\n\
-                         \x20                       HostBridge::System(sys_ctx) => {{ let _ = sys_ctx.commands().insert_relation(_e, handles.{rh}, _t); }}\n\
-                         \x20                       HostBridge::Commands(cmds) => {{ let _ = cmds.insert_relation(_e, handles.{rh}, _t); }}\n\
+                         \x20                       HostBridge::System(sys_ctx) => {{ let _cmds = sys_ctx.commands(); let _ = _cmds.insert_relation(_e, handles.{rh}, _t); {companion_stmt} }}\n\
+                         \x20                       HostBridge::Commands(_cmds) => {{ let _ = _cmds.insert_relation(_e, handles.{rh}, _t); {companion_stmt} }}\n\
                          \x20                       _ => {{}}\n\
                          \x20                   }}\n\
                          \x20               }}",
@@ -1823,15 +2131,37 @@ pub(super) fn emit_inst(
             entity,
             target,
         } => {
-            if let Some(rel) = cat.resolve_rel(relation) {
+            if relation == "ChildOf" || relation.ends_with("::ChildOf") {
+                writeln!(
+                    out,
+                    "                {{\n\
+                     \x20                   let _e = locals[{}].as_entity();\n\
+                     \x20                   match bridge {{\n\
+                     \x20                       HostBridge::System(sys_ctx) => {{ let _ = sys_ctx.commands().remove_parent(_e); }}\n\
+                     \x20                       HostBridge::Commands(cmds) => {{ let _ = cmds.remove_parent(_e); }}\n\
+                     \x20                       _ => {{}}\n\
+                     \x20                   }}\n\
+                     \x20               }}",
+                    entity.0
+                )
+                .ok();
+            } else if let Some(rel) = cat.resolve_rel(relation) {
+                let short_r = relation.rsplit("::").next().unwrap_or(relation.as_str());
+                let rem_companion = if let Some(comp) =
+                    cat.resolve_comp(&format!("__strata_rel_parent_{short_r}"))
+                {
+                    format!("let _ = _cmds.remove(_e, handles.{});", comp.handle_field)
+                } else {
+                    String::new()
+                };
                 writeln!(
                     out,
                     "                {{\n\
                      \x20                   let _e = locals[{}].as_entity();\n\
                      \x20                   let _t = locals[{}].as_entity();\n\
                      \x20                   match bridge {{\n\
-                     \x20                       HostBridge::System(sys_ctx) => {{ let _ = sys_ctx.commands().remove_relation(_e, handles.{}, _t); }}\n\
-                     \x20                       HostBridge::Commands(cmds) => {{ let _ = cmds.remove_relation(_e, handles.{}, _t); }}\n\
+                     \x20                       HostBridge::System(sys_ctx) => {{ let _cmds = sys_ctx.commands(); let _ = _cmds.remove_relation(_e, handles.{}, _t); {rem_companion} }}\n\
+                     \x20                       HostBridge::Commands(_cmds) => {{ let _ = _cmds.remove_relation(_e, handles.{}, _t); {rem_companion} }}\n\
                      \x20                       _ => {{}}\n\
                      \x20                   }}\n\
                      \x20               }}",
@@ -1865,12 +2195,30 @@ pub(super) fn emit_inst(
         Inst::SpatialCsrCount { index_name, pos } => {
             let resolved = resolve_guest_spatial_name(mir, func, index_name);
             let esc_idx = escape_rust_str(&resolved);
+            let pos_is_vec2 = matches!(
+                func.locals.get(pos.0 as usize).map(|l| &l.ty),
+                Some(MirType::Vec2)
+            );
+            let pos_expr = if pos_is_vec2 {
+                let axes = mir
+                    .spatial_indices
+                    .iter()
+                    .find(|sp| sp.name == resolved)
+                    .map_or([0, 1], |sp| {
+                        [sp.plane_axes[0].min(2), sp.plane_axes[1].min(2)]
+                    });
+                format!(
+                    "{{ let mut _sp_p = [0.0f32; 4]; let _v2 = locals[{}].as_vec2(); _sp_p[{}] = _v2[0]; _sp_p[{}] = _v2[1]; _sp_p }}",
+                    pos.0, axes[0], axes[1]
+                )
+            } else {
+                format!("locals[{}].as_vec4()", pos.0)
+            };
             writeln!(
                 out,
                 "                if let Ok(mut _w) = world.lock() {{\n\
-                 \x20                   if let Some(_g) = _w.spatial.get_mut(\"{esc_idx}\") {{ _g.csr_count(locals[{}].as_vec4()); }}\n\
-                 \x20               }}",
-                pos.0
+                 \x20                   if let Some(_g) = _w.spatial.get_mut(\"{esc_idx}\") {{ _g.csr_count({pos_expr}); }}\n\
+                 \x20               }}"
             )
             .ok();
         }
@@ -1892,12 +2240,31 @@ pub(super) fn emit_inst(
         } => {
             let resolved = resolve_guest_spatial_name(mir, func, index_name);
             let esc_idx = escape_rust_str(&resolved);
+            let pos_is_vec2 = matches!(
+                func.locals.get(pos.0 as usize).map(|l| &l.ty),
+                Some(MirType::Vec2)
+            );
+            let pos_expr = if pos_is_vec2 {
+                let axes = mir
+                    .spatial_indices
+                    .iter()
+                    .find(|sp| sp.name == resolved)
+                    .map_or([0, 1], |sp| {
+                        [sp.plane_axes[0].min(2), sp.plane_axes[1].min(2)]
+                    });
+                format!(
+                    "{{ let mut _sp_p = [0.0f32; 4]; let _v2 = locals[{}].as_vec2(); _sp_p[{}] = _v2[0]; _sp_p[{}] = _v2[1]; _sp_p }}",
+                    pos.0, axes[0], axes[1]
+                )
+            } else {
+                format!("locals[{}].as_vec4()", pos.0)
+            };
             writeln!(
                 out,
                 "                if let Ok(mut _w) = world.lock() {{\n\
-                 \x20                   if let Some(_g) = _w.spatial.get_mut(\"{esc_idx}\") {{ _g.csr_scatter(locals[{}].as_entity(), locals[{}].as_vec4()); }}\n\
+                 \x20                   if let Some(_g) = _w.spatial.get_mut(\"{esc_idx}\") {{ _g.csr_scatter(locals[{}].as_entity(), {pos_expr}); }}\n\
                  \x20               }}",
-                entity.0, pos.0
+                entity.0
             )
             .ok();
         }
@@ -1908,10 +2275,14 @@ pub(super) fn emit_inst(
         } => {
             let resolved = resolve_guest_spatial_name(mir, func, grid_name);
             let esc = escape_rust_str(&resolved);
+            let center_is_vec2 = matches!(
+                func.locals.get(center.0 as usize).map(|l| &l.ty),
+                Some(MirType::Vec2)
+            );
             writeln!(
                 out,
                 "                let _sh_idx = spatial_hits.len();\n\
-                 \x20               spatial_hits.push(strata_query_disc_hits(world, \"{esc}\", locals[{}].as_vec4(), locals[{}].as_f32()));",
+                 \x20               spatial_hits.push(strata_query_disc_hits(world, \"{esc}\", locals[{}].as_vec4(), locals[{}].as_f32(), {center_is_vec2}));",
                 center.0, radius.0
             )
             .ok();
@@ -2068,13 +2439,13 @@ pub(super) fn guest_mir_coerce_val_expr(ty: &MirType) -> &'static str {
 pub(super) fn guest_mir_elem_write_bytes_expr(ty: &MirType) -> &'static str {
     match ty {
         MirType::Bool => "if _w_off < _buf.len() { _buf[_w_off] = u8::from(_raw_v.as_bool()); }",
-        MirType::U8 => "if _w_off < _buf.len() { _buf[_w_off] = _raw_v.as_u32() as u8; }",
-        MirType::I8 => "if _w_off < _buf.len() { _buf[_w_off] = (_raw_v.as_i32() as i8) as u8; }",
+        MirType::U8 => "if _w_off < _buf.len() { _buf[_w_off] = _raw_v.as_u8(); }",
+        MirType::I8 => "if _w_off < _buf.len() { _buf[_w_off] = _raw_v.as_i8() as u8; }",
         MirType::U16 => {
-            "if _w_off + 2 <= _buf.len() { _buf[_w_off.._w_off + 2].copy_from_slice(&(_raw_v.as_u32() as u16).to_le_bytes()); }"
+            "if _w_off + 2 <= _buf.len() { _buf[_w_off.._w_off + 2].copy_from_slice(&_raw_v.as_u16().to_le_bytes()); }"
         }
         MirType::I16 => {
-            "if _w_off + 2 <= _buf.len() { _buf[_w_off.._w_off + 2].copy_from_slice(&(_raw_v.as_i32() as i16).to_le_bytes()); }"
+            "if _w_off + 2 <= _buf.len() { _buf[_w_off.._w_off + 2].copy_from_slice(&_raw_v.as_i16().to_le_bytes()); }"
         }
         MirType::U32 | MirType::Sym => {
             "if _w_off + 4 <= _buf.len() { _buf[_w_off.._w_off + 4].copy_from_slice(&_raw_v.as_u32().to_le_bytes()); }"
@@ -2128,6 +2499,66 @@ pub(super) fn guest_mir_elem_write_bytes_expr(ty: &MirType) -> &'static str {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn guest_inst_is_par_unsafe(inst: &Inst, mir: &MirModule, visited: &mut HashSet<String>) -> bool {
+    match inst {
+        Inst::CmdSpawn { .. }
+        | Inst::CmdSpawnBatch { .. }
+        | Inst::SpawnBatchBegin { .. }
+        | Inst::SpawnBatchPush { .. }
+        | Inst::SpawnBatchCommit { .. }
+        | Inst::CmdDespawn { .. }
+        | Inst::CmdDespawnAll { .. }
+        | Inst::CmdInsert { .. }
+        | Inst::CmdRemove { .. }
+        | Inst::CmdTrigger { .. }
+        | Inst::StreamEmit { .. }
+        | Inst::CmdCheckpoint
+        | Inst::CmdRollback { .. }
+        | Inst::CmdInsertRelation { .. }
+        | Inst::CmdRemoveRelation { .. }
+        | Inst::ResRead { .. }
+        | Inst::ResWrite { .. }
+        | Inst::EntityGet { .. }
+        | Inst::EntityGetMut { .. }
+        | Inst::ResolveNamedObject { .. }
+        | Inst::BindNamedObject { .. }
+        | Inst::IterUpCascade { .. }
+        | Inst::IterCount { .. }
+        | Inst::IterReset { .. }
+        | Inst::ParForEachChunk { .. }
+        | Inst::ParForEachChunkReadonly { .. }
+        | Inst::SpatialRebuildCsr { .. }
+        | Inst::SpatialCsrBegin { .. }
+        | Inst::SpatialCsrCount { .. }
+        | Inst::SpatialCsrPrefixSum { .. }
+        | Inst::SpatialCsrScatter { .. }
+        | Inst::SpatialQueryDisc { .. }
+        | Inst::SpatialQuerySegmentAt { .. }
+        | Inst::ShadowWrite { .. }
+        | Inst::ShadowCommit { .. }
+        | Inst::RequireTrue { .. }
+        | Inst::FsmDispatch { .. }
+        | Inst::TaskStep { .. } => true,
+        Inst::Call { callee, .. } => !guest_helper_is_par_safe(callee, mir, visited),
+        _ => false,
+    }
+}
+
+fn guest_helper_is_par_safe(callee: &str, mir: &MirModule, visited: &mut HashSet<String>) -> bool {
+    if !visited.insert(callee.to_owned()) {
+        return true;
+    }
+    let short = callee.rsplit("::").next().unwrap_or(callee);
+    let Some(hf) = mir.fns.iter().find(|f| f.name == callee || f.name == short) else {
+        return true;
+    };
+    !hf.blocks.iter().any(|bb| {
+        bb.stmts
+            .iter()
+            .any(|s| guest_inst_is_par_unsafe(&s.inst, mir, visited))
+    })
+}
+
 pub(super) fn emit_par_chunks_dispatch(
     out: &mut String,
     mir: &MirModule,
@@ -2145,7 +2576,11 @@ pub(super) fn emit_par_chunks_dispatch(
     if read_only && deterministic_order {
         return;
     }
-    // Only dispatch primary query 0 chunk loop when `par_chunks`/`par_chunks_readonly` executes
+    // `SystemContext::par_chunks` / `par_chunks_readonly` always dispatch physical query 0.
+    // Secondary or subsequent queries in the same system must fall back to sequential iteration.
+    if remap_qi(query_remap, qi) != 0 {
+        return;
+    }
     let Some(hdr_bb_id) = (match cur_bb.terminator {
         Terminator::Goto(b) => Some(b.0 as usize),
         _ => None,
@@ -2161,24 +2596,6 @@ pub(super) fn emit_par_chunks_dispatch(
         } => (then_bb.0, else_bb.0),
         _ => return,
     };
-
-    // Identify reduction accumulator slots (`ReduceInit` -> `SlotStore`)
-    let mut reduce_slots: Vec<(usize, String)> = Vec::new();
-    let mut red_init_locals: HashMap<u32, String> = HashMap::new();
-    for bb in &func.blocks {
-        for s in &bb.stmts {
-            if let Inst::ReduceInit { op, .. } = &s.inst
-                && let Some(d) = s.dst
-            {
-                red_init_locals.insert(d.0, op.clone());
-            }
-            if let Inst::SlotStore { slot, val } = &s.inst
-                && let Some(op) = red_init_locals.get(&val.0)
-            {
-                reduce_slots.push((slot.0 as usize, op.clone()));
-            }
-        }
-    }
 
     // Notice `Chunk` does NOT allow `component_rows` on `&Chunk` (requires `&mut Chunk`),
     // so if `read_only` has any `@sparse` query term, fall back to sequential `chunk_hdr` cleanly.
@@ -2207,35 +2624,52 @@ pub(super) fn emit_par_chunks_dispatch(
         return;
     }
 
-    // Check if the loop body uses `SystemContext` features unavailable in `Chunk` (commands, streams, res, entity_get, queries > 0)
+    // Identify reduction accumulator slots actively updated inside `loop_blocks`.
+    let mut red_init_locals: HashMap<u32, String> = HashMap::new();
+    let mut outer_red_ops: HashMap<u32, String> = HashMap::new();
+    for bb in &func.blocks {
+        for s in &bb.stmts {
+            if let Inst::ReduceInit { op, .. } = &s.inst
+                && let Some(d) = s.dst
+            {
+                red_init_locals.insert(d.0, op.clone());
+            }
+            if let Inst::SlotStore { slot, val } = &s.inst
+                && let Some(op) = red_init_locals.get(&val.0)
+            {
+                outer_red_ops.insert(slot.0, op.clone());
+            }
+        }
+    }
+    let mut reduce_accum_locals: HashSet<u32> = HashSet::new();
+    for &bid in &loop_blocks {
+        for s in &func.blocks[bid as usize].stmts {
+            if let Inst::ReduceAccum { .. } = &s.inst
+                && let Some(d) = s.dst
+            {
+                reduce_accum_locals.insert(d.0);
+            }
+        }
+    }
+    let mut reduce_slots: Vec<(usize, String)> = Vec::new();
+    let mut seen_red_slots: HashSet<usize> = HashSet::new();
+    for &bid in &loop_blocks {
+        for s in &func.blocks[bid as usize].stmts {
+            if let Inst::SlotStore { slot, val } = &s.inst
+                && reduce_accum_locals.contains(&val.0)
+                && let Some(op) = outer_red_ops.get(&slot.0)
+                && seen_red_slots.insert(slot.0 as usize)
+            {
+                reduce_slots.push((slot.0 as usize, op.clone()));
+            }
+        }
+    }
+
+    // Check if the loop body (directly or transitively via helper calls) uses `SystemContext`-only features.
     let uses_sys_only = loop_blocks.iter().any(|&bid| {
         func.blocks[bid as usize].stmts.iter().any(|s| {
-            matches!(
-                s.inst,
-                Inst::CmdSpawn { .. }
-                    | Inst::CmdSpawnBatch { .. }
-                    | Inst::SpawnBatchBegin { .. }
-                    | Inst::SpawnBatchPush { .. }
-                    | Inst::SpawnBatchCommit { .. }
-                    | Inst::CmdDespawn { .. }
-                    | Inst::CmdDespawnAll { .. }
-                    | Inst::CmdInsert { .. }
-                    | Inst::CmdRemove { .. }
-                    | Inst::CmdTrigger { .. }
-                    | Inst::StreamEmit { .. }
-                    | Inst::CmdCheckpoint
-                    | Inst::CmdRollback { .. }
-                    | Inst::CmdInsertRelation { .. }
-                    | Inst::CmdRemoveRelation { .. }
-                    | Inst::ResRead { .. }
-                    | Inst::ResWrite { .. }
-                    | Inst::EntityGet { .. }
-                    | Inst::EntityGetMut { .. }
-                    | Inst::ResolveNamedObject { .. }
-                    | Inst::BindNamedObject { .. }
-                    | Inst::IterUpCascade { .. }
-                    | Inst::IterCount { .. }
-            ) || matches!(s.inst, Inst::IterNextChunk { query_idx } if query_idx as usize != qi)
+            guest_inst_is_par_unsafe(&s.inst, mir, &mut HashSet::new())
+                || matches!(s.inst, Inst::IterNextChunk { query_idx } if query_idx as usize != qi)
         })
     });
     if uses_sys_only {
@@ -2279,8 +2713,20 @@ pub(super) fn emit_par_chunks_dispatch(
          \x20                       let mut migrate_dst = StrataObj::Empty;\n\
          \x20                       let trg_payload = StrataObj::Empty;\n\
          \x20                       let mut locals = _par_locals_init.clone();\n\
-         \x20                       let mut slots = _par_slots_init.clone();\n\
-         \x20                       let mut spatial_hits: Vec<Vec<(FfiEntity, [f32; 4])>> = Vec::new();\n\
+         \x20                       let mut slots = _par_slots_init.clone();"
+    )
+    .ok();
+    for (sid, op) in &reduce_slots {
+        let esc_op = escape_rust_str(op);
+        writeln!(
+            out,
+            "                        slots[{sid}] = strata_reduce_identity(\"{esc_op}\", &slots[{sid}]);"
+        )
+        .ok();
+    }
+    writeln!(
+        out,
+        "                        let mut spatial_hits: Vec<Vec<(FfiEntity, [f32; 4])>> = Vec::new();\n\
          \x20                       let mut par_consumed: [bool; {nq}] = [false; {nq}];\n\
          \x20                       let mut iter_started_once: [bool; {nq}] = [false; {nq}];\n\
          \x20                       let mut dirty_runs: HashMap<usize, (u32, u32)> = HashMap::new();\n\
@@ -2291,7 +2737,7 @@ pub(super) fn emit_par_chunks_dispatch(
     )
     .ok();
 
-    let const_info = collect_guest_fn_const_info(func);
+    let const_info = collect_guest_fn_const_info(func, mir, cat);
     for &bid in &loop_blocks {
         let bb = &func.blocks[bid as usize];
         writeln!(out, "                                {bid} => {{").ok();
@@ -2432,7 +2878,7 @@ pub(super) fn emit_par_chunks_dispatch(
             let esc_op = escape_rust_str(op);
             writeln!(
                 out,
-                "                            for (rsid, rval) in _g.iter() {{ if *rsid == {sid} {{ slots[{sid}] = strata_reduce_accum(&slots[{sid}], \"{esc_op}\", rval); }} }}"
+                "                            for (rsid, rval) in _g.iter() {{ if *rsid == {sid} {{ slots[{sid}] = strata_reduce_merge(&slots[{sid}], \"{esc_op}\", rval); }} }}"
             )
             .ok();
         }

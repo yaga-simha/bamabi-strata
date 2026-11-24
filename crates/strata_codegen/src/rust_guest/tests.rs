@@ -1313,3 +1313,434 @@ schedule FixedUpdate { kick }
         "RustGuest observer must emit native build_with_ctx observer wiring:\n{all_rs}"
     );
 }
+
+fn emit_all_rust(file: &str, src: &str) -> (MirModule, String) {
+    let analyzed = analyze_source(file, src);
+    assert!(analyzed.ok(), "sema failed: {:?}", analyzed.diagnostics);
+    let mir = lower_to_mir(&analyzed);
+    let out = emit(&mir, &RustGuestOptions::default()).expect("rust_guest emit");
+    let all_rs = out
+        .files
+        .iter()
+        .filter(|f| f.path.ends_with(".rs"))
+        .map(|f| f.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (mir, all_rs)
+}
+
+#[test]
+fn rust_guest_math_types_and_par_reduction_regressions() {
+    let src = r#"
+module test::wave2b_math @version(1.0.0);
+
+resource Stats {
+    prod_i: i64 = 1,
+    sum_v2: vec2 = vec2(0.0, 0.0),
+    cnt: u32 = 0,
+    any_flag: bool = false,
+    all_flag: bool = true,
+    qres: vec3 = vec3(0.0, 0.0, 0.0),
+    fix_prod: fix32 = 1.0,
+}
+
+component Body {
+    pos: vec3 = vec3(0.0, 0.0, 0.0),
+    v4: vec4 = vec4(1.0, 2.0, 3.0, 4.0),
+    va: vec3a = vec3a(1.0, 0.0, 0.0),
+    vb: vec3a = vec3a(1.0, 0.0, 0.0),
+    iv: ivec2 = ivec2(1, -2),
+    uv: uvec2 = uvec2(2, 3),
+    q: quat = quat(0.0, 0.0, 0.0, 1.0),
+    f32x: fix32 = 2.0,
+    f64x: fix64 = 3.0,
+    sm: i8 = 0,
+    val: i32 = 1,
+    flag: bool = true,
+}
+
+component TagB { w: f32 = 2.0 }
+
+const C_FIX64: fix64 = (4.0 as fix32) as fix64;
+const C_FIX32: fix32 = (5.0 as fix64) as fix32;
+
+fn bump_stats(st: &mut res Stats) {
+    st.cnt += 1;
+}
+
+sys math_and_casts(st: &mut res Stats) {
+    let c64 = C_FIX64;
+    let c32 = C_FIX32;
+    let r64 = c32 as fix64;
+    let _r32 = c64 as fix32;
+    let _a = abs(-2147483648_i32);
+    let _s = sqr(3.0_f32);
+    let _d = distance_sq(vec3(0.0, 0.0, 0.0), vec3(3.0, 4.0, 0.0));
+    let wide_f: f32 = 500.0_f32;
+    let _sat_i8 = wide_f as i8;
+
+    for row in query(b: &mut Body) {
+        row.b.sm = (row.b.v4.x * 500.0_f32) as i8;
+        row.b.pos.xz = vec2(7.0, 8.0);
+        let q1 = row.b.q * quat(0.0, 0.0, 0.0, 1.0);
+        st.qres = q1 * row.b.pos;
+        let _d4 = distance(row.b.v4, vec4(0.0, 0.0, 0.0, 0.0));
+        let _ls4 = length_sq(row.b.v4);
+        let _n4 = normalize(row.b.v4);
+        let _l4 = lerp(row.b.v4, vec4(2.0, 4.0, 6.0, 8.0), 0.5);
+        let _eq3a = row.b.va == row.b.vb;
+        row.b.iv = row.b.iv + ivec2(1, 2);
+        row.b.uv = row.b.uv * uvec2(2, 2);
+        row.b.f64x = r64;
+    }
+}
+
+@par(read_only, chunk = 64)
+sys par_reduce_ops(st: &mut res Stats) {
+    let (p_val, s_v2, f_prod, cnt, any_f, all_f) = for row in query(b: &Body) reduce (
+        p_val: prod(2_i64, row.b.val as i64),
+        s_v2: sum(vec2(0.0, 0.0), vec2(row.b.pos.x, row.b.pos.z)),
+        f_prod: prod(1.0, row.b.f32x),
+        cnt: count(row.b.val > 0),
+        any_f: any(row.b.flag),
+        all_f: all(row.b.flag)
+    );
+    st.prod_i = p_val;
+    st.sum_v2 = s_v2;
+    st.fix_prod = f_prod;
+    st.cnt = cnt;
+    st.any_flag = any_f;
+    st.all_flag = all_f;
+
+    // Secondary query after first query exercises query_idx == 1
+    let mut sum_w = 0.0_f32;
+    for sec in query(t: &TagB) {
+        sum_w += sec.t.w;
+    }
+    let _sw = sum_w;
+}
+
+@par(chunk = 64)
+sys par_transitive_res(st: &mut res Stats) {
+    for row in query(b: &Body) {
+        if row.b.val > 0 {
+            bump_stats(st);
+        }
+    }
+    for sec in query(t: &TagB) {
+        if sec.t.w > 0.0 {
+            bump_stats(st);
+        }
+    }
+}
+
+schedule FixedUpdate { math_and_casts, par_reduce_ops, par_transitive_res }
+"#;
+    let (_, all_rs) = emit_all_rust("wave2b_math.strata", src);
+    assert!(
+        all_rs.contains("wrapping_abs"),
+        "PM-03 wrapping_abs missing"
+    );
+    assert!(
+        all_rs.contains("as_i8()"),
+        "PM-10 slow-path saturating as_i8 missing"
+    );
+    assert!(
+        all_rs.contains("strata_fix32_mul") || all_rs.contains(">> 16) as i32"),
+        "PM-08 fix32 prod missing"
+    );
+    assert!(
+        all_rs.contains("strata_vec2_add") || all_rs.contains(")[0] + ("),
+        "PM-14 vec2 sum missing"
+    );
+    assert!(
+        all_rs.contains("query_mut(1)") && all_rs.contains("(1)"),
+        "PM-14 secondary query index 1 missing"
+    );
+    assert!(
+        all_rs.contains("strata_helper_bump_stats_") && !all_rs.contains("par_chunks("),
+        "PM-06 transitive resource write helper / sequential fallback missing"
+    );
+}
+
+#[test]
+fn rust_guest_composites_tables_and_slot_type_regressions() {
+    let src = r#"
+module test::wave2b_comp @version(1.0.0);
+
+enum Act { Slash }
+resource Clock { dt: f32 = 0.016 }
+component HealthV1 { cur: i32 = 10, label: InlineStr<16> = "ok" }
+component Health { hp: i32 = 10, name_tag: InlineStr<16> = "ok" }
+
+struct InnerCell {
+    x: i32 = 1,
+    lbl: InlineStr<16> = "cell",
+}
+
+struct TimerWrap {
+    gw: GraceWindow,
+    ib: InputBuffer<Act, 4>,
+}
+
+table Drops by Act {
+    id: u32,
+    inner: InnerCell,
+} = {
+    Slash => { id: 1, inner: InnerCell { x: 2, lbl: "cell" } },
+};
+
+component Holder {
+    grid: [[u32; 2]; 2],
+    cells: [InnerCell; 2],
+    labels: [InlineStr<16>; 2],
+    m: mat3,
+    bs: BitSet<64>,
+    sv: SmallVec<f32, 4>,
+    wrap: TimerWrap,
+    pair: (u32, f32) = (7, 2.5),
+}
+
+migrate Health from 1.0.0 to 2.0.0 (old: &HealthV1) -> Health {
+    Health { hp: old.cur, name_tag: old.label }
+}
+
+const C_PAIR: (u32, f32) = (9, 3.5);
+
+sys composite_work(clk: &res Clock) {
+    let (pa, pb) = C_PAIR;
+    let r0 = Drops[Act::Slash];
+    let r1 = r0;
+    let _copy_x = r1.inner.x;
+    for row in query(h: &mut Holder) {
+        row.h.grid[1][0] = pa;
+        row.h.cells[1].x = 42;
+        let _lbl = row.h.labels[1];
+        row.h.bs.set(35);
+        let _has = row.h.bs.has(35);
+        row.h.sv.push(pb);
+        row.h.wrap.gw.arm(0.5);
+        row.h.wrap.gw.tick(clk.dt);
+        row.h.wrap.ib.buffer(Act::Slash, 0.2);
+        row.h.wrap.ib.tick(clk.dt);
+    }
+}
+
+schedule FixedUpdate { composite_work }
+"#;
+    let (_, all_rs) = emit_all_rust("wave2b_comp.strata", src);
+    assert!(
+        all_rs.contains("pub bs: [u32; 2]"),
+        "BUG-TL-01 word-aligned BitSet<64> sizing missing"
+    );
+    assert!(
+        all_rs.contains("pub sv: [u32; 6]"),
+        "BUG-TL-09 SmallVec<f32, 4> layout missing"
+    );
+    assert!(
+        all_rs.contains("strata_ptr_bytes_mut") || all_rs.contains("strata_get_slot_bytes"),
+        "BUG-TL-06 MutPtr/Slot byte write helpers missing"
+    );
+    assert!(
+        all_rs.contains("migrate_src") && all_rs.contains("migrate_pod_component_column"),
+        "BUG-TL-04 migrate emission missing"
+    );
+    assert!(
+        all_rs.contains(".max("),
+        "BUG-TL-05 GraceArm .max() missing"
+    );
+}
+
+#[test]
+fn rust_guest_ecs_flow_spatial_and_schedule_regressions() {
+    let src = r#"
+module test::wave2b_ecs @version(1.0.0);
+
+event HitEv { dmg: i32 }
+stream PulseMsg { tick: u32 }
+relation ChildOf [exclusive];
+relation Follows [exclusive];
+
+component Unit {
+    pos2: vec2 = vec2(1.0, 2.0),
+    pos3: vec3 = vec3(1.0, 0.0, 2.0),
+    hp: i32 = 10,
+}
+component Ally { hp: i32 = 5 }
+resource Clock { dt: f32 = 0.02 }
+
+object Hero { Unit { hp: 99 } }
+
+spatial_grid GridXZ(
+    cell_size: 4.0_m,
+    bounds: vec2(-16.0_m, -16.0_m)..vec2(16.0_m, 16.0_m),
+    plane: xz,
+    capacity: 16,
+) over Unit by Unit.pos3;
+
+spatial_history HistXZ(
+    frames: 4,
+    cell_size: 4.0_m,
+    bounds: vec2(-16.0_m, -16.0_m)..vec2(16.0_m, 16.0_m),
+    plane: xz,
+    capacity: 16,
+) over Unit by Unit.pos3;
+
+timeline StrikeTl @rate(60_hz) @duration(20_f) {
+    window active = 4_f..12_f;
+    at 6_f => emit(PulseMsg { tick: 1 });
+}
+
+sys on_start(cmds: &mut Commands) {
+    let _e = Hero.entity();
+    let p = cmds.spawn((Unit { hp: 20 },)).id();
+    let c = cmds.spawn((Ally { hp: 5 },)).id();
+    cmds.insert(c, Follows, p);
+}
+
+sys flow_step(
+    cmds: &mut Commands,
+    g: &res GridXZ,
+    h: &res HistXZ,
+    evw: &mut StreamWriter<PulseMsg>,
+) {
+    evw.send(PulseMsg { tick: 1 });
+    for row in query(u: &mut? Unit).added() {
+        if row.u.hp > 5 {
+            row.u.hp += 1;
+            if row.u.hp > 50 {
+                return;
+            }
+        }
+    }
+    for hit in g.query_disc(vec2(1.0, 2.0), 4.0_m) {
+        let _he = hit.entity;
+    }
+    for hit in h.query_segment_at(10_u32, vec3(0.0, 0.0, 0.0), vec3(4.0, 0.0, 0.0), 1.0_m) {
+        let _se = hit.entity;
+    }
+    let pl = HitEv { dmg: 7 };
+    cmds.trigger(Hero.entity(), pl);
+}
+
+sys flow_childof() {
+    for row in query(a: &mut Ally).up<ChildOf>() {
+        row.a.hp += 1;
+    }
+}
+
+sys flow_follows() {
+    for row in query(a: &mut Ally).up<Follows>() {
+        row.a.hp += 2;
+    }
+}
+
+sys flow_query_one() {
+    for opt in query_one(u: &mut? Unit).on(Hero.entity()) {
+        if let Some(r) = opt {
+            r.u.hp += 3;
+        }
+    }
+}
+
+schedule Startup { on_start }
+schedule FixedUpdate {
+    flow_step,
+    set InnerGrp after(flow_step) {
+        flow_childof,
+        flow_follows,
+        flow_query_one
+    }
+}
+"#;
+    let (_, all_rs) = emit_all_rust("wave2b_ecs.strata", src);
+    assert!(
+        all_rs.contains("BAM_STORAGE_FLAG_MESSAGE") || all_rs.contains("0x00000008"),
+        "EQ-02/GF-14 stream BAM_STORAGE_FLAG_MESSAGE missing"
+    );
+    assert!(
+        all_rs.contains("resolve_component::<FfiChildOf>()"),
+        "EQ-05/GF-02 ChildOf FfiChildOf resolve missing"
+    );
+    assert!(
+        all_rs.contains("__strata_rel_parent_Follows"),
+        "EQ-05/GF-02 custom relation companion handle missing"
+    );
+    assert!(
+        all_rs.contains(".added::<"),
+        "EQ-07 QueryBuilder::added missing"
+    );
+    assert!(
+        all_rs.contains("mark_changed_range"),
+        "EQ-06a/b dirty range flush missing"
+    );
+    assert!(
+        all_rs.contains("strata_timeline_advance_bytes"),
+        "GF-03 timeline helper missing"
+    );
+    assert!(
+        all_rs.contains("__strata_named_objects_startup"),
+        "GF-06 Startup named-objects ordering missing"
+    );
+    assert!(
+        all_rs.contains("(tick_offset as usize) >= frames"),
+        "BUG-SW-05 spatial_history OOB frame guard missing"
+    );
+    assert!(
+        all_rs.contains("center_is_vec2"),
+        "BUG-SW-06 2D center projection missing"
+    );
+    assert!(
+        all_rs.contains("ScheduleSetBuilder") && all_rs.contains(".after("),
+        "BUG-SW-07a/c schedule set & constraint ordering missing"
+    );
+}
+
+#[test]
+fn rust_guest_net_soa_mod_resource_and_large_rpc_regressions() {
+    let src = r#"
+module test::wave2b_net @version(1.0.0);
+
+@net(reliable, channel = 0)
+@soa
+component SoaActor {
+    hot { pos: vec3 = vec3(0.0, 0.0, 0.0) }
+    cold meta { hp: u32 = 100 }
+}
+
+@net(reliable, channel = 1)
+resource ModNetState {
+    score: u32 = 0,
+    phase: u8 = 1,
+}
+
+@net_rpc(direction = client_to_server, reliability = reliable, channel = 2)
+rpc BigBlobRpc {
+    seq_id: u32,
+    blob: [u8; 48],
+}
+
+sys tick_net(st: &mut res ModNetState) {
+    st.score += 1;
+}
+
+schedule FixedUpdate { tick_net }
+"#;
+    let (_, all_rs) = emit_all_rust("wave2b_net.strata", src);
+    assert!(
+        all_rs.contains("strata_net_encode_SoaActor(src_0:")
+            && all_rs.contains("strata_net_decode_SoaActor(pkt: &StrataNetPacket, out_0:")
+            && all_rs.contains(".or_group(1,"),
+        "NT-03 multi-stratum @soa codec & TX or_group missing"
+    );
+    assert!(
+        all_rs.contains("mod_res_") && all_rs.contains("_shadow:"),
+        "NT-04 module-local @net resource shadow missing"
+    );
+    assert!(
+        all_rs.contains("pub struct StrataRpc_BigBlobRpc")
+            && all_rs.contains("impl Default for StrataRpc_BigBlobRpc")
+            && all_rs.contains("[0u8; 48]"),
+        "NT-06 explicit Default impl for [u8; 48] RPC missing"
+    );
+}

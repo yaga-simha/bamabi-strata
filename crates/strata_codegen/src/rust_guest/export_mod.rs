@@ -109,6 +109,15 @@ pub(super) fn emit_plugin_and_registration(
     }
 
     // 2. Register components, tags, events, streams; probe host-registered resources without calling register_dynamic_component
+    writeln!(
+        out,
+        "        handles.bam_child_of = match app.resolve_component::<FfiChildOf>() {{\n\
+         \x20           Ok(h) => h,\n\
+         \x20           Err(FfiResult::NOT_FOUND) => BamComponent::INVALID,\n\
+         \x20           Err(e) => return e,\n\
+         \x20       }};"
+    )
+    .ok();
     for &cid in &cat.topo_order {
         let c = &cat.components[cid];
         if !c.register_dynamic && !c.is_resource_like() {
@@ -116,6 +125,10 @@ pub(super) fn emit_plugin_and_registration(
         }
         let sname = &c.struct_name;
         let hfield = &c.handle_field;
+        if c.canonical_name == "ChildOf" || c.canonical_name.ends_with("::ChildOf") {
+            writeln!(out, "        handles.{hfield} = handles.bam_child_of;").ok();
+            continue;
+        }
         if c.is_resource_like() {
             writeln!(
                 out,
@@ -158,6 +171,15 @@ pub(super) fn emit_plugin_and_registration(
 
     // 3. Register relations (`register_relation`)
     for rel in &cat.relations {
+        if rel.canonical_name == "ChildOf" || rel.canonical_name.ends_with("::ChildOf") {
+            writeln!(
+                out,
+                "        handles.{} = handles.bam_child_of;",
+                rel.handle_field
+            )
+            .ok();
+            continue;
+        }
         let esc = escape_rust_str(&rel.canonical_name);
         let uuid_lit = format_u8_array_16(&rel.uuid_bytes);
         let mut builder_chain = format!(
@@ -496,9 +518,6 @@ pub(super) fn emit_plugin_and_registration(
             s_idx,
             &sched.nodes,
             sched_id,
-            "BamSystemSet::INVALID",
-            false,
-            &mut None,
             &mut set_counter,
             &sys_handle_vars,
         );
@@ -554,6 +573,7 @@ pub(super) fn emit_guest_net_sys_registration(
             format!("strata_net_tx_{chunk_idx}")
         };
         writeln!(out, "        if let Some(_net_h) = _net_pkt_handle {{").ok();
+        writeln!(out, "            let _w_net = Arc::clone(&world_state);").ok();
         writeln!(out, "            let _h_net = handles;").ok();
         writeln!(out, "            let mut _net_res_cnt: usize = 0;").ok();
         writeln!(
@@ -613,19 +633,45 @@ pub(super) fn emit_guest_net_sys_registration(
         writeln!(out, "            let _net_res = _nb.{msg_method}(_net_h)").ok();
         for nc in chunk {
             if !nc.is_resource
-                && let Some(comp) = cat.resolve_comp(&nc.canonical_name)
+                && let Ok(strata) = net_comp_strata(nc, cat)
+                && !strata.is_empty()
             {
-                let sname = &comp.struct_name;
-                if is_rx {
-                    writeln!(out, "                .query(|q| q.write::<{sname}>())").ok();
+                if strata.len() == 1 {
+                    let sname = &strata[0].1.struct_name;
+                    if is_rx {
+                        writeln!(out, "                .query(|q| q.write::<{sname}>())").ok();
+                    } else {
+                        writeln!(out, "                .query(|q| q.changed::<{sname}>())").ok();
+                    }
+                } else if is_rx {
+                    writeln!(out, "                .query(|mut q| {{").ok();
+                    for (_, comp) in &strata {
+                        let sname = &comp.struct_name;
+                        writeln!(out, "                    q = q.write::<{sname}>();").ok();
+                    }
+                    writeln!(out, "                    q\n                }})").ok();
                 } else {
-                    writeln!(out, "                .query(|q| q.changed::<{sname}>())").ok();
+                    writeln!(out, "                .query(|mut q| {{").ok();
+                    for (_, comp) in &strata {
+                        let sname = &comp.struct_name;
+                        writeln!(out, "                    q = q.read::<{sname}>();").ok();
+                    }
+                    writeln!(out, "                    q.or_group(1, |mut g| {{").ok();
+                    for (_, comp) in &strata {
+                        let sname = &comp.struct_name;
+                        writeln!(out, "                        g = g.changed::<{sname}>();").ok();
+                    }
+                    writeln!(
+                        out,
+                        "                        g\n                    }})\n                }})"
+                    )
+                    .ok();
                 }
             }
         }
         writeln!(
             out,
-            "                .build(move |mut ctx| {fn_name}(&mut ctx, &_h_net, _net_res_cnt));\n\
+            "                .build(move |mut ctx| {fn_name}(&mut ctx, &_w_net, &_h_net, _net_res_cnt));\n\
              \x20           if !_net_res.is_ok() {{ return _net_res; }}\n\
              \x20       }}"
         )
@@ -826,6 +872,13 @@ pub(super) fn emit_system_builder_registration(
     .ok();
     if handle_var.is_none() {
         writeln!(out, "        _b_s{idx} = _b_s{idx}.schedule({sched_id});").ok();
+    }
+    if !mir.objects.is_empty() && sched_label == "Startup" {
+        writeln!(
+            out,
+            "        _b_s{idx} = _b_s{idx}.after(c\"__strata_named_objects_startup\");"
+        )
+        .ok();
     }
     if let Some(tt_name) = after_timer_tick {
         let tt_esc = escape_rust_str(tt_name);
@@ -1042,21 +1095,43 @@ pub(super) fn emit_query_builder_chain(
     trailing_semi: &str,
 ) {
     writeln!(out, "{indent}{call_prefix}(|mut q| {{").ok();
+    let mut post_changed: Vec<&str> = Vec::new();
+    let mut post_added: Vec<&str> = Vec::new();
     for pt in &pq.terms {
         let sname = &cat.components[pt.comp_id].struct_name;
-        let method = match pt.mode {
-            TermAccessMode::Write | TermAccessMode::SelectiveWrite => "write",
-            TermAccessMode::OptionalRead => "optional_read",
-            TermAccessMode::OptionalWrite => "optional_write",
-            TermAccessMode::Allow => "allow",
-            TermAccessMode::Has => "has",
-            TermAccessMode::RemovedRead => "removed",
-            TermAccessMode::With => "with",
-            TermAccessMode::Without => "without",
-            _ if pt.changed_filter => "changed",
-            _ => "read",
+        let is_opt = matches!(
+            pt.mode,
+            TermAccessMode::OptionalRead | TermAccessMode::OptionalWrite
+        );
+        let (method, handled_changed, handled_added) = match pt.mode {
+            TermAccessMode::Write | TermAccessMode::SelectiveWrite => ("write", false, false),
+            TermAccessMode::OptionalRead => ("optional_read", false, false),
+            TermAccessMode::OptionalWrite => ("optional_write", false, false),
+            TermAccessMode::Allow => ("allow", false, false),
+            TermAccessMode::Has => ("has", false, false),
+            TermAccessMode::RemovedRead => ("removed", false, false),
+            TermAccessMode::With => ("with", false, false),
+            TermAccessMode::Without => ("without", false, false),
+            _ if pt.changed_filter && !pt.added_filter => ("changed", true, false),
+            _ if pt.added_filter && !pt.changed_filter => ("added", false, true),
+            _ if pt.changed_filter && pt.added_filter => ("changed", true, false),
+            _ => ("read", false, false),
         };
         writeln!(out, "{indent}    q = q.{method}::<{sname}>();").ok();
+        if !is_opt {
+            if pt.changed_filter && !handled_changed {
+                post_changed.push(sname.as_str());
+            }
+            if pt.added_filter && !handled_added {
+                post_added.push(sname.as_str());
+            }
+        }
+    }
+    for sname in post_changed {
+        writeln!(out, "{indent}    q = q.changed::<{sname}>();").ok();
+    }
+    for sname in post_added {
+        writeln!(out, "{indent}    q = q.added::<{sname}>();").ok();
     }
     for cid in &pq.with_filters {
         let sname = &cat.components[*cid].struct_name;
@@ -1066,97 +1141,359 @@ pub(super) fn emit_query_builder_chain(
         let sname = &cat.components[*cid].struct_name;
         writeln!(out, "{indent}    q = q.without::<{sname}>();").ok();
     }
-    for pt in &pq.terms {
-        let sname = &cat.components[pt.comp_id].struct_name;
-        if pt.changed_filter && pt.mode != TermAccessMode::Read {
-            writeln!(out, "{indent}    q = q.changed::<{sname}>();").ok();
-        }
-        if pt.added_filter {
-            writeln!(out, "{indent}    q = q.added::<{sname}>();").ok();
-        }
-    }
     for cid in &pq.extra_changed_filters {
         let sname = &cat.components[*cid].struct_name;
         writeln!(out, "{indent}    q = q.changed::<{sname}>();").ok();
     }
+    for cid in &pq.extra_added_filters {
+        let sname = &cat.components[*cid].struct_name;
+        writeln!(out, "{indent}    q = q.added::<{sname}>();").ok();
+    }
     writeln!(out, "{indent}    q\n{indent}}}){trailing_semi}").ok();
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_schedule_nodes(
     out: &mut String,
     sched_idx: usize,
     nodes: &[HirScheduleGroup],
     sched_id: &str,
-    parent_set: &str,
-    parent_is_seq: bool,
-    prev_sibling_set: &mut Option<String>,
     set_counter: &mut usize,
     sys_handles: &HashMap<String, String>,
 ) {
-    for node in nodes {
-        if node.kind == "leaf" {
-            if let Some(sys_var) = sys_handles.get(&node.name) {
-                writeln!(
-                    out,
-                    "        let _mnt = app.mount_system({sys_var}, {sched_id}, {parent_set});\n\
-                     \x20       if !_mnt.is_ok() {{ return _mnt; }}"
-                )
-                .ok();
+    struct ScheduleSetPlan {
+        idx: usize,
+        set_name: String,
+        var_name: String,
+        kind: String,
+        leaf_sys_var: Option<String>,
+        parent_idx: Option<usize>,
+        after_deps: Vec<(usize, bool)>,
+        raw_before: Vec<String>,
+        raw_after: Vec<String>,
+        raw_names: Vec<String>,
+    }
+
+    fn collect_refs(nodes: &[HirScheduleGroup], out: &mut HashSet<String>) {
+        for n in nodes {
+            for b in &n.before {
+                out.insert(b.clone());
+                out.insert(bare_unqualified_name(b));
             }
+            for a in &n.after {
+                out.insert(a.clone());
+                out.insert(bare_unqualified_name(a));
+            }
+            collect_refs(&n.children, out);
+        }
+    }
+
+    fn flatten_nodes(
+        nodes: &[HirScheduleGroup],
+        sched_idx: usize,
+        parent_idx: Option<usize>,
+        parent_is_seq: bool,
+        parent_is_weak: bool,
+        referenced_names: &HashSet<String>,
+        set_counter: &mut usize,
+        sys_handles: &HashMap<String, String>,
+        plans: &mut Vec<ScheduleSetPlan>,
+        unwrapped_leaves: &mut Vec<(String, Option<usize>)>,
+    ) {
+        let mut prev_sibling: Option<usize> = None;
+        for node in nodes {
+            let bare_node = bare_unqualified_name(&node.name);
+            let is_refd = !node.name.is_empty()
+                && (referenced_names.contains(&node.name) || referenced_names.contains(&bare_node));
+            if node.kind == "leaf" {
+                let Some(sys_var) = sys_handles.get(&node.name) else {
+                    continue;
+                };
+                if parent_is_seq || !node.before.is_empty() || !node.after.is_empty() || is_refd {
+                    let k = *set_counter;
+                    *set_counter += 1;
+                    let idx = plans.len();
+                    let raw_name = if node.name.trim().is_empty() {
+                        format!("sched_{sched_idx}_leaf_{k}")
+                    } else {
+                        format!("sched_{sched_idx}_leaf_{}_{k}", sanitize_ident(&bare_node))
+                    };
+                    let mut after_deps = Vec::new();
+                    if parent_is_seq && let Some(prev) = prev_sibling {
+                        after_deps.push((prev, parent_is_weak));
+                    }
+                    let mut raw_names = vec![node.name.clone()];
+                    if bare_node != node.name {
+                        raw_names.push(bare_node);
+                    }
+                    plans.push(ScheduleSetPlan {
+                        idx,
+                        set_name: raw_name,
+                        var_name: format!("_set_{k}"),
+                        kind: "leaf".to_owned(),
+                        leaf_sys_var: Some(sys_var.clone()),
+                        parent_idx,
+                        after_deps,
+                        raw_before: node.before.clone(),
+                        raw_after: node.after.clone(),
+                        raw_names,
+                    });
+                    if parent_is_seq {
+                        prev_sibling = Some(idx);
+                    }
+                } else {
+                    unwrapped_leaves.push((sys_var.clone(), parent_idx));
+                }
+                continue;
+            }
+
+            let k = *set_counter;
+            *set_counter += 1;
+            let idx = plans.len();
+            let raw_name = if node.name.trim().is_empty() {
+                format!("sched_{sched_idx}_{}_{k}", sanitize_ident(&node.kind))
+            } else {
+                format!("sched_{sched_idx}_{}_{k}", sanitize_ident(&bare_node))
+            };
+            let mut after_deps = Vec::new();
+            if parent_is_seq && let Some(prev) = prev_sibling {
+                after_deps.push((prev, parent_is_weak));
+            }
+            let mut raw_names = Vec::new();
+            if !node.name.trim().is_empty() {
+                raw_names.push(node.name.clone());
+                if bare_node != node.name {
+                    raw_names.push(bare_node);
+                }
+            }
+            plans.push(ScheduleSetPlan {
+                idx,
+                set_name: raw_name,
+                var_name: format!("_set_{k}"),
+                kind: node.kind.clone(),
+                leaf_sys_var: None,
+                parent_idx,
+                after_deps,
+                raw_before: node.before.clone(),
+                raw_after: node.after.clone(),
+                raw_names,
+            });
+            if parent_is_seq {
+                prev_sibling = Some(idx);
+            }
+
+            let child_is_seq = matches!(node.kind.as_str(), "seq" | "seq_weak");
+            let child_is_weak = node.kind == "seq_weak";
+            flatten_nodes(
+                &node.children,
+                sched_idx,
+                Some(idx),
+                child_is_seq,
+                child_is_weak,
+                referenced_names,
+                set_counter,
+                sys_handles,
+                plans,
+                unwrapped_leaves,
+            );
+        }
+    }
+
+    let mut referenced_names = HashSet::new();
+    collect_refs(nodes, &mut referenced_names);
+    let mut plans = Vec::new();
+    let mut unwrapped_leaves = Vec::new();
+    flatten_nodes(
+        nodes,
+        sched_idx,
+        None,
+        false,
+        false,
+        &referenced_names,
+        set_counter,
+        sys_handles,
+        &mut plans,
+        &mut unwrapped_leaves,
+    );
+
+    let mut name_to_idxs: HashMap<String, Vec<usize>> = HashMap::new();
+    for p in &plans {
+        for nm in &p.raw_names {
+            name_to_idxs.entry(nm.clone()).or_default().push(p.idx);
+        }
+    }
+
+    let before_edges: Vec<(usize, String)> = plans
+        .iter()
+        .flat_map(|p| p.raw_before.iter().map(move |tgt| (p.idx, tgt.clone())))
+        .collect();
+    for (src_idx, tgt_name) in before_edges {
+        let targets = name_to_idxs
+            .get(&tgt_name)
+            .or_else(|| name_to_idxs.get(&bare_unqualified_name(&tgt_name)))
+            .cloned()
+            .unwrap_or_default();
+        for t_idx in targets {
+            if t_idx != src_idx {
+                plans[t_idx].after_deps.push((src_idx, false));
+            }
+        }
+    }
+    let raw_afters: Vec<Vec<String>> = plans.iter().map(|p| p.raw_after.clone()).collect();
+    for (idx, after_names) in raw_afters.into_iter().enumerate() {
+        for dep_name in after_names {
+            let deps = name_to_idxs
+                .get(&dep_name)
+                .or_else(|| name_to_idxs.get(&bare_unqualified_name(&dep_name)))
+                .cloned()
+                .unwrap_or_default();
+            for d_idx in deps {
+                if d_idx != idx {
+                    plans[idx].after_deps.push((d_idx, false));
+                }
+            }
+        }
+    }
+
+    // Propagate parent group ordering onto nested sets/leaves since ABI v0.3 `ScheduleSetBuilder`
+    // has `.before`/`.after` without `.in_set`.
+    let n = plans.len();
+    let mut children_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for p in &plans {
+        if let Some(par) = p.parent_idx {
+            children_of[par].push(p.idx);
+        }
+    }
+    let mut descendants_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for idx in (0..n).rev() {
+        let mut desc = Vec::new();
+        for &c in &children_of[idx] {
+            desc.push(c);
+            desc.extend_from_slice(&descendants_of[c]);
+        }
+        descendants_of[idx] = desc;
+    }
+    let parent_idxs: Vec<Option<usize>> = plans.iter().map(|p| p.parent_idx).collect();
+    for (idx, par_opt) in parent_idxs.into_iter().enumerate() {
+        if let Some(par) = par_opt {
+            let par_deps = plans[par].after_deps.clone();
+            for (dep, is_weak) in par_deps {
+                if dep != idx && !descendants_of[idx].contains(&dep) {
+                    plans[idx].after_deps.push((dep, is_weak));
+                }
+            }
+        }
+    }
+    let all_after_deps: Vec<Vec<(usize, bool)>> =
+        plans.iter().map(|p| p.after_deps.clone()).collect();
+    for (idx, cur_deps) in all_after_deps.into_iter().enumerate() {
+        for (dep, is_weak) in cur_deps {
+            for &d_child in &descendants_of[dep] {
+                if d_child != idx
+                    && !descendants_of[idx].contains(&d_child)
+                    && !descendants_of[d_child].contains(&idx)
+                {
+                    plans[idx].after_deps.push((d_child, is_weak));
+                }
+            }
+        }
+    }
+
+    // Kahn's topological order so `.after(_set_d)` only references declared sets.
+    let mut indeg = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for p in &plans {
+        let mut prereqs = Vec::new();
+        if let Some(par) = p.parent_idx {
+            prereqs.push(par);
+        }
+        for &(dep, _) in &p.after_deps {
+            prereqs.push(dep);
+        }
+        prereqs.sort_unstable();
+        prereqs.dedup();
+        for pr in prereqs {
+            if pr != p.idx {
+                dependents[pr].push(p.idx);
+                indeg[p.idx] += 1;
+            }
+        }
+    }
+    let mut queue: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+    let mut q_head = 0usize;
+    let mut order = Vec::with_capacity(n);
+    let mut in_order = vec![false; n];
+    while q_head < queue.len() {
+        let cur = queue[q_head];
+        q_head += 1;
+        if in_order[cur] {
             continue;
         }
+        in_order[cur] = true;
+        order.push(cur);
+        for &nxt in &dependents[cur] {
+            indeg[nxt] = indeg[nxt].saturating_sub(1);
+            if indeg[nxt] == 0 {
+                queue.push(nxt);
+            }
+        }
+    }
+    for (i, &seen) in in_order.iter().enumerate() {
+        if !seen {
+            order.push(i);
+        }
+    }
 
-        let k = *set_counter;
-        *set_counter += 1;
-        let raw_name = if node.name.trim().is_empty() {
-            format!("sched_{sched_idx}_{}_{k}", sanitize_ident(&node.kind))
-        } else {
-            let bare_node = bare_unqualified_name(&node.name);
-            format!("sched_{sched_idx}_{}_{k}", sanitize_ident(&bare_node))
-        };
-        let esc_set = escape_rust_str(&raw_name);
-        let set_var = format!("_set_{k}");
-
-        let mode_call = match node.kind.as_str() {
+    let mut emitted_sets = HashSet::new();
+    for &idx in &order {
+        let p = &plans[idx];
+        let esc_set = escape_rust_str(&p.set_name);
+        let set_var = &p.var_name;
+        let mode_call = match p.kind.as_str() {
             "seq" => ".sequence()",
             "seq_weak" => ".sequence_weak()",
             "par" => ".parallel()",
             _ => "",
         };
-        let after_call = if parent_is_seq && let Some(prev) = prev_sibling_set.as_ref() {
-            format!(".after({prev})")
-        } else {
-            String::new()
-        };
-
+        let mut chain =
+            format!("ScheduleSetBuilder::new(\"{esc_set}\").schedule({sched_id}){mode_call}");
+        let mut seen_after = HashSet::new();
+        for &(dep, is_weak) in &p.after_deps {
+            if emitted_sets.contains(&dep) && seen_after.insert(dep) {
+                let method = if is_weak { "after_weak" } else { "after" };
+                chain.push_str(&format!(".{method}({})", plans[dep].var_name));
+            }
+        }
         writeln!(
             out,
             "        let {set_var} = match app.configure_schedule_set(\n\
-             \x20           ScheduleSetBuilder::new(\"{esc_set}\").schedule({sched_id}){mode_call}{after_call}\n\
+             \x20           {chain}\n\
              \x20       ) {{\n\
              \x20           Ok(s) => s,\n\
              \x20           Err(e) => return e,\n\
              \x20       }};"
         )
         .ok();
-        if parent_is_seq {
-            *prev_sibling_set = Some(set_var.clone());
+        emitted_sets.insert(idx);
+    }
+    for p in &plans {
+        if let Some(ref sys_var) = p.leaf_sys_var {
+            let set_var = &p.var_name;
+            writeln!(
+                out,
+                "        let _mnt = app.mount_system({sys_var}, {sched_id}, {set_var});\n\
+                 \x20       if !_mnt.is_ok() {{ return _mnt; }}"
+            )
+            .ok();
         }
-
-        let child_is_seq = matches!(node.kind.as_str(), "seq" | "seq_weak");
-        let mut child_prev: Option<String> = None;
-        emit_schedule_nodes(
+    }
+    for (sys_var, par_opt) in unwrapped_leaves {
+        let par_expr = par_opt.map_or("BamSystemSet::INVALID", |pi| plans[pi].var_name.as_str());
+        writeln!(
             out,
-            sched_idx,
-            &node.children,
-            sched_id,
-            &set_var,
-            child_is_seq,
-            &mut child_prev,
-            set_counter,
-            sys_handles,
-        );
+            "        let _mnt = app.mount_system({sys_var}, {sched_id}, {par_expr});\n\
+             \x20       if !_mnt.is_ok() {{ return _mnt; }}"
+        )
+        .ok();
     }
 }
 
@@ -1383,7 +1720,26 @@ pub(super) fn format_hir_expr_rust(
             _ if matches!(ty, Ty::F64) => fmt_f64(*value),
             _ => fmt_f32(*value as f32),
         },
-        HirExpr::StringLit(s) => format!("\"{}\"", escape_rust_str(s)),
+        HirExpr::StringLit(s) => {
+            if let Ty::InlineStr(cap) = target_ty {
+                let words = 1 + cap.div_ceil(4);
+                let mut out_words = vec![0u32; words];
+                let mut end = s.len().min(*cap);
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                out_words[0] = end as u32;
+                for (wi, chunk) in s.as_bytes()[..end].chunks(4).enumerate() {
+                    let mut arr = [0u8; 4];
+                    arr[..chunk.len()].copy_from_slice(chunk);
+                    out_words[1 + wi] = u32::from_le_bytes(arr);
+                }
+                let parts: Vec<String> = out_words.iter().map(|w| format!("{w}u32")).collect();
+                format!("[{}]", parts.join(", "))
+            } else {
+                format!("\"{}\"", escape_rust_str(s))
+            }
+        }
         HirExpr::Path { name, .. } => {
             if let Some(vec_expr) = rust_vec_path_const(name) {
                 vec_expr.to_owned()
@@ -1521,6 +1877,71 @@ pub(super) fn format_hir_expr_rust(
         HirExpr::Call(c)
             if matches!(
                 c.callee.rsplit("::").next().unwrap_or(c.callee.as_str()),
+                "mat3" | "Mat3"
+            ) =>
+        {
+            if c.args.len() >= 9 {
+                let vals: Vec<String> = c
+                    .args
+                    .iter()
+                    .take(9)
+                    .map(|a| format_hir_expr_rust(a, &Ty::F32, mir, _cat))
+                    .collect();
+                format!("[{}]", vals.join(", "))
+            } else if c.args.len() == 3 {
+                let mut cols = Vec::with_capacity(9);
+                for a in &c.args {
+                    let v = format_hir_expr_rust(a, &Ty::Vec3, mir, _cat);
+                    cols.push(format!("({v})[0]"));
+                    cols.push(format!("({v})[1]"));
+                    cols.push(format!("({v})[2]"));
+                }
+                format!("[{}]", cols.join(", "))
+            } else {
+                let d = c.args.first().map_or_else(
+                    || "1.0f32".to_owned(),
+                    |a| format_hir_expr_rust(a, &Ty::F32, mir, _cat),
+                );
+                format!("[{d}, 0.0f32, 0.0f32, 0.0f32, {d}, 0.0f32, 0.0f32, 0.0f32, {d}]")
+            }
+        }
+        HirExpr::Call(c)
+            if matches!(
+                c.callee.rsplit("::").next().unwrap_or(c.callee.as_str()),
+                "mat4" | "Mat4"
+            ) =>
+        {
+            if c.args.len() >= 16 {
+                let vals: Vec<String> = c
+                    .args
+                    .iter()
+                    .take(16)
+                    .map(|a| format_hir_expr_rust(a, &Ty::F32, mir, _cat))
+                    .collect();
+                format!("[{}]", vals.join(", "))
+            } else if c.args.len() == 4 {
+                let mut cols = Vec::with_capacity(16);
+                for a in &c.args {
+                    let v = format_hir_expr_rust(a, &Ty::Vec4, mir, _cat);
+                    cols.push(format!("({v})[0]"));
+                    cols.push(format!("({v})[1]"));
+                    cols.push(format!("({v})[2]"));
+                    cols.push(format!("({v})[3]"));
+                }
+                format!("[{}]", cols.join(", "))
+            } else {
+                let d = c.args.first().map_or_else(
+                    || "1.0f32".to_owned(),
+                    |a| format_hir_expr_rust(a, &Ty::F32, mir, _cat),
+                );
+                format!(
+                    "[{d}, 0.0f32, 0.0f32, 0.0f32, 0.0f32, {d}, 0.0f32, 0.0f32, 0.0f32, 0.0f32, {d}, 0.0f32, 0.0f32, 0.0f32, 0.0f32, {d}]"
+                )
+            }
+        }
+        HirExpr::Call(c)
+            if matches!(
+                c.callee.rsplit("::").next().unwrap_or(c.callee.as_str()),
                 "meters" | "sec" | "ms" | "rad" | "deg" | "mps" | "mps2" | "hz" | "frames"
             ) =>
         {
@@ -1608,15 +2029,71 @@ pub(super) fn format_hir_expr_rust(
             }
         }
         HirExpr::ArrayLit { elems, .. } => {
-            let elem_ty = match target_ty {
-                Ty::Array { elem, .. } => elem.as_ref(),
-                _ => &Ty::I32,
-            };
-            let vals: Vec<String> = elems
-                .iter()
-                .map(|e| format_hir_expr_rust(e, elem_ty, mir, _cat))
-                .collect();
-            format!("[{}]", vals.join(", "))
+            if let Ty::SmallVec { elem, cap } = target_ty {
+                let (sv_sz, sv_al) =
+                    crate::rust_guest::items::guest_ty_abi_size_align(target_ty, mir);
+                let elem_exprs: Vec<String> = elems
+                    .iter()
+                    .take(*cap)
+                    .map(|e| {
+                        if **elem == Ty::Bool {
+                            if let HirExpr::BoolLit(b) = e {
+                                format!("FfiBool::from_bool({b})")
+                            } else {
+                                format!(
+                                    "FfiBool::from_bool({})",
+                                    format_hir_expr_rust(e, &Ty::Bool, mir, _cat)
+                                )
+                            }
+                        } else {
+                            format_hir_expr_rust(e, elem, mir, _cat)
+                        }
+                    })
+                    .collect();
+                crate::rust_guest::items::emit_const_pack_smallvec_expr(
+                    &elem_exprs,
+                    elem,
+                    sv_sz,
+                    sv_al,
+                    *cap,
+                    mir,
+                    _cat,
+                )
+            } else {
+                let elem_ty = match target_ty {
+                    Ty::Array { elem, .. } => elem.as_ref(),
+                    _ => &Ty::I32,
+                };
+                let vals: Vec<String> = elems
+                    .iter()
+                    .map(|e| format_hir_expr_rust(e, elem_ty, mir, _cat))
+                    .collect();
+                format!("[{}]", vals.join(", "))
+            }
+        }
+        HirExpr::Tuple { elems, .. } => {
+            if elems.is_empty() {
+                "()".to_owned()
+            } else if let Ty::Tuple(item_tys) = target_ty {
+                let parts: Vec<String> = elems
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let ety = item_tys.get(i).unwrap_or(&Ty::Unknown);
+                        format_hir_expr_rust(e, ety, mir, _cat)
+                    })
+                    .collect();
+                format!("({})", parts.join(", "))
+            } else {
+                let parts: Vec<String> = elems
+                    .iter()
+                    .map(|e| {
+                        let ety = infer_const_hir_expr_ty(e, mir);
+                        format_hir_expr_rust(e, &ety, mir, _cat)
+                    })
+                    .collect();
+                format!("({})", parts.join(", "))
+            }
         }
         HirExpr::Unary {
             op: strata_sema::hir::HirUnOp::Neg,
@@ -1777,21 +2254,35 @@ pub(super) fn format_hir_expr_rust(
                 } else {
                     let inner_s = format_hir_expr_rust(expr, &src_ty, mir, _cat);
                     let is_float = matches!(src_ty, Ty::F32 | Ty::F64 | Ty::UnitScalar { .. });
-                    match (cast_ty, is_float) {
-                        (Ty::Fix32, true) => {
+                    match (&src_ty, cast_ty, is_float) {
+                        (Ty::Fix32, Ty::Fix32, _) => format!("(({inner_s}) as i32)"),
+                        (Ty::Fix64, Ty::Fix64, _) => format!("(({inner_s}) as i64)"),
+                        (Ty::Fix32, Ty::Fix64, _) => format!("((({inner_s}) as i32 as i64) << 16)"),
+                        (Ty::Fix64, Ty::Fix32, _) => format!(
+                            "(((({inner_s}) as i64) >> 16).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)"
+                        ),
+                        (Ty::Bool, Ty::Fix32, _) => {
+                            format!("(if ({inner_s}) {{ 65536_i32 }} else {{ 0_i32 }})")
+                        }
+                        (Ty::Bool, Ty::Fix64, _) => {
+                            format!("(if ({inner_s}) {{ 4294967296_i64 }} else {{ 0_i64 }})")
+                        }
+                        (_, Ty::Fix32, true) => {
                             format!(
                                 "{{ let __v = ({inner_s}) as f64; if __v.is_finite() {{ let __x = __v * 65536.0_f64; (if __x >= 0.0_f64 {{ __x + 0.5_f64 }} else {{ __x - 0.5_f64 }}) as i32 }} else {{ 0 }} }}"
                             )
                         }
-                        (Ty::Fix32, false) => {
-                            format!("((({inner_s}) as i64).saturating_mul(65536) as i32)")
+                        (_, Ty::Fix32, false) => {
+                            format!(
+                                "((({inner_s}) as i64).saturating_mul(65536).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)"
+                            )
                         }
-                        (Ty::Fix64 | _, true) => {
+                        (_, Ty::Fix64 | _, true) => {
                             format!(
                                 "{{ let __v = ({inner_s}) as f64; if __v.is_finite() {{ let __x = __v * 4294967296.0_f64; (if __x >= 0.0_f64 {{ __x + 0.5_f64 }} else {{ __x - 0.5_f64 }}) as i64 }} else {{ 0 }} }}"
                             )
                         }
-                        (_, false) => format!("((({inner_s}) as i64).wrapping_shl(32))"),
+                        (_, _, false) => format!("((({inner_s}) as i64).wrapping_shl(32))"),
                     }
                 }
             } else {
@@ -1977,6 +2468,8 @@ fn infer_const_hir_expr_ty(expr: &HirExpr, mir: &MirModule) -> Ty {
             "uvec2" | "UVec2" => Ty::UVec2,
             "quat" | "Quat" => Ty::Quat,
             "rgba" | "Rgba" => Ty::Rgba,
+            "mat3" | "Mat3" => Ty::Mat3,
+            "mat4" | "Mat4" => Ty::Mat4,
             "bits" => Ty::BitSet(32),
             "meters" | "sec" | "ms" | "rad" | "deg" | "mps" | "mps2" | "hz" | "frames" => Ty::F32,
             _ => Ty::Unknown,
@@ -2021,6 +2514,41 @@ pub(super) fn hir_expr_to_strata_val(
         Ty::BitSet(_) => {
             let r = format_hir_expr_rust(expr, ty, mir, cat);
             return format!("StrataVal::Words({r}.to_vec())");
+        }
+        Ty::SmallVec { elem, .. } => {
+            if let HirExpr::ArrayLit { elems, .. } = expr {
+                let parts: Vec<String> = elems
+                    .iter()
+                    .map(|e| hir_expr_to_strata_val(e, elem, mir, cat))
+                    .collect();
+                return format!("StrataVal::Arr(vec![{}])", parts.join(", "));
+            }
+            let r = format_hir_expr_rust(expr, ty, mir, cat);
+            return format!(
+                "{{ let _tmp = {r}; let mut _raw = Vec::new(); for _w in &_tmp {{ strata_push_le_into(&mut _raw, *_w); }} StrataVal::Bytes(_raw) }}"
+            );
+        }
+        Ty::Mat3 | Ty::Mat4 => {
+            let r = format_hir_expr_rust(expr, ty, mir, cat);
+            return format!("StrataVal::Arr(({r}).iter().map(|_x| StrataVal::F32(*_x)).collect())");
+        }
+        Ty::Tuple(item_tys) => {
+            if let HirExpr::Tuple { elems, .. } = expr {
+                let parts: Vec<String> = elems
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let ety = item_tys.get(i).unwrap_or(&Ty::Unknown);
+                        hir_expr_to_strata_val(e, ety, mir, cat)
+                    })
+                    .collect();
+                return format!("StrataVal::Tuple(vec![{}])", parts.join(", "));
+            }
+            return "StrataVal::Unit".to_owned();
+        }
+        Ty::InlineStr(_) => {
+            let r = format_hir_expr_rust(expr, ty, mir, cat);
+            return format!("StrataVal::Words(({r}).to_vec())");
         }
         Ty::Array { elem, .. } => {
             if let HirExpr::ArrayLit { elems, .. } = expr {
@@ -2087,7 +2615,6 @@ pub(super) fn hir_expr_to_strata_val(
         Ty::IVec2 => format!("StrataVal::IVec2({r})"),
         Ty::IVec3 => format!("StrataVal::IVec3({r})"),
         Ty::UVec2 => format!("StrataVal::UVec2({r})"),
-        Ty::InlineStr(_) => format!("StrataVal::Str(({r}).to_string())"),
         _ => "StrataVal::Unit".to_owned(),
     }
 }

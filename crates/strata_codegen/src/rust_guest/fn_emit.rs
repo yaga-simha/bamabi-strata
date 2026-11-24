@@ -298,27 +298,438 @@ pub(super) struct GuestFnConstInfo {
     pub(super) const_floats: HashMap<LocalId, f64>,
     pub(super) slot_types: HashMap<LocalId, MirType>,
     pub(super) array_inits: HashMap<LocalId, Vec<LocalId>>,
+    pub(super) ptr_sema_tys: HashMap<LocalId, Ty>,
+    pub(super) sub_ptrs: HashSet<LocalId>,
+    pub(super) table_ptrs: HashMap<LocalId, (LocalId, String)>,
 }
 
-pub(super) fn collect_guest_fn_const_info(func: &MirFunction) -> GuestFnConstInfo {
+pub(super) fn resolve_guest_ptr_field_ty(
+    base_ty: &Ty,
+    layout_key: &str,
+    field: &str,
+    offset_bytes: u32,
+    cat: &GuestCatalog,
+) -> Option<Ty> {
+    match base_ty {
+        Ty::SmallVec { elem, cap } => {
+            if field == "data" {
+                Some(Ty::Array {
+                    elem: elem.clone(),
+                    len: (*cap).max(1),
+                })
+            } else if field == "len" {
+                Some(Ty::U32)
+            } else {
+                None
+            }
+        }
+        Ty::InlineStr(_) if field == "len" => Some(Ty::U32),
+        Ty::Named(comp_key) => {
+            if let Some(comp) = cat.resolve_comp(comp_key)
+                && let Some(t) = resolve_guest_field_ty_in_fields(
+                    cat,
+                    &comp.layout.fields,
+                    field,
+                    offset_bytes as usize,
+                )
+            {
+                return Some(t.clone());
+            }
+            if !layout_key.is_empty() && layout_key != comp_key {
+                return resolve_guest_field_ty_path(cat, layout_key, field, offset_bytes).cloned();
+            }
+            None
+        }
+        _ if !layout_key.is_empty() => {
+            resolve_guest_field_ty_path(cat, layout_key, field, offset_bytes).cloned()
+        }
+        _ => None,
+    }
+}
+
+fn resolve_guest_table_field_ty(
+    table_name: &str,
+    field_path: &str,
+    mir: &MirModule,
+    cat: &GuestCatalog,
+) -> Option<Ty> {
+    let bare = table_name
+        .strip_prefix("__table_row::")
+        .unwrap_or(table_name);
+    let tbl = mir.tables.iter().find(|t| t.name == bare)?;
+    let (first, rest) = match field_path.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (field_path, None),
+    };
+    let (_, base_fty) = tbl.fields.iter().find(|(nm, _)| nm == first)?;
+    let Some(rest_path) = rest else {
+        return Some(base_fty.clone());
+    };
+    let mut cur = base_fty;
+    for seg in rest_path.split('.') {
+        if let Ty::Named(ref n) = *cur
+            && let Some(comp) = cat.resolve_comp(n)
+            && let Some(sf) = comp
+                .layout
+                .fields
+                .iter()
+                .find(|sf| !sf.is_padding && sf.name == seg)
+        {
+            cur = &sf.ty;
+        } else {
+            return None;
+        }
+    }
+    Some(cur.clone())
+}
+
+pub(super) fn collect_guest_fn_const_info(
+    func: &MirFunction,
+    mir: &MirModule,
+    cat: &GuestCatalog,
+) -> GuestFnConstInfo {
     let mut def_counts: HashMap<LocalId, usize> = HashMap::new();
     let mut slot_types: HashMap<LocalId, MirType> = HashMap::new();
     let mut array_inits: HashMap<LocalId, Vec<LocalId>> = HashMap::new();
+    let mut col_tys: HashMap<LocalId, Ty> = HashMap::new();
+    let mut ptr_sema_tys: HashMap<LocalId, Ty> = HashMap::new();
+    let mut sub_ptrs: HashSet<LocalId> = HashSet::new();
+    let mut table_ptrs: HashMap<LocalId, (LocalId, String)> = HashMap::new();
+    let mut slot_ptr_tys: HashMap<LocalId, Ty> = HashMap::new();
+    let mut slot_sub_ptrs: HashSet<LocalId> = HashSet::new();
+    let mut slot_table_ptrs: HashMap<LocalId, (LocalId, String)> = HashMap::new();
+
+    for rb in &func.resources {
+        if let Some(rc) = cat.resolve_comp(&rb.canonical_name) {
+            ptr_sema_tys.insert(rb.ptr_local, Ty::Named(rc.canonical_name.clone()));
+        }
+    }
+
     for bb in &func.blocks {
         for st in &bb.stmts {
             if let Some(d) = st.dst {
                 *def_counts.entry(d).or_insert(0) += 1;
                 if let Inst::SlotAlloc { ty } = &st.inst {
                     slot_types.insert(d, ty.clone());
+                    if let Some(sty) = mir_ty_to_guest_ty_hint(ty, mir) {
+                        if matches!(
+                            sty,
+                            Ty::Array { .. } | Ty::SmallVec { .. } | Ty::InputBuffer { .. }
+                        ) {
+                            sub_ptrs.insert(d);
+                        }
+                        ptr_sema_tys.insert(d, sty);
+                    }
                 }
             }
         }
     }
+
     let mut const_floats: HashMap<LocalId, f64> = HashMap::new();
-    for _ in 0..3 {
+    for _ in 0..5 {
         let mut changed = false;
         for bb in &func.blocks {
             for st in &bb.stmts {
+                match &st.inst {
+                    Inst::Copy { val } => {
+                        if let Some(d) = st.dst {
+                            if let Some(t) = ptr_sema_tys.get(val).cloned()
+                                && ptr_sema_tys.get(&d) != Some(&t)
+                            {
+                                ptr_sema_tys.insert(d, t);
+                                changed = true;
+                            }
+                            if sub_ptrs.contains(val) && sub_ptrs.insert(d) {
+                                changed = true;
+                            }
+                            if let Some(tp) = table_ptrs.get(val).cloned()
+                                && table_ptrs.get(&d) != Some(&tp)
+                            {
+                                table_ptrs.insert(d, tp);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Inst::SlotStore { slot, val } => {
+                        if matches!(slot_types.get(slot), Some(MirType::Ptr | MirType::MutPtr)) {
+                            if let Some(t) = ptr_sema_tys.get(val).cloned()
+                                && slot_ptr_tys.get(slot) != Some(&t)
+                            {
+                                slot_ptr_tys.insert(*slot, t);
+                                changed = true;
+                            }
+                            if sub_ptrs.contains(val) && slot_sub_ptrs.insert(*slot) {
+                                changed = true;
+                            }
+                            if let Some(tp) = table_ptrs.get(val).cloned()
+                                && slot_table_ptrs.get(slot) != Some(&tp)
+                            {
+                                slot_table_ptrs.insert(*slot, tp);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Inst::SlotLoad { slot } => {
+                        if let Some(d) = st.dst
+                            && matches!(slot_types.get(slot), Some(MirType::Ptr | MirType::MutPtr))
+                        {
+                            if let Some(t) = slot_ptr_tys.get(slot).cloned()
+                                && ptr_sema_tys.get(&d) != Some(&t)
+                            {
+                                ptr_sema_tys.insert(d, t);
+                                changed = true;
+                            }
+                            if slot_sub_ptrs.contains(slot) && sub_ptrs.insert(d) {
+                                changed = true;
+                            }
+                            if let Some(tp) = slot_table_ptrs.get(slot).cloned()
+                                && table_ptrs.get(&d) != Some(&tp)
+                            {
+                                table_ptrs.insert(d, tp);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Inst::ResRead { resource } | Inst::ResWrite { resource } => {
+                        if let Some(d) = st.dst
+                            && let Some(rc) = cat.resolve_comp(resource)
+                        {
+                            let t = Ty::Named(rc.canonical_name.clone());
+                            if ptr_sema_tys.get(&d) != Some(&t) {
+                                ptr_sema_tys.insert(d, t);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Inst::MigrateSrcPtr { layout_key } | Inst::MigrateDstPtr { layout_key } => {
+                        if let Some(d) = st.dst {
+                            let key = cat
+                                .resolve_comp(layout_key)
+                                .map_or_else(|| layout_key.clone(), |c| c.canonical_name.clone());
+                            let t = Ty::Named(key);
+                            if ptr_sema_tys.get(&d) != Some(&t) {
+                                ptr_sema_tys.insert(d, t);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Inst::TriggerPayload { event } => {
+                        if let Some(d) = st.dst {
+                            let key = cat
+                                .resolve_comp(event)
+                                .map_or_else(|| event.clone(), |c| c.canonical_name.clone());
+                            let t = Ty::Named(key);
+                            if ptr_sema_tys.get(&d) != Some(&t) {
+                                ptr_sema_tys.insert(d, t);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Inst::IterColRead {
+                        query_idx,
+                        term_idx,
+                        ..
+                    }
+                    | Inst::IterColWrite {
+                        query_idx,
+                        term_idx,
+                        ..
+                    }
+                    | Inst::IterColWriteUntracked {
+                        query_idx,
+                        term_idx,
+                        ..
+                    } => {
+                        if let Some(d) = st.dst
+                            && let Some(mterm) = func
+                                .query_bindings
+                                .iter()
+                                .find(|q| q.query_idx == *query_idx)
+                                .and_then(|q| q.terms.iter().find(|t| t.term_idx == *term_idx))
+                        {
+                            let t = if let Some(ref fnm) = mterm.field_name
+                                && let Some(sf_ty) = resolve_guest_field_ty_path(
+                                    cat,
+                                    &mterm.canonical_component,
+                                    fnm,
+                                    0,
+                                ) {
+                                sf_ty.clone()
+                            } else {
+                                Ty::Named(mterm.canonical_component.clone())
+                            };
+                            if col_tys.get(&d) != Some(&t) {
+                                col_tys.insert(d, t);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Inst::RowPtr { col_ptr, .. } => {
+                        if let Some(d) = st.dst
+                            && let Some(t) = col_tys.get(col_ptr).cloned()
+                            && ptr_sema_tys.get(&d) != Some(&t)
+                        {
+                            ptr_sema_tys.insert(d, t);
+                            changed = true;
+                        }
+                    }
+                    Inst::EntityGet {
+                        query_idx,
+                        term_idx,
+                        storage_key,
+                        ..
+                    }
+                    | Inst::EntityGetMut {
+                        query_idx,
+                        term_idx,
+                        storage_key,
+                        ..
+                    } => {
+                        if let Some(d) = st.dst {
+                            let t = if let Some(mterm) = func
+                                .query_bindings
+                                .iter()
+                                .find(|q| q.query_idx == *query_idx)
+                                .and_then(|q| q.terms.iter().find(|t| t.term_idx == *term_idx))
+                            {
+                                if let Some(ref fnm) = mterm.field_name
+                                    && let Some(sf_ty) = resolve_guest_field_ty_path(
+                                        cat,
+                                        &mterm.canonical_component,
+                                        fnm,
+                                        0,
+                                    )
+                                {
+                                    sf_ty.clone()
+                                } else {
+                                    Ty::Named(mterm.canonical_component.clone())
+                                }
+                            } else {
+                                let key = cat.resolve_comp(storage_key).map_or_else(
+                                    || storage_key.clone(),
+                                    |c| c.canonical_name.clone(),
+                                );
+                                Ty::Named(key)
+                            };
+                            if ptr_sema_tys.get(&d) != Some(&t) {
+                                ptr_sema_tys.insert(d, t);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Inst::TableLoad {
+                        table_name, field, ..
+                    } if field.is_empty() => {
+                        if let Some(d) = st.dst {
+                            let tp = (d, String::new());
+                            if table_ptrs.get(&d) != Some(&tp) {
+                                table_ptrs.insert(d, tp);
+                                changed = true;
+                            }
+                            let t = Ty::Named(format!("__table_row::{table_name}"));
+                            if ptr_sema_tys.get(&d) != Some(&t) {
+                                ptr_sema_tys.insert(d, t);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Inst::FieldPtr {
+                        base_ptr,
+                        layout_key,
+                        field,
+                        offset_bytes,
+                    } => {
+                        if let Some(d) = st.dst {
+                            if let Some((tbl_row, prefix)) = table_ptrs.get(base_ptr).cloned() {
+                                let new_path = if prefix.is_empty() {
+                                    field.clone()
+                                } else {
+                                    format!("{prefix}.{field}")
+                                };
+                                let tp = (tbl_row, new_path.clone());
+                                if table_ptrs.get(&d) != Some(&tp) {
+                                    table_ptrs.insert(d, tp);
+                                    changed = true;
+                                }
+                                if let Some(Ty::Named(tbl_nm)) = ptr_sema_tys.get(&tbl_row)
+                                    && let Some(ft) =
+                                        resolve_guest_table_field_ty(tbl_nm, &new_path, mir, cat)
+                                    && ptr_sema_tys.get(&d) != Some(&ft)
+                                {
+                                    ptr_sema_tys.insert(d, ft);
+                                    changed = true;
+                                }
+                            } else {
+                                if sub_ptrs.contains(base_ptr) && sub_ptrs.insert(d) {
+                                    changed = true;
+                                }
+                                let resolved = ptr_sema_tys
+                                    .get(base_ptr)
+                                    .and_then(|bt| {
+                                        resolve_guest_ptr_field_ty(
+                                            bt,
+                                            layout_key,
+                                            field,
+                                            *offset_bytes,
+                                            cat,
+                                        )
+                                    })
+                                    .or_else(|| {
+                                        if !layout_key.is_empty() {
+                                            resolve_guest_field_ty_path(
+                                                cat,
+                                                layout_key,
+                                                field,
+                                                *offset_bytes,
+                                            )
+                                            .cloned()
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                if let Some(ft) = resolved
+                                    && ptr_sema_tys.get(&d) != Some(&ft)
+                                {
+                                    ptr_sema_tys.insert(d, ft);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    Inst::ArrayIndex { base, .. } => {
+                        if let Some(d) = st.dst {
+                            let dst_is_ptr = matches!(
+                                func.locals.get(d.0 as usize).map(|l| &l.ty),
+                                Some(MirType::Ptr | MirType::MutPtr)
+                            );
+                            if dst_is_ptr {
+                                if sub_ptrs.insert(d) {
+                                    changed = true;
+                                }
+                                let elem_ty = match ptr_sema_tys.get(base) {
+                                    Some(Ty::Array { elem, .. } | Ty::SmallVec { elem, .. }) => {
+                                        Some((**elem).clone())
+                                    }
+                                    _ => func.locals.get(base.0 as usize).and_then(|l| {
+                                        if let MirType::Array { elem, .. } = &l.ty {
+                                            mir_ty_to_guest_ty_hint(elem, mir)
+                                        } else {
+                                            None
+                                        }
+                                    }),
+                                };
+                                if let Some(et) = elem_ty
+                                    && ptr_sema_tys.get(&d) != Some(&et)
+                                {
+                                    ptr_sema_tys.insert(d, et);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
                 let Some(d) = st.dst else {
                     continue;
                 };
@@ -353,6 +764,9 @@ pub(super) fn collect_guest_fn_const_info(func: &MirFunction) -> GuestFnConstInf
         const_floats,
         slot_types,
         array_inits,
+        ptr_sema_tys,
+        sub_ptrs,
+        table_ptrs,
     }
 }
 
@@ -1270,8 +1684,11 @@ pub(super) fn resolve_guest_field<'a>(
     let layout = &cat.components.get(comp_id)?.layout;
     layout.fields.iter().find(|f| {
         !f.is_padding
-            && ((!field_name.is_empty() && f.name == field_name)
-                || f.offset == offset_bytes as usize)
+            && if !field_name.is_empty() {
+                f.name == field_name
+            } else {
+                f.offset == offset_bytes as usize
+            }
     })
 }
 
@@ -1280,6 +1697,7 @@ pub(super) fn is_supported_guest_intrinsic(name: &str) -> bool {
     matches!(
         short,
         "sqrt"
+            | "sqr"
             | "abs"
             | "floor"
             | "ceil"
@@ -1315,6 +1733,12 @@ pub(super) fn is_supported_guest_intrinsic(name: &str) -> bool {
             | "vec3a"
             | "Vec3a"
             | "vec4"
+            | "ivec2"
+            | "IVec2"
+            | "ivec3"
+            | "IVec3"
+            | "uvec2"
+            | "UVec2"
             | "dot"
             | "cross"
             | "length"
@@ -1323,10 +1747,14 @@ pub(super) fn is_supported_guest_intrinsic(name: &str) -> bool {
             | "len_sq"
             | "distance"
             | "dist"
+            | "distance_sq"
+            | "dist_sq"
             | "normalize"
             | "norm"
+            | "normalize_or_zero"
             | "step"
             | "smoothstep"
+            | "remap"
             | "raw"
             | "to_bits"
             | "is_null"
@@ -1376,6 +1804,9 @@ pub(super) fn is_supported_guest_intrinsic_call(
         "vec2" => *dt == GuestValTy::Vec2,
         "vec3" => *dt == GuestValTy::Vec3,
         "vec4" => *dt == GuestValTy::Vec4,
+        "ivec2" | "IVec2" => *dt == GuestValTy::IVec2,
+        "ivec3" | "IVec3" => *dt == GuestValTy::IVec3,
+        "uvec2" | "UVec2" => *dt == GuestValTy::UVec2,
         "cross" => {
             *dt == GuestValTy::Vec3
                 && arg_ty(0) == Some(&GuestValTy::Vec3)
@@ -1386,9 +1817,51 @@ pub(super) fn is_supported_guest_intrinsic_call(
             let a1 = arg_ty(1);
             if matches!(
                 a0,
-                Some(GuestValTy::Vec2 | GuestValTy::Vec3 | GuestValTy::Vec4)
+                Some(
+                    GuestValTy::Vec2
+                        | GuestValTy::Vec3
+                        | GuestValTy::Vec4
+                        | GuestValTy::IVec2
+                        | GuestValTy::IVec3
+                        | GuestValTy::UVec2
+                )
             ) {
                 a0 == a1 && a0 == Some(dt)
+            } else {
+                dt.is_int() || dt.is_fixed() || dt.is_float()
+            }
+        }
+        "clamp" => {
+            let a0 = arg_ty(0);
+            if matches!(
+                a0,
+                Some(
+                    GuestValTy::Vec2
+                        | GuestValTy::Vec3
+                        | GuestValTy::Vec4
+                        | GuestValTy::IVec2
+                        | GuestValTy::IVec3
+                        | GuestValTy::UVec2
+                )
+            ) {
+                a0 == Some(dt)
+            } else {
+                dt.is_int() || dt.is_fixed() || dt.is_float()
+            }
+        }
+        "abs" => {
+            let a0 = arg_ty(0);
+            if matches!(
+                a0,
+                Some(
+                    GuestValTy::Vec2
+                        | GuestValTy::Vec3
+                        | GuestValTy::Vec4
+                        | GuestValTy::IVec2
+                        | GuestValTy::IVec3
+                )
+            ) {
+                a0 == Some(dt)
             } else {
                 dt.is_int() || dt.is_fixed() || dt.is_float()
             }
@@ -1404,7 +1877,7 @@ pub(super) fn is_supported_guest_intrinsic_call(
                 dt.is_int() || dt.is_fixed() || dt.is_float()
             }
         }
-        "normalize" | "norm" => {
+        "normalize" | "norm" | "normalize_or_zero" => {
             let a0 = arg_ty(0);
             matches!(
                 a0,
@@ -1412,9 +1885,8 @@ pub(super) fn is_supported_guest_intrinsic_call(
             ) && a0 == Some(dt)
         }
         "is_null" | "is_valid" => *dt == GuestValTy::Bool && arg_ty(0) == Some(&GuestValTy::Entity),
-        "dot" | "length" | "len" | "length_sq" | "len_sq" | "distance" | "dist" => {
-            dt.is_float() || dt.is_int() || dt.is_fixed()
-        }
+        "dot" | "length" | "len" | "length_sq" | "len_sq" | "distance" | "dist" | "distance_sq"
+        | "dist_sq" => dt.is_float() || dt.is_int() || dt.is_fixed(),
         _ => dt.is_int() || dt.is_fixed() || dt.is_float() || *dt == GuestValTy::Bool,
     }
 }
@@ -2123,6 +2595,10 @@ pub(super) fn analyze_guest_fast_loops(
 
         for &bid in &loop_blocks {
             let bb_cur = &func.blocks[bid.0 as usize];
+            if matches!(bb_cur.terminator, Terminator::Return(_)) {
+                unsupported_inst = true;
+                break;
+            }
             if row_body_blocks.contains(&bid)
                 && guest_term_succs(&bb_cur.terminator).contains(&exit_bb)
             {
@@ -2316,14 +2792,26 @@ pub(super) fn analyze_guest_fast_loops(
                     | Inst::BitSetGet { ptr, .. }
                     | Inst::BitSetClear { ptr, .. } => {
                         let ok = match ptr_targets.get(ptr) {
-                            Some(GuestPtrTarget::Field { base, .. }) => {
-                                matches!(base.as_ref(), GuestPtrTarget::QueryRow { query_idx: qi, .. } if *qi == query_idx)
-                            }
+                            Some(GuestPtrTarget::Field { base, field }) => matches!(
+                                base.as_ref(),
+                                GuestPtrTarget::QueryRow {
+                                    query_idx: qi,
+                                    comp_id,
+                                    ..
+                                } if *qi == query_idx
+                                    && resolve_guest_field(cat, *comp_id, field, 0).is_some_and(|sf| {
+                                        matches!(sf.ty, Ty::GraceWindow | Ty::BitSet(_))
+                                    })
+                            ),
                             Some(GuestPtrTarget::QueryRow {
                                 query_idx: qi,
-                                projected: Some(_),
+                                projected: Some((_, _, sty)),
                                 ..
-                            }) if *qi == query_idx => true,
+                            }) if *qi == query_idx
+                                && matches!(sty, Ty::GraceWindow | Ty::BitSet(_)) =>
+                            {
+                                true
+                            }
                             _ => false,
                         };
                         if !ok {
@@ -2596,28 +3084,60 @@ pub(super) fn guest_reduce_identity(op: &str, vty: &GuestValTy) -> String {
         "min" | "Min" => match vty {
             GuestValTy::F32 => "f32::MAX".to_owned(),
             GuestValTy::F64 => "f64::MAX".to_owned(),
+            GuestValTy::U8 => "u8::MAX".to_owned(),
+            GuestValTy::I8 => "i8::MAX".to_owned(),
+            GuestValTy::U16 => "u16::MAX".to_owned(),
+            GuestValTy::I16 => "i16::MAX".to_owned(),
             GuestValTy::U32 => "u32::MAX".to_owned(),
             GuestValTy::I32 | GuestValTy::Fix32 => "i32::MAX".to_owned(),
             GuestValTy::U64 => "u64::MAX".to_owned(),
             GuestValTy::I64 | GuestValTy::Fix64 => "i64::MAX".to_owned(),
+            GuestValTy::Vec2 => "[f32::MAX; 2]".to_owned(),
+            GuestValTy::Vec3 => "[f32::MAX; 3]".to_owned(),
+            GuestValTy::Vec4 => "[f32::MAX; 4]".to_owned(),
+            GuestValTy::IVec2 => "[i32::MAX; 2]".to_owned(),
+            GuestValTy::IVec3 => "[i32::MAX; 3]".to_owned(),
+            GuestValTy::UVec2 => "[u32::MAX; 2]".to_owned(),
             _ => vty.default_expr(),
         },
         "max" | "Max" => match vty {
             GuestValTy::F32 => "f32::MIN".to_owned(),
             GuestValTy::F64 => "f64::MIN".to_owned(),
+            GuestValTy::U8 => "0u8".to_owned(),
+            GuestValTy::I8 => "i8::MIN".to_owned(),
+            GuestValTy::U16 => "0u16".to_owned(),
+            GuestValTy::I16 => "i16::MIN".to_owned(),
             GuestValTy::U32 => "0u32".to_owned(),
             GuestValTy::I32 | GuestValTy::Fix32 => "i32::MIN".to_owned(),
             GuestValTy::U64 => "0u64".to_owned(),
             GuestValTy::I64 | GuestValTy::Fix64 => "i64::MIN".to_owned(),
+            GuestValTy::Vec2 => "[f32::MIN; 2]".to_owned(),
+            GuestValTy::Vec3 => "[f32::MIN; 3]".to_owned(),
+            GuestValTy::Vec4 => "[f32::MIN; 4]".to_owned(),
+            GuestValTy::IVec2 => "[i32::MIN; 2]".to_owned(),
+            GuestValTy::IVec3 => "[i32::MIN; 3]".to_owned(),
+            GuestValTy::UVec2 => "[0u32; 2]".to_owned(),
             _ => vty.default_expr(),
         },
         "prod" | "Prod" | "*" | "*=" => match vty {
             GuestValTy::F32 => "1.0_f32".to_owned(),
             GuestValTy::F64 => "1.0_f64".to_owned(),
+            GuestValTy::U8 => "1u8".to_owned(),
+            GuestValTy::I8 => "1i8".to_owned(),
+            GuestValTy::U16 => "1u16".to_owned(),
+            GuestValTy::I16 => "1i16".to_owned(),
             GuestValTy::U32 => "1u32".to_owned(),
             GuestValTy::I32 => "1i32".to_owned(),
+            GuestValTy::Fix32 => "65536i32".to_owned(),
             GuestValTy::U64 => "1u64".to_owned(),
             GuestValTy::I64 => "1i64".to_owned(),
+            GuestValTy::Fix64 => "4294967296i64".to_owned(),
+            GuestValTy::Vec2 => "[1.0_f32; 2]".to_owned(),
+            GuestValTy::Vec3 => "[1.0_f32; 3]".to_owned(),
+            GuestValTy::Vec4 => "[1.0_f32; 4]".to_owned(),
+            GuestValTy::IVec2 => "[1i32; 2]".to_owned(),
+            GuestValTy::IVec3 => "[1i32; 3]".to_owned(),
+            GuestValTy::UVec2 => "[1u32; 2]".to_owned(),
             _ => vty.default_expr(),
         },
         "all" | "All" | "&&" => "true".to_owned(),
@@ -2631,19 +3151,59 @@ pub(super) fn guest_reduce_combine(
     acc: &str,
     val: &str,
     cat: &GuestCatalog,
+    is_chunk_merge: bool,
 ) -> String {
+    if let Some(dims) = vty.is_vec() {
+        let lanes: Vec<String> = (0..dims)
+            .map(|i| match op {
+                "min" | "Min" => format!("({acc})[{i}].min(({val})[{i}])"),
+                "max" | "Max" => format!("({acc})[{i}].max(({val})[{i}])"),
+                "prod" | "Prod" | "*" | "*=" => format!("(({acc})[{i}] * ({val})[{i}])"),
+                _ => format!("(({acc})[{i}] + ({val})[{i}])"),
+            })
+            .collect();
+        return format!("[{}]", lanes.join(", "));
+    }
+    if let Some(dims) = vty.is_ivec() {
+        let lanes: Vec<String> = (0..dims)
+            .map(|i| match op {
+                "min" | "Min" => format!("({acc})[{i}].min(({val})[{i}])"),
+                "max" | "Max" => format!("({acc})[{i}].max(({val})[{i}])"),
+                "prod" | "Prod" | "*" | "*=" => {
+                    format!("(({acc})[{i}]).wrapping_mul(({val})[{i}])")
+                }
+                _ => format!("(({acc})[{i}]).wrapping_add(({val})[{i}])"),
+            })
+            .collect();
+        return format!("[{}]", lanes.join(", "));
+    }
+    let rt = vty.rust_type(cat);
     let rhs = if *vty == GuestValTy::Bool {
         val.to_owned()
     } else {
-        format!("({val}) as {}", vty.rust_type(cat))
+        format!("({val}) as {rt}")
     };
     match op {
         "min" | "Min" => format!("({acc}).min({rhs})"),
         "max" | "Max" => format!("({acc}).max({rhs})"),
-        "prod" | "Prod" | "*" | "*=" => format!("({acc}) * ({rhs})"),
+        "prod" | "Prod" | "*" | "*=" => match vty {
+            GuestValTy::Fix32 => format!("(((({acc}) as i64) * (({rhs}) as i64) >> 16) as i32)"),
+            GuestValTy::Fix64 => {
+                format!("(((({acc}) as i128) * (({rhs}) as i128) >> 32) as i64)")
+            }
+            _ if vty.is_int() => format!("({acc}).wrapping_mul({rhs})"),
+            _ => format!("({acc}) * ({rhs})"),
+        },
         "any" | "Any" | "||" => format!("({acc}) || ({rhs})"),
         "all" | "All" | "&&" => format!("({acc}) && ({rhs})"),
-        "count" | "Count" => format!("({acc}) + u32::from({val})"),
+        "count" | "Count" => {
+            if is_chunk_merge {
+                format!("({acc}).wrapping_add(({val}) as {rt})")
+            } else {
+                format!("({acc}).wrapping_add((if {val} {{ 1u32 }} else {{ 0u32 }}) as {rt})")
+            }
+        }
+        _ if vty.is_int() || vty.is_fixed() => format!("({acc}).wrapping_add({rhs})"),
         _ => format!("({acc}) + ({rhs})"),
     }
 }
@@ -2794,6 +3354,21 @@ pub(super) fn guest_fast_binop(
     let le = guest_fast_local_expr(lhs, fl);
     let re = guest_fast_local_expr(rhs, fl);
 
+    if op == "quat_mul" {
+        let la = guest_fast_coerce(&le, l_ty, &GuestValTy::Vec4, cat);
+        let ra = guest_fast_coerce(&re, r_ty, &GuestValTy::Vec4, cat);
+        return format!(
+            "{{ let __a = {la}; let __b = {ra}; [__a[3] * __b[0] + __a[0] * __b[3] + __a[1] * __b[2] - __a[2] * __b[1], __a[3] * __b[1] - __a[0] * __b[2] + __a[1] * __b[3] + __a[2] * __b[0], __a[3] * __b[2] + __a[0] * __b[1] - __a[1] * __b[0] + __a[2] * __b[3], __a[3] * __b[3] - __a[0] * __b[0] - __a[1] * __b[1] - __a[2] * __b[2]] }}"
+        );
+    }
+    if op == "quat_mul_vec3" {
+        let qa = guest_fast_coerce(&le, l_ty, &GuestValTy::Vec4, cat);
+        let va = guest_fast_coerce(&re, r_ty, &GuestValTy::Vec3, cat);
+        return format!(
+            "{{ let __q = {qa}; let __v = {va}; let __tx = 2.0_f32 * (__q[1] * __v[2] - __q[2] * __v[1]); let __ty = 2.0_f32 * (__q[2] * __v[0] - __q[0] * __v[2]); let __tz = 2.0_f32 * (__q[0] * __v[1] - __q[1] * __v[0]); let __cx = __q[1] * __tz - __q[2] * __ty; let __cy = __q[2] * __tx - __q[0] * __tz; let __cz = __q[0] * __ty - __q[1] * __tx; [__v[0] + __q[3] * __tx + __cx, __v[1] + __q[3] * __ty + __cy, __v[2] + __q[3] * __tz + __cz] }}"
+        );
+    }
+
     if let Some(dims) = l_ty.is_ivec()
         && r_ty.is_ivec() == Some(dims)
     {
@@ -2816,9 +3391,95 @@ pub(super) fn guest_fast_binop(
                     .collect();
                 format!("[{}]", parts.join(", "))
             }
+            "/" => {
+                let parts: Vec<String> = (0..dims)
+                    .map(|i| {
+                        format!(
+                            "{{ let __d = {re}[{i}]; if __d != 0 {{ ({le}[{i}]).wrapping_div(__d) }} else {{ 0 }} }}"
+                        )
+                    })
+                    .collect();
+                format!("[{}]", parts.join(", "))
+            }
+            "%" => {
+                let parts: Vec<String> = (0..dims)
+                    .map(|i| {
+                        format!(
+                            "{{ let __d = {re}[{i}]; if __d != 0 {{ ({le}[{i}]).wrapping_rem(__d) }} else {{ 0 }} }}"
+                        )
+                    })
+                    .collect();
+                format!("[{}]", parts.join(", "))
+            }
             "==" => format!("({le} == {re})"),
             "!=" => format!("({le} != {re})"),
             _ => le,
+        };
+    }
+    if let Some(dims) = l_ty.is_ivec()
+        && r_ty.is_int()
+    {
+        let scalar_ty = if *l_ty == GuestValTy::UVec2 {
+            GuestValTy::U32
+        } else {
+            GuestValTy::I32
+        };
+        let rs = guest_fast_coerce(&re, r_ty, &scalar_ty, cat);
+        return match op {
+            "+" | "-" | "*" => {
+                let m = match op {
+                    "+" => "wrapping_add",
+                    "-" => "wrapping_sub",
+                    _ => "wrapping_mul",
+                };
+                let parts: Vec<String> = (0..dims)
+                    .map(|i| format!("({le}[{i}]).{m}({rs})"))
+                    .collect();
+                format!("[{}]", parts.join(", "))
+            }
+            "/" | "%" => {
+                let m = if op == "/" {
+                    "wrapping_div"
+                } else {
+                    "wrapping_rem"
+                };
+                let parts: Vec<String> =
+                    (0..dims).map(|i| format!("({le}[{i}]).{m}(__d)")).collect();
+                let zero = if scalar_ty == GuestValTy::U32 {
+                    format!("[0u32; {dims}]")
+                } else {
+                    format!("[0i32; {dims}]")
+                };
+                format!(
+                    "{{ let __d = {rs}; if __d != 0 {{ [{}] }} else {{ {zero} }} }}",
+                    parts.join(", ")
+                )
+            }
+            _ => le,
+        };
+    }
+    if l_ty.is_int()
+        && let Some(dims) = r_ty.is_ivec()
+    {
+        let scalar_ty = if *r_ty == GuestValTy::UVec2 {
+            GuestValTy::U32
+        } else {
+            GuestValTy::I32
+        };
+        let ls = guest_fast_coerce(&le, l_ty, &scalar_ty, cat);
+        return match op {
+            "+" | "-" | "*" => {
+                let m = match op {
+                    "+" => "wrapping_add",
+                    "-" => "wrapping_sub",
+                    _ => "wrapping_mul",
+                };
+                let parts: Vec<String> = (0..dims)
+                    .map(|i| format!("({ls}).{m}({re}[{i}])"))
+                    .collect();
+                format!("[{}]", parts.join(", "))
+            }
+            _ => re,
         };
     }
     if let Some(dims) = l_ty.is_vec()
@@ -3079,6 +3740,33 @@ pub(super) fn guest_fast_intrinsic_expr(
                 guest_fast_coerce(&raw, &GuestValTy::F32, dst_ty, cat)
             }
         }
+        "sqr" => {
+            let (vt, e) = a(0);
+            match vt {
+                GuestValTy::Fix32 => {
+                    let raw = format!("((((({e}) as i64) * (({e}) as i64)) >> 16) as i32)");
+                    guest_fast_coerce(&raw, &vt, dst_ty, cat)
+                }
+                GuestValTy::Fix64 => {
+                    let raw = format!("((((({e}) as i128) * (({e}) as i128)) >> 32) as i64)");
+                    guest_fast_coerce(&raw, &vt, dst_ty, cat)
+                }
+                _ if vt.is_int() => {
+                    let raw = format!("({e}).wrapping_mul({e})");
+                    guest_fast_coerce(&raw, &vt, dst_ty, cat)
+                }
+                _ if use_f64 => {
+                    let x = af64(0);
+                    let raw = format!("({x} * {x})");
+                    guest_fast_coerce(&raw, &GuestValTy::F64, dst_ty, cat)
+                }
+                _ => {
+                    let x = af32(0);
+                    let raw = format!("({x} * {x})");
+                    guest_fast_coerce(&raw, &GuestValTy::F32, dst_ty, cat)
+                }
+            }
+        }
         "abs" => {
             let (vt, e) = a(0);
             if matches!(
@@ -3087,13 +3775,28 @@ pub(super) fn guest_fast_intrinsic_expr(
                     | GuestValTy::I16
                     | GuestValTy::I32
                     | GuestValTy::I64
-                    | GuestValTy::F32
-                    | GuestValTy::F64
+                    | GuestValTy::Fix32
+                    | GuestValTy::Fix64
             ) {
-                let raw = format!("({e}).abs()");
-                guest_fast_coerce(&raw, &vt, dst_ty, cat)
-            } else if vt.is_fixed() {
                 let raw = format!("({e}).wrapping_abs()");
+                guest_fast_coerce(&raw, &vt, dst_ty, cat)
+            } else if matches!(
+                vt,
+                GuestValTy::U8 | GuestValTy::U16 | GuestValTy::U32 | GuestValTy::U64
+            ) {
+                guest_fast_coerce(&e, &vt, dst_ty, cat)
+            } else if matches!(vt, GuestValTy::Vec2 | GuestValTy::Vec3 | GuestValTy::Vec4) {
+                let dims = vt.is_vec().unwrap_or(2);
+                let parts: Vec<String> = (0..dims).map(|i| format!("{e}[{i}].abs()")).collect();
+                format!("[{}]", parts.join(", "))
+            } else if matches!(vt, GuestValTy::IVec2 | GuestValTy::IVec3) {
+                let dims = vt.is_ivec().unwrap_or(2);
+                let parts: Vec<String> = (0..dims)
+                    .map(|i| format!("{e}[{i}].wrapping_abs()"))
+                    .collect();
+                format!("[{}]", parts.join(", "))
+            } else if matches!(vt, GuestValTy::F32 | GuestValTy::F64) {
+                let raw = format!("({e}).abs()");
                 guest_fast_coerce(&raw, &vt, dst_ty, cat)
             } else if use_f64 {
                 let raw = format!("({}).abs()", af64(0));
@@ -3134,6 +3837,16 @@ pub(super) fn guest_fast_intrinsic_expr(
                 format!(
                     "[{e0}[0].{short}({e1}[0]), {e0}[1].{short}({e1}[1]), {e0}[2].{short}({e1}[2]), {e0}[3].{short}({e1}[3])]"
                 )
+            } else if matches!(
+                vt0,
+                GuestValTy::IVec2 | GuestValTy::IVec3 | GuestValTy::UVec2
+            ) && vt0 == vt1
+            {
+                let dims = vt0.is_ivec().unwrap_or(2);
+                let parts: Vec<String> = (0..dims)
+                    .map(|i| format!("{e0}[{i}].{short}({e1}[{i}])"))
+                    .collect();
+                format!("[{}]", parts.join(", "))
             } else if vt0 == vt1 && (vt0.is_int() || vt0.is_fixed()) {
                 let raw = format!("({e0}).{short}({e1})");
                 guest_fast_coerce(&raw, &vt0, dst_ty, cat)
@@ -3149,8 +3862,55 @@ pub(super) fn guest_fast_intrinsic_expr(
             let (vt0, e0) = a(0);
             let (vt1, e1) = a(1);
             let (vt2, e2) = a(2);
-            if vt0 == vt1 && vt0 == vt2 && (vt0.is_int() || vt0.is_fixed()) {
-                let raw = format!("({e0}).clamp({e1}, {e2})");
+            if let Some(dims) = vt0.is_vec() {
+                let lo_e = |i: usize| {
+                    if vt1 == vt0 {
+                        format!("{e1}[{i}]")
+                    } else {
+                        af32(1)
+                    }
+                };
+                let hi_e = |i: usize| {
+                    if vt2 == vt0 {
+                        format!("{e2}[{i}]")
+                    } else {
+                        af32(2)
+                    }
+                };
+                let parts: Vec<String> = (0..dims)
+                    .map(|i| {
+                        let lo = lo_e(i);
+                        let hi = hi_e(i);
+                        format!("{{ let __lo = {lo}; let __hi = {hi}; {e0}[{i}].clamp(__lo, __hi.max(__lo)) }}")
+                    })
+                    .collect();
+                format!("[{}]", parts.join(", "))
+            } else if let Some(dims) = vt0.is_ivec() {
+                let scalar_ty = if vt0 == GuestValTy::UVec2 {
+                    GuestValTy::U32
+                } else {
+                    GuestValTy::I32
+                };
+                let lo_s = guest_fast_coerce(&e1, &vt1, &scalar_ty, cat);
+                let hi_s = guest_fast_coerce(&e2, &vt2, &scalar_ty, cat);
+                let parts: Vec<String> = (0..dims)
+                    .map(|i| {
+                        let lo = if vt1 == vt0 {
+                            format!("{e1}[{i}]")
+                        } else {
+                            lo_s.clone()
+                        };
+                        let hi = if vt2 == vt0 {
+                            format!("{e2}[{i}]")
+                        } else {
+                            hi_s.clone()
+                        };
+                        format!("{{ let __lo = {lo}; let __hi = {hi}; {e0}[{i}].clamp(__lo, __hi.max(__lo)) }}")
+                    })
+                    .collect();
+                format!("[{}]", parts.join(", "))
+            } else if vt0 == vt1 && vt0 == vt2 && (vt0.is_int() || vt0.is_fixed()) {
+                let raw = format!("({e0}).clamp({e1}, ({e2}).max({e1}))");
                 guest_fast_coerce(&raw, &vt0, dst_ty, cat)
             } else if use_f64 {
                 let raw = format!(
@@ -3262,11 +4022,13 @@ pub(super) fn guest_fast_intrinsic_expr(
                 let (vt, e) = a(1);
                 guest_fast_coerce(&e, &vt, &GuestValTy::I32, cat)
             } else {
-                "0i32".to_owned()
+                x.clone()
             };
             let z = if args.len() > 2 {
                 let (vt, e) = a(2);
                 guest_fast_coerce(&e, &vt, &GuestValTy::I32, cat)
+            } else if args.len() == 1 {
+                x.clone()
             } else {
                 "0i32".to_owned()
             };
@@ -3350,7 +4112,22 @@ pub(super) fn guest_fast_intrinsic_expr(
                 ),
             }
         }
-        "normalize" | "norm" => {
+        "distance_sq" | "dist_sq" => {
+            let (vt0, e0) = a(0);
+            let (_, e1) = a(1);
+            match vt0 {
+                GuestValTy::Vec3 => format!(
+                    "{{ let __dx = {e0}[0] - {e1}[0]; let __dy = {e0}[1] - {e1}[1]; let __dz = {e0}[2] - {e1}[2]; __dx * __dx + __dy * __dy + __dz * __dz }}"
+                ),
+                GuestValTy::Vec4 => format!(
+                    "{{ let __dx = {e0}[0] - {e1}[0]; let __dy = {e0}[1] - {e1}[1]; let __dz = {e0}[2] - {e1}[2]; let __dw = {e0}[3] - {e1}[3]; __dx * __dx + __dy * __dy + __dz * __dz + __dw * __dw }}"
+                ),
+                _ => format!(
+                    "{{ let __dx = {e0}[0] - {e1}[0]; let __dy = {e0}[1] - {e1}[1]; __dx * __dx + __dy * __dy }}"
+                ),
+            }
+        }
+        "normalize" | "norm" | "normalize_or_zero" => {
             let (vt0, e0) = a(0);
             match vt0 {
                 GuestValTy::Vec3 => format!(
@@ -3396,6 +4173,29 @@ pub(super) fn guest_fast_intrinsic_expr(
                     e0 = af32(0),
                     e1 = af32(1),
                     x = af32(2)
+                );
+                guest_fast_coerce(&raw, &GuestValTy::F32, dst_ty, cat)
+            }
+        }
+        "remap" => {
+            if use_f64 {
+                let raw = format!(
+                    "{{ let __span = {i1} - {i0}; let __t = if __span.abs() > 1e-6_f64 {{ ({v} - {i0}) / __span }} else {{ 0.0_f64 }}; {o0} + ({o1} - {o0}) * __t }}",
+                    v = af64(0),
+                    i0 = af64(1),
+                    i1 = af64(2),
+                    o0 = af64(3),
+                    o1 = af64(4)
+                );
+                guest_fast_coerce(&raw, &GuestValTy::F64, dst_ty, cat)
+            } else {
+                let raw = format!(
+                    "{{ let __span = {i1} - {i0}; let __t = if __span.abs() > 1e-6_f32 {{ ({v} - {i0}) / __span }} else {{ 0.0_f32 }}; {o0} + ({o1} - {o0}) * __t }}",
+                    v = af32(0),
+                    i0 = af32(1),
+                    i1 = af32(2),
+                    o0 = af32(3),
+                    o1 = af32(4)
                 );
                 guest_fast_coerce(&raw, &GuestValTy::F32, dst_ty, cat)
             }
@@ -3917,7 +4717,7 @@ pub(super) fn emit_guest_fast_stmt(
         Inst::GraceArm { ptr, duration_sec } => {
             if let Some((place, _, _)) = guest_fast_field_mut_place(*ptr, "", 0, fl, cat) {
                 let de = guest_fast_local_expr(*duration_sec, fl);
-                writeln!(out, "{indent}{place} = {de};").ok();
+                writeln!(out, "{indent}{place} = ({place}).max({de});").ok();
             }
         }
         Inst::GraceTick { ptr, dt_sec } => {
@@ -4020,7 +4820,7 @@ pub(super) fn emit_guest_fast_stmt(
                 let dt = &fl.val_tys[d.0 as usize];
                 let ae = guest_fast_local_expr(*acc, fl);
                 let ve = guest_fast_local_expr(*val, fl);
-                let comb = guest_reduce_combine(op, dt, &ae, &ve, cat);
+                let comb = guest_reduce_combine(op, dt, &ae, &ve, cat, false);
                 writeln!(out, "{indent}__loc_{} = {comb};", d.0).ok();
             }
         }
@@ -4668,6 +5468,7 @@ pub(super) fn emit_guest_fast_loop(
                         &format!("__g.{ri}"),
                         &format!("__cred_{ri}"),
                         cat,
+                        true,
                     );
                     writeln!(out, "{pind}    __g.{ri} = {comb};").ok();
                 }
@@ -4739,6 +5540,7 @@ pub(super) fn emit_guest_fast_loop(
                     &format!("__g.{ri}"),
                     &format!("__cred_{ri}"),
                     cat,
+                    true,
                 );
                 writeln!(out, "{cind}    __g.{ri} = {comb};").ok();
             }
@@ -4853,6 +5655,7 @@ pub(super) fn emit_guest_fast_loop(
                             &format!("__g.{ri}"),
                             &format!("__cred_{ri}"),
                             cat,
+                            true,
                         );
                         writeln!(out, "{cind}    __g.{ri} = {comb};").ok();
                     }
