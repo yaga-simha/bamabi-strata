@@ -5078,7 +5078,7 @@ fn setup_four_way_apps(
     src: &str,
     tier3_driver: &str,
 ) -> (TempDir, strata_mir::MirModule, App, App, App, Tier3Capture) {
-    let analyzed = analyze_source(&format!("{label}.strata"), src);
+    let analyzed = analyze_source(format!("{label}.strata"), src);
     assert!(
         analyzed.ok(),
         "{label} sema failed: {:?}",
