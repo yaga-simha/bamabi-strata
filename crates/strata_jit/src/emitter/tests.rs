@@ -628,3 +628,106 @@ sys readonly_shared() {
     assert!(wire_queries_conflict(&q_changed, &q_mut));
     assert!(wire_queries_conflict(&q_res_ro, &q_res_wr));
 }
+
+#[test]
+fn x86_64_linux_pic_compile_regression_helpers_and_narrow_casts() {
+    let x64_triple: target_lexicon::Triple = "x86_64-unknown-linux-gnu".parse().expect("triple");
+    if cranelift_codegen::isa::lookup(x64_triple.clone()).is_err() {
+        return;
+    }
+
+    let full_mir_src = r#"
+module test::full_mir_test @version(1.0.0) @deterministic;
+enum WeaponKind { Sword = 0, Bow = 1 }
+@sparse component Pos { xy: vec2 }
+component Flags { mask: BitSet<64> }
+relation ChildRel [exclusive, cascade_despawn];
+table WeaponStats by WeaponKind { damage: f32, range: f32 } = {
+    Sword => { damage: 25.0, range: 2.0 },
+    Bow   => { damage: 15.0, range: 30.0 },
+};
+curve Falloff(f32 -> f32) = [(0.0, 1.0), (10.0, 0.5), (30.0, 0.0)];
+fn compute_falloff(d: f32, kind: WeaponKind) -> f32 {
+    let w = WeaponStats[kind].damage;
+    let s = sin(d) + cos(d) + atan2(d, 1.0) + pow(2.0, 0.5) + exp(0.0) + log(1.0) + round(1.6);
+    w * Falloff.sample(d) + s * 0.001
+}
+sys update_all() {
+    for row in query(pos: &mut Pos, fl: &mut Flags) {
+        let dmg = compute_falloff(length(row.pos.xy), WeaponKind::Sword);
+        if dmg > 0.0 {
+            row.fl.mask.set(3);
+            if row.fl.mask.get(3) { row.fl.mask.clear(3); }
+        }
+        insert_relation<ChildRel>(row.id, row.id);
+    }
+}
+schedule FixedUpdate { update_all }
+"#;
+
+    let helper_and_casts_src = r#"
+module test::x64_reg @version(1.0.0);
+component Box {
+    iv3: ivec3 = ivec3(0, 0, 0),
+    v3: vec3 = vec3(0.0, 0.0, 0.0),
+    v4: vec4 = vec4(0.0, 0.0, 0.0, 0.0),
+    si8: i8 = 0,
+    su8: u8 = 0,
+    si16: i16 = 0,
+    su16: u16 = 0,
+    f32v: f32 = 1e20_f32,
+    f64v: f64 = -1e25_f64,
+}
+fn make_iv3(x: i32, y: i32, z: i32) -> ivec3 { return ivec3(x, y, z); }
+fn make_v3(x: f32, y: f32, z: f32) -> vec3 { return vec3(x, y, z); }
+fn make_v4(x: f32, y: f32, z: f32, w: f32) -> vec4 { return vec4(x, y, z, w); }
+sys run_all() {
+    for r in query(b: &mut Box) {
+        r.b.iv3 = make_iv3(1, -2, 3);
+        r.b.v3 = make_v3(1.0, 2.0, 3.0);
+        r.b.v4 = make_v4(1.0, 2.0, 3.0, 4.0);
+        r.b.si8 = (r.b.f32v) as i8;
+        r.b.su8 = (r.b.f32v) as u8;
+        r.b.si16 = (r.b.f64v) as i16;
+        r.b.su16 = (r.b.f64v) as u16;
+    }
+}
+schedule FixedUpdate { run_all }
+"#;
+
+    let net_subword_src = r#"
+module test::x64_net_subword @version(1.0.0);
+@net(reliable, channel = 0)
+@authority(server)
+component SubNet {
+    @quantize(min = -10.0, max = 10.0, bits = 8)
+    a: i8 = 0,
+    @quantize(min = 0.0, max = 100.0, bits = 8)
+    b: u8 = 0,
+    @quantize(min = -100.0, max = 100.0, bits = 12)
+    c: i16 = 0,
+    @quantize(min = 0.0, max = 1000.0, bits = 12)
+    d: u16 = 0,
+}
+schedule FixedUpdate {}
+"#;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for (name, src) in [
+        ("full_mir_test", full_mir_src),
+        ("helper_and_casts", helper_and_casts_src),
+        ("net_subword", net_subword_src),
+    ] {
+        let sema = strata_sema::analyze_source(name, src);
+        assert!(sema.ok(), "{name} sema: {:?}", sema.diagnostics);
+        let mir = strata_mir::lower_to_mir(&sema);
+        let opts = JitCompileOptions {
+            out_dir: tmp.path().to_path_buf(),
+            module_stem: name.to_owned(),
+            opt_level: JitOptLevel::Speed,
+        };
+        let art = emit_pic_object_for_triple(&mir, &opts, x64_triple.clone())
+            .unwrap_or_else(|e| panic!("{name} x86_64 PIC emit failed: {e}"));
+        assert!(!art.object_bytes.is_empty());
+    }
+}

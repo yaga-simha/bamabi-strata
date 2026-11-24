@@ -2,6 +2,10 @@
 
 use super::*;
 
+pub(super) fn helper_uses_out_ptr(ret_ty: &MirType) -> bool {
+    matches!(ret_ty, MirType::Vec3 | MirType::Vec4 | MirType::IVec3)
+}
+
 pub(super) fn build_helper_signature(
     hfn: &MirFunction,
     ptr_ty: Type,
@@ -10,10 +14,15 @@ pub(super) fn build_helper_signature(
 ) -> Signature {
     let mut sig = Signature::new(cc);
     sig.params.push(AbiParam::new(ptr_ty)); // state_ptr
+    if helper_uses_out_ptr(&hfn.ret_ty) {
+        sig.params.push(AbiParam::new(ptr_ty)); // sret out_ptr for 3/4-lane vecs
+    }
     for p in &hfn.params {
         push_abi_params_for_mir_type(&mut sig.params, &p.ty, ptr_ty, enums_by_name);
     }
-    push_abi_params_for_mir_type(&mut sig.returns, &hfn.ret_ty, ptr_ty, enums_by_name);
+    if !helper_uses_out_ptr(&hfn.ret_ty) {
+        push_abi_params_for_mir_type(&mut sig.returns, &hfn.ret_ty, ptr_ty, enums_by_name);
+    }
     sig
 }
 
@@ -1042,7 +1051,12 @@ pub(super) fn emit_mir_function_body(
 
         // Bind `HelperFn` parameters onto `MirParam.local`.
         if mode == MirCallbackMode::Helper {
-            let mut p_off = 1usize;
+            let mut p_off = if helper_uses_out_ptr(&mir_fn.ret_ty) {
+                lowerer.helper_out_ptr = Some(params[1]);
+                2usize
+            } else {
+                1usize
+            };
             for p in &mir_fn.params {
                 let count = match p.ty {
                     MirType::Unit => 0,
@@ -1387,6 +1401,7 @@ pub(super) struct FnLowerer<'a, 'b, 'f> {
     pub(super) obs_commands: Option<Value>,
     pub(super) mig_src: Option<Value>,
     pub(super) mig_dst: Option<Value>,
+    pub(super) helper_out_ptr: Option<Value>,
     pub(super) local_reps: Vec<LocalRep>,
     pub(super) slot_elem_tys: HashMap<u32, MirType>,
     pub(super) agg_slots: HashMap<u32, StackSlot>,
@@ -1573,6 +1588,7 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             obs_commands,
             mig_src,
             mig_dst,
+            helper_out_ptr: None,
             local_reps,
             slot_elem_tys,
             agg_slots,
@@ -2247,11 +2263,29 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
             }
             MirType::Vec3 | MirType::IVec3 => {
                 let vs = self.use_vec(lid);
-                self.b.ins().return_(&[vs[0], vs[1], vs[2]]);
+                if let Some(out_ptr) = self.helper_out_ptr {
+                    for (i, &v) in vs[..3].iter().enumerate() {
+                        self.b
+                            .ins()
+                            .store(MemFlagsData::new(), v, out_ptr, (i * 4) as i32);
+                    }
+                    self.b.ins().return_(&[]);
+                } else {
+                    self.b.ins().return_(&[vs[0], vs[1], vs[2]]);
+                }
             }
             MirType::Vec4 => {
                 let vs = self.use_vec(lid);
-                self.b.ins().return_(&vs);
+                if let Some(out_ptr) = self.helper_out_ptr {
+                    for (i, &v) in vs.iter().enumerate() {
+                        self.b
+                            .ins()
+                            .store(MemFlagsData::new(), v, out_ptr, (i * 4) as i32);
+                    }
+                    self.b.ins().return_(&[]);
+                } else {
+                    self.b.ins().return_(&vs);
+                }
             }
             _ => {
                 let ret_mty = self.mir_fn.ret_ty.clone();
@@ -2270,6 +2304,13 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
     }
 
     pub(super) fn emit_default_helper_return(&mut self) {
+        if let Some(out_ptr) = self.helper_out_ptr {
+            let zero = self.b.ins().iconst(types::I64, 0);
+            self.b.ins().store(MemFlagsData::new(), zero, out_ptr, 0);
+            self.b.ins().store(MemFlagsData::new(), zero, out_ptr, 8);
+            self.b.ins().return_(&[]);
+            return;
+        }
         let rets: Vec<Type> = self
             .b
             .func
@@ -2552,6 +2593,40 @@ pub(super) fn apply_min_max(
     }
 }
 
+fn emit_fcvt_to_sint_sat(b: &mut FunctionBuilder<'_>, to: Type, val: Value) -> Value {
+    if to == types::I8 || to == types::I16 {
+        let wide = b.ins().fcvt_to_sint_sat(types::I32, val);
+        let (min_v, max_v) = if to == types::I8 {
+            (i64::from(i8::MIN), i64::from(i8::MAX))
+        } else {
+            (i64::from(i16::MIN), i64::from(i16::MAX))
+        };
+        let min_c = b.ins().iconst(types::I32, min_v);
+        let max_c = b.ins().iconst(types::I32, max_v);
+        let lo = b.ins().smax(wide, min_c);
+        let clamped = b.ins().smin(lo, max_c);
+        b.ins().ireduce(to, clamped)
+    } else {
+        b.ins().fcvt_to_sint_sat(to, val)
+    }
+}
+
+fn emit_fcvt_to_uint_sat(b: &mut FunctionBuilder<'_>, to: Type, val: Value) -> Value {
+    if to == types::I8 || to == types::I16 {
+        let wide = b.ins().fcvt_to_uint_sat(types::I32, val);
+        let max_v = if to == types::I8 {
+            i64::from(u8::MAX)
+        } else {
+            i64::from(u16::MAX)
+        };
+        let max_c = b.ins().iconst(types::I32, max_v);
+        let clamped = b.ins().umin(wide, max_c);
+        b.ins().ireduce(to, clamped)
+    } else {
+        b.ins().fcvt_to_uint_sat(to, val)
+    }
+}
+
 pub(super) fn coerce_cl_val(
     b: &mut FunctionBuilder<'_>,
     val: Value,
@@ -2569,7 +2644,7 @@ pub(super) fn coerce_cl_val(
         return b.ins().fdemote(types::F32, val);
     }
     if (from == types::F32 || from == types::F64) && to.is_int() {
-        return b.ins().fcvt_to_sint_sat(to, val);
+        return emit_fcvt_to_sint_sat(b, to, val);
     }
     if from.is_int() && (to == types::F32 || to == types::F64) {
         return b.ins().fcvt_from_sint(to, val);
@@ -2604,9 +2679,9 @@ pub(super) fn cast_value(
     }
     if (from == types::F32 || from == types::F64) && dst_ty.is_int() {
         if dst_signed {
-            return b.ins().fcvt_to_sint_sat(dst_ty, val);
+            return emit_fcvt_to_sint_sat(b, dst_ty, val);
         }
-        return b.ins().fcvt_to_uint_sat(dst_ty, val);
+        return emit_fcvt_to_uint_sat(b, dst_ty, val);
     }
     if from.is_int() && (dst_ty == types::F32 || dst_ty == types::F64) {
         if src_signed {

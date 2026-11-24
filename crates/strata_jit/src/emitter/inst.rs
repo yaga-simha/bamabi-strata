@@ -1959,7 +1959,16 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         };
         let ptr_ty = self.ctx.ptr_ty;
         let hfn = self.ctx.mir.fns[hidx].clone();
+        let use_out_ptr = helper_uses_out_ptr(&hfn.ret_ty);
         let mut call_args = vec![self.state_ptr];
+        let out_ptr = if use_out_ptr {
+            let out_slot = alloc_zero_slot(self.b, 16, ptr_ty);
+            let p = self.b.ins().stack_addr(ptr_ty, out_slot, 0);
+            call_args.push(p);
+            Some(p)
+        } else {
+            None
+        };
         for (i, &arg) in args.iter().enumerate() {
             let expected_ty = hfn.params.get(i).map_or_else(
                 || self.mir_fn.locals[arg.0 as usize].ty.clone(),
@@ -1999,7 +2008,25 @@ impl<'a, 'b, 'f> FnLowerer<'a, 'b, 'f> {
         let results = self.b.inst_results(call).to_vec();
         if let Some(d) = dst {
             let dty = self.mir_fn.locals[d.0 as usize].ty.clone();
-            self.bind_param_val(d, &results, &dty);
+            if let Some(p) = out_ptr {
+                let lane_ty = if is_ivec_mir_ty(&hfn.ret_ty) {
+                    types::I32
+                } else {
+                    types::F32
+                };
+                let lanes = if hfn.ret_ty == MirType::Vec4 { 4 } else { 3 };
+                let mut loaded = Vec::with_capacity(lanes);
+                for i in 0..lanes {
+                    loaded.push(
+                        self.b
+                            .ins()
+                            .load(lane_ty, MemFlagsData::new(), p, (i * 4) as i32),
+                    );
+                }
+                self.bind_param_val(d, &loaded, &dty);
+            } else {
+                self.bind_param_val(d, &results, &dty);
+            }
         }
         Ok(())
     }

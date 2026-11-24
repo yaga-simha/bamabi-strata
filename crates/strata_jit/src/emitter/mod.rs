@@ -456,9 +456,16 @@ pub fn emit_pic_object(
     mir: &MirModule,
     opts: &JitCompileOptions,
 ) -> Result<PicObjectArtifact, JitError> {
+    emit_pic_object_for_triple(mir, opts, Triple::host())
+}
+
+pub(crate) fn emit_pic_object_for_triple(
+    mir: &MirModule,
+    opts: &JitCompileOptions,
+    triple: Triple,
+) -> Result<PicObjectArtifact, JitError> {
     validate_net_packet_capacity(mir).map_err(|e| JitError::Codegen(e.to_string()))?;
 
-    let triple = Triple::host();
     let mut flag_builder = settings::builder();
     flag_builder
         .set("is_pic", "true")
