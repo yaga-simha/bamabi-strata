@@ -5195,8 +5195,8 @@ fn id_fx64(v: fix64) -> fix64 { v }
 
 sys step_math_coll() {
     let (p32, p64, cnt, has_any, every_flag) = for r in query(x: &FxRow) reduce (
-        p32: prod(r.x.fx32),
-        p64: prod(r.x.fx64),
+        p32: prod(1.0, r.x.fx32),
+        p64: prod(1.0, r.x.fx64),
         cnt: count(r.x.flag),
         has_any: any(r.x.flag),
         every_flag: all(r.x.flag)

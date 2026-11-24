@@ -1764,6 +1764,11 @@ pub(super) fn analyze_function(
                         let resolved = resolve_custom_relation_name(ctx, relation);
                         let vname = format!("rel_res_{}", sanitize_ident(resolved));
                         relation_res_map.insert(resolved.to_owned(), (vname, true));
+                        let short_r = resolved.rsplit("::").next().unwrap_or(resolved);
+                        let comp_short = format!("__strata_rel_parent_{short_r}");
+                        if ctx.find_layout_entry(&comp_short).is_some() {
+                            needs_commands = true;
+                        }
                     }
                 }
                 Inst::IterUpCascade {

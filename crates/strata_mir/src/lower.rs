@@ -2437,8 +2437,32 @@ impl<'a> CfgBuilder<'a> {
                     ),
                     MirType::Vec4,
                 ),
-                _ => unreachable!(),
+                other => self.materialize_const_val(name, &other, MirType::Unit),
             };
+        }
+
+        // Matrix constants (`mat3::IDENTITY`, `mat3::ZERO`, `mat4::IDENTITY`, `mat4::ZERO`)
+        if let Some((callee, elems)) = mat_path_constant(name) {
+            let mut arg_ids = Vec::with_capacity(elems.len());
+            for &value in elems {
+                arg_ids.push(self.alloc_and_emit(
+                    "mat_e",
+                    MirType::F32,
+                    Inst::ConstFloat { value },
+                ));
+            }
+            let mty = MirType::Named(callee.to_owned());
+            return (
+                self.alloc_and_emit(
+                    "mat_c",
+                    mty.clone(),
+                    Inst::Call {
+                        callee: callee.to_owned(),
+                        args: arg_ids,
+                    },
+                ),
+                mty,
+            );
         }
 
         // Module `const`
@@ -7910,6 +7934,24 @@ fn vec_path_constant(name: &str) -> Option<MirConstVal> {
         "vec4::Y" => Some(MirConstVal::Vec4([0.0, 1.0, 0.0, 0.0])),
         "vec4::Z" => Some(MirConstVal::Vec4([0.0, 0.0, 1.0, 0.0])),
         "vec4::W" => Some(MirConstVal::Vec4([0.0, 0.0, 0.0, 1.0])),
+        "quat::ZERO" | "Quat::ZERO" => Some(MirConstVal::Vec4([0.0, 0.0, 0.0, 0.0])),
+        "quat::IDENTITY" | "Quat::IDENTITY" => Some(MirConstVal::Vec4([0.0, 0.0, 0.0, 1.0])),
+        _ => None,
+    }
+}
+
+fn mat_path_constant(name: &str) -> Option<(&'static str, &'static [f64])> {
+    const MAT3_ZERO: [f64; 9] = [0.0; 9];
+    const MAT3_ID: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    const MAT4_ZERO: [f64; 16] = [0.0; 16];
+    const MAT4_ID: [f64; 16] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    match name {
+        "mat3::ZERO" | "Mat3::ZERO" => Some(("mat3", &MAT3_ZERO)),
+        "mat3::IDENTITY" | "Mat3::IDENTITY" => Some(("mat3", &MAT3_ID)),
+        "mat4::ZERO" | "Mat4::ZERO" => Some(("mat4", &MAT4_ZERO)),
+        "mat4::IDENTITY" | "Mat4::IDENTITY" => Some(("mat4", &MAT4_ID)),
         _ => None,
     }
 }

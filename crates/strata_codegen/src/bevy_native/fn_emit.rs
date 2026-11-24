@@ -456,7 +456,7 @@ pub(super) fn emit_single_function(
                 .map(|e| (format!("Stream_{i}"), mw_var.clone(), e.struct_name.clone()))
         })
         .collect();
-    let tx_rels: Vec<(String, String, String)> = analysis
+    let tx_rels: Vec<(String, String, String, Option<String>)> = analysis
         .relation_res_map
         .iter()
         .enumerate()
@@ -470,7 +470,11 @@ pub(super) fn emit_single_function(
                 .and_then(|r| r.payload_layout.as_ref())
                 .and_then(|pl| ctx.find_layout_entry(&pl.canonical_name))
                 .map_or_else(|| "()".to_owned(), |e| e.struct_name.clone());
-            (format!("Rel_{i}"), rel_var.clone(), p_ty)
+            let short_r = rel_name.rsplit("::").next().unwrap_or(rel_name.as_str());
+            let comp_struct = ctx
+                .find_layout_entry(&format!("__strata_rel_parent_{short_r}"))
+                .map(|e| e.struct_name.clone());
+            (format!("Rel_{i}"), rel_var.clone(), p_ty, comp_struct)
         })
         .collect();
 
@@ -479,7 +483,7 @@ pub(super) fn emit_single_function(
         for (vtag, _, stype) in &tx_streams {
             variants.push(format!("{vtag}({stype})"));
         }
-        for (vtag, _, p_ty) in &tx_rels {
+        for (vtag, _, p_ty, _) in &tx_rels {
             variants.push(format!("{vtag}Insert(Entity, Entity, {p_ty})"));
             variants.push(format!("{vtag}Remove(Entity, Entity)"));
         }
@@ -570,12 +574,36 @@ pub(super) fn emit_single_function(
                 "__StrataTxCmd::{vtag}(ev) => {{ {mw_var}.write(ev); }}"
             ));
         }
-        for (vtag, rel_var, _) in &tx_rels {
+        for (vtag, rel_var, _, comp_opt) in &tx_rels {
+            let comp_ins = comp_opt.as_ref().map_or_else(String::new, |cs| {
+                if analysis.needs_commands {
+                    format!(
+                        " commands.entity(s).insert({cs} {{ parent: FfiEntity::from_bits(d.to_bits()) }});"
+                    )
+                } else if analysis.needs_par_commands {
+                    format!(
+                        " par_commands.command_scope(|mut __cmds| {{ __cmds.entity(s).insert({cs} {{ parent: FfiEntity::from_bits(d.to_bits()) }}); }});"
+                    )
+                } else {
+                    String::new()
+                }
+            });
+            let comp_rem = comp_opt.as_ref().map_or_else(String::new, |cs| {
+                if analysis.needs_commands {
+                    format!(" commands.entity(s).remove::<{cs}>();")
+                } else if analysis.needs_par_commands {
+                    format!(
+                        " par_commands.command_scope(|mut __cmds| {{ __cmds.entity(s).remove::<{cs}>(); }});"
+                    )
+                } else {
+                    String::new()
+                }
+            });
             arms.push(format!(
-                "__StrataTxCmd::{vtag}Insert(s, d, p) => {{ {rel_var}.insert(s, d, p); }}"
+                "__StrataTxCmd::{vtag}Insert(s, d, p) => {{ {rel_var}.insert(s, d, p);{comp_ins} }}"
             ));
             arms.push(format!(
-                "__StrataTxCmd::{vtag}Remove(s, d) => {{ {rel_var}.remove(s, d); }}"
+                "__StrataTxCmd::{vtag}Remove(s, _d) => {{ {rel_var}.remove(s, _d);{comp_rem} }}"
             ));
         }
         writeln!(
@@ -3584,6 +3612,23 @@ pub(super) fn emit_stmt(
                     let p_expr = payload
                         .map(|p| format!("__loc_{}", p.0))
                         .unwrap_or_else(|| "()".to_owned());
+                    let short_r = resolved_rel.rsplit("::").next().unwrap_or(resolved_rel);
+                    let comp_ins = ctx
+                        .find_layout_entry(&format!("__strata_rel_parent_{short_r}"))
+                        .map_or_else(String::new, |e| {
+                            let cs = &e.struct_name;
+                            if analysis.needs_par_commands {
+                                format!(
+                                    " par_commands.command_scope(|mut __cmds| {{ __cmds.entity(__s).insert({cs} {{ parent: FfiEntity::from_bits(__d.to_bits()) }}); }});"
+                                )
+                            } else if analysis.needs_commands {
+                                format!(
+                                    " commands.entity(__s).insert({cs} {{ parent: FfiEntity::from_bits(__d.to_bits()) }});"
+                                )
+                            } else {
+                                String::new()
+                            }
+                        });
                     let r_idx_opt = analysis
                         .relation_res_map
                         .keys()
@@ -3594,7 +3639,7 @@ pub(super) fn emit_stmt(
                         writeln!(
                             out,
                             "{indent}if let (Some(__s), Some(__d)) = (Entity::try_from_bits({ent}.to_bits()), Entity::try_from_bits({tgt}.to_bits())) {{\n\
-                             {indent}    if __tx_active {{ __tx_cmds.push(__StrataTxCmd::Rel_{r_idx}Insert(__s, __d, {p_expr})); }} else {{ {vname}.insert(__s, __d, {p_expr}); }}\n\
+                             {indent}    if __tx_active {{ __tx_cmds.push(__StrataTxCmd::Rel_{r_idx}Insert(__s, __d, {p_expr})); }} else {{ {vname}.insert(__s, __d, {p_expr});{comp_ins} }}\n\
                              {indent}}}"
                         )
                         .ok();
@@ -3602,7 +3647,7 @@ pub(super) fn emit_stmt(
                         writeln!(
                             out,
                             "{indent}if let (Some(__s), Some(__d)) = (Entity::try_from_bits({ent}.to_bits()), Entity::try_from_bits({tgt}.to_bits())) {{\n\
-                             {indent}    {vname}.insert(__s, __d, {p_expr});\n\
+                             {indent}    {vname}.insert(__s, __d, {p_expr});{comp_ins}\n\
                              {indent}}}"
                         )
                         .ok();
@@ -3627,6 +3672,21 @@ pub(super) fn emit_stmt(
                 let tgt = resolve_entity_local_expr(*target, func, analysis, in_chunk);
                 let resolved_rel = resolve_custom_relation_name(ctx, relation);
                 if let Some((vname, _)) = analysis.relation_res_map.get(resolved_rel) {
+                    let short_r = resolved_rel.rsplit("::").next().unwrap_or(resolved_rel);
+                    let comp_rem = ctx
+                        .find_layout_entry(&format!("__strata_rel_parent_{short_r}"))
+                        .map_or_else(String::new, |e| {
+                            let cs = &e.struct_name;
+                            if analysis.needs_par_commands {
+                                format!(
+                                    " par_commands.command_scope(|mut __cmds| {{ __cmds.entity(__s).remove::<{cs}>(); }});"
+                                )
+                            } else if analysis.needs_commands {
+                                format!(" commands.entity(__s).remove::<{cs}>();")
+                            } else {
+                                String::new()
+                            }
+                        });
                     let r_idx_opt = analysis
                         .relation_res_map
                         .keys()
@@ -3637,7 +3697,7 @@ pub(super) fn emit_stmt(
                         writeln!(
                             out,
                             "{indent}if let (Some(__s), Some(__d)) = (Entity::try_from_bits({ent}.to_bits()), Entity::try_from_bits({tgt}.to_bits())) {{\n\
-                             {indent}    if __tx_active {{ __tx_cmds.push(__StrataTxCmd::Rel_{r_idx}Remove(__s, __d)); }} else {{ {vname}.remove(__s, __d); }}\n\
+                             {indent}    if __tx_active {{ __tx_cmds.push(__StrataTxCmd::Rel_{r_idx}Remove(__s, __d)); }} else {{ {vname}.remove(__s, __d);{comp_rem} }}\n\
                              {indent}}}"
                         )
                         .ok();
@@ -3645,7 +3705,7 @@ pub(super) fn emit_stmt(
                         writeln!(
                             out,
                             "{indent}if let (Some(__s), Some(__d)) = (Entity::try_from_bits({ent}.to_bits()), Entity::try_from_bits({tgt}.to_bits())) {{\n\
-                             {indent}    {vname}.remove(__s, __d);\n\
+                             {indent}    {vname}.remove(__s, __d);{comp_rem}\n\
                              {indent}}}"
                         )
                         .ok();
