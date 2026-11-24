@@ -968,7 +968,7 @@ pub(super) fn define_table_rodata(
             _ => (ptr_bytes.max(8), 8),
         };
         cursor = align_up(cursor, al);
-        fields.insert(fname.clone(), (cursor, mty.clone()));
+        fields.insert(fname.clone(), (cursor, mty));
         ordered_fields.push((fname.clone(), cursor, sz, fty.clone()));
         cursor += sz;
     }

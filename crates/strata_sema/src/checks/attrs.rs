@@ -887,7 +887,7 @@ pub(super) fn parse_net_attr(
                                 if let Some(d) = diags.as_deref_mut() {
                                     d.push(Diagnostic::error(
                                         codes::E0502_INVALID_NET_ATTR,
-                                        arg_span.clone(),
+                                        arg_span,
                                         format!("@net `rate` on `{owner}` requires Hz unit (e.g. `20Hz`), found `{txt}`"),
                                         None,
                                     ));

@@ -1170,7 +1170,7 @@ pub(super) fn extract_field_defaults_list(
                     saw_eq = true;
                 }
                 NodeOrToken::Node(n) if saw_eq && is_expr_node(n.kind()) => {
-                    map.insert(fname.clone(), lower_expr(&n, lower_env, &mut scope, &[]));
+                    map.insert(fname, lower_expr(&n, lower_env, &mut scope, &[]));
                     break;
                 }
                 _ => {}

@@ -160,8 +160,7 @@ impl CsrGridScratch {
             for cx in min_cx..=max_cx {
                 let cell = cy * self.cols + cx;
                 if let Some((start, end)) = csr_cell_range(&self.offsets, cell, total) {
-                    for idx in start..end {
-                        let p = self.sorted_pos[idx];
+                    for &p in &self.sorted_pos[start..end] {
                         let dx = p[0] - center[0];
                         let dy = p[1] - center[1];
                         if dx * dx + dy * dy <= r2 {

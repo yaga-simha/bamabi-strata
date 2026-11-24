@@ -7432,7 +7432,7 @@ fn synthesize_timer_tick_system(
         let storage_key = if let Some((comp, strat)) = short_comp.split_once("__") {
             format!("{comp}::{strat}")
         } else {
-            short_comp.clone()
+            short_comp
         };
         let is_sparse =
             (comp_layout.component_flags & bamabi_sys::BAM_COMPONENT_FLAG_SPARSE_SET) != 0;
@@ -7495,13 +7495,13 @@ fn synthesize_timer_tick_system(
                 Inst::IterColRowsWrite {
                     query_idx: qi,
                     term_idx: 0,
-                    storage_key: storage_key.clone(),
+                    storage_key,
                 }
             } else {
                 Inst::IterColWrite {
                     query_idx: qi,
                     term_idx: 0,
-                    storage_key: storage_key.clone(),
+                    storage_key,
                 }
             },
         );

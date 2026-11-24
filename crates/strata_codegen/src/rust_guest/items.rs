@@ -207,7 +207,7 @@ impl GuestCatalog {
                 pl.clone()
             } else {
                 let canon_name = if canon_or_short.contains("::") || mir.module_path.is_empty() {
-                    canon_or_short.clone()
+                    canon_or_short
                 } else {
                     format!("{}::{canon_or_short}", mir.module_path)
                 };

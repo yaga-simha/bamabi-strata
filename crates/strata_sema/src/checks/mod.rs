@@ -636,7 +636,7 @@ pub(crate) fn compute_module_env_summary(file: &str, sig: &str) -> ModuleEnvSumm
                 if let Some(hc) =
                     analyze_const(file, sig, c.syntax(), &lower_env, &mut discard_diags)
                 {
-                    lower_env.const_tys.insert(hc.name.clone(), hc.ty.clone());
+                    lower_env.const_tys.insert(hc.name, hc.ty);
                 }
             }
             ast::Item::Table(tb) => {
