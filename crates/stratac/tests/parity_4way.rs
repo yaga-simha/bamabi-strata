@@ -5070,3 +5070,852 @@ schedule FixedUpdate { step_iter10 }
         );
     }
 }
+
+/// Shared 4-way parity harness that compiles a `.strata` source module for JIT, C99, RustGuest,
+/// and Tier-3 BevyNative, runs the provided Tier-3 driver, and sets up the 3 dynamic host apps.
+fn setup_four_way_apps(
+    label: &str,
+    src: &str,
+    tier3_driver: &str,
+) -> (TempDir, strata_mir::MirModule, App, App, App, Tier3Capture) {
+    let analyzed = analyze_source(&format!("{label}.strata"), src);
+    assert!(
+        analyzed.ok(),
+        "{label} sema failed: {:?}",
+        analyzed.diagnostics
+    );
+    let mir = lower_to_mir(&analyzed);
+    strata_mir::verify_mir(&mir).unwrap_or_else(|e| panic!("{label} verify_mir failed: {e:?}"));
+
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join(format!("{label}.strata"));
+    fs::write(&src_path, src).unwrap();
+
+    let jit_bin = build_target_bin(&src_path, BuildTarget::Jit, &tmp.path().join("jit"));
+    let c99_bin = build_target_bin(&src_path, BuildTarget::C99, &tmp.path().join("c99"));
+    let rg_bin = build_target_bin(
+        &src_path,
+        BuildTarget::RustGuest,
+        &tmp.path().join("rust_guest"),
+    );
+    let tier3 = run_tier3_native_harness(tmp.path(), label, &src_path, tier3_driver);
+
+    let (w_jit, _) = setup_dynamic_app_with_mod(&jit_bin);
+    let (w_c99, _) = setup_dynamic_app_with_mod(&c99_bin);
+    let (w_rg, _) = setup_dynamic_app_with_mod(&rg_bin);
+    (tmp, mir, w_jit, w_c99, w_rg, tier3)
+}
+
+#[test]
+fn wave3_math_tables_collections_and_layouts_four_way_parity() {
+    let _parity_rg = parity_alloc_read_guard();
+    let src = r#"
+module parity::wave3_math_coll @version(1.0.0);
+
+enum Biome {
+    Abyss = -2,
+    Surface = 0,
+    Sky = 5,
+}
+
+struct SubCfg {
+    tag_id: i32,
+    gain: f32,
+}
+
+struct ItemSlot {
+    hp: i32 = 10,
+    label: InlineStr<16> = "init",
+}
+
+struct NestBox {
+    src_str: InlineStr<16> = "hello",
+    copied: InlineStr<16> = "",
+    bs: [BitSet<128>; 2] = [bits(3), bits(4)],
+}
+
+table CfgByBiome by Biome {
+    off: vec2,
+    sub: SubCfg,
+    mask: BitSet<128>,
+} = {
+    Abyss => { off: vec2(-2.0, 4.0), sub: SubCfg { tag_id: -9, gain: 0.25 }, mask: bits(0, 127) },
+    Surface => { off: vec2(0.0, 0.0), sub: SubCfg { tag_id: 0, gain: 1.0 }, mask: bits(1) },
+    Sky => { off: vec2(3.0, 5.0), sub: SubCfg { tag_id: 7, gain: 2.5 }, mask: bits(64) },
+};
+
+component FxRow {
+    fx32: fix32 = 12.0,
+    fx64: fix64 = 1000.0,
+    flag: bool = true,
+}
+
+component MathCollPod {
+    id: u32 = 1,
+    q_res: quat = quat(0.0, 0.0, 0.0, 1.0),
+    v3_rot: vec3 = vec3(0.0, 0.0, 0.0),
+    abs_i32_min: i32 = 0,
+    abs_i64_min: i64 = 0,
+    abs_fx32: fix32 = 0.0,
+    abs_fx64: fix64 = 0.0,
+    prod_fx32: fix32 = 0.0,
+    prod_fx64: fix64 = 0.0,
+    red_cnt: u32 = 0,
+    red_any: bool = false,
+    red_all: bool = false,
+    tbl_tag: i32 = 0,
+    tbl_off_x: f32 = 0.0,
+    tbl_has_127: bool = false,
+    arr128: [BitSet<128>; 2] = [bits(1), bits(1, 90)],
+    bs_has_70: bool = false,
+    bs_has_1: bool = false,
+    mat2: [[i32; 2]; 2] = [[1, 2], [3, 4]],
+    cube3: [[[i32; 2]; 2]; 2] = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]],
+    items: [ItemSlot; 2] = [ItemSlot { hp: 10, label: "a" }, ItemSlot { hp: 20, label: "b" }],
+    str_arr: [InlineStr<16>; 2] = ["alpha", "beta"],
+    nest: NestBox = NestBox {},
+    sv: SmallVec<i32, 4> = [11, 22],
+    sv_len: u32 = 0,
+    sv_sum: i32 = 0,
+}
+
+object Fx1 { FxRow { fx32: 12.0, fx64: 1000.0, flag: true } }
+object Fx2 { FxRow { fx32: 12.0, fx64: 1000.0, flag: true } }
+object Fx3 { FxRow { fx32: 12.0, fx64: 1000.0, flag: false } }
+object Fx4 { FxRow { fx32: 12.0, fx64: 1.0, flag: true } }
+
+object MainMathColl {
+    MathCollPod { id: 1 },
+}
+
+fn id_i32(v: i32) -> i32 { v }
+fn id_i64(v: i64) -> i64 { v }
+fn id_fx32(v: fix32) -> fix32 { v }
+fn id_fx64(v: fix64) -> fix64 { v }
+
+sys step_math_coll() {
+    let (p32, p64, cnt, has_any, every_flag) = for r in query(x: &FxRow) reduce (
+        p32: prod(r.x.fx32),
+        p64: prod(r.x.fx64),
+        cnt: count(r.x.flag),
+        has_any: any(r.x.flag),
+        every_flag: all(r.x.flag)
+    );
+    let qz = quat(0.0, 0.0, 0.70710677, 0.70710677);
+    let qid = quat(0.0, 0.0, 0.0, 1.0);
+    let t_row = CfgByBiome[Biome::Abyss];
+
+    for row in query(m: &mut MathCollPod) {
+        let mut q = qz * qid;
+        q *= qid;
+        row.m.q_res = q;
+        row.m.v3_rot = q * vec3(1.0, 0.0, 0.0);
+
+        row.m.abs_i32_min = abs(id_i32(-2147483647 - 1));
+        row.m.abs_i64_min = abs(id_i64(-9223372036854775808));
+        row.m.abs_fx32 = abs(id_fx32(-3.25));
+        row.m.abs_fx64 = abs(id_fx64(-5.5));
+
+        row.m.prod_fx32 = p32;
+        row.m.prod_fx64 = p64;
+        row.m.red_cnt = cnt;
+        row.m.red_any = has_any;
+        row.m.red_all = every_flag;
+
+        row.m.tbl_tag = t_row.sub.tag_id;
+        row.m.tbl_off_x = t_row.off.x;
+        row.m.tbl_has_127 = t_row.mask.has(127);
+
+        row.m.arr128[1].set(70);
+        row.m.arr128[1].clear(1);
+        row.m.bs_has_70 = row.m.arr128[1].has(70);
+        row.m.bs_has_1 = row.m.arr128[1].has(1);
+
+        row.m.mat2[1][0] = 77;
+        row.m.cube3[1][0][1] = 88;
+        row.m.items[1].hp += 25;
+        row.m.items[0].label = "hero";
+        row.m.str_arr[1] = "omega";
+        row.m.nest.copied = row.m.nest.src_str;
+        row.m.nest.bs[0].set(126);
+
+        row.m.sv.push(33);
+        row.m.sv_len = row.m.sv.len();
+        row.m.sv_sum = row.m.sv[0] + row.m.sv[1] + row.m.sv[2];
+    }
+}
+
+schedule FixedUpdate { step_math_coll }
+"#;
+    let tier3_driver = r#"
+    app.world_mut().run_schedule(Startup);
+    capture_snapshot(&out_dir, "init", app.world());
+    app.world_mut().run_schedule(FixedUpdate);
+    capture_snapshot(&out_dir, "tick1", app.world());
+"#;
+    let (_tmp, mir, mut w_jit, mut w_c99, mut w_rg, tier3) =
+        setup_four_way_apps("wave3_math_coll", src, tier3_driver);
+    let pod_layout = mir
+        .layouts
+        .iter()
+        .find(|l| l.canonical_name.ends_with("MathCollPod"))
+        .unwrap();
+    let off = |name: &str| {
+        pod_layout
+            .fields
+            .iter()
+            .find(|f| !f.is_padding && f.name == name)
+            .unwrap()
+            .offset
+    };
+
+    assert_four_way_snapshot("init", &w_jit, &w_c99, &w_rg, &tier3);
+    for w in [&mut w_jit, &mut w_c99, &mut w_rg] {
+        w.world_mut().run_schedule(FixedUpdate);
+    }
+    assert_four_way_snapshot("tick1", &w_jit, &w_c99, &w_rg, &tier3);
+
+    for (label, app) in [("jit", &w_jit), ("c99", &w_c99), ("rust_guest", &w_rg)] {
+        let b = read_single_comp_bytes_by_u32_id(app.world(), "MathCollPod", off("id"), 1);
+        let r_i32 = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let r_u32 = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let r_i64 = |o: usize| i64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let r_f32 = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+
+        assert!(
+            (r_f32(off("v3_rot")) - 0.0).abs() < 1e-4,
+            "{label} v3_rot.x"
+        );
+        assert!(
+            (r_f32(off("v3_rot") + 4) - 1.0).abs() < 1e-4,
+            "{label} v3_rot.y"
+        );
+        assert_eq!(r_i32(off("abs_i32_min")), i32::MIN, "{label} abs_i32_min");
+        assert_eq!(r_i64(off("abs_i64_min")), i64::MIN, "{label} abs_i64_min");
+        assert_eq!(
+            r_i32(off("abs_fx32")),
+            (3.25_f32 * 65536.0) as i32,
+            "{label} abs_fx32"
+        );
+        assert_eq!(
+            r_i64(off("abs_fx64")),
+            (5.5_f64 * 4_294_967_296.0) as i64,
+            "{label} abs_fx64"
+        );
+        assert_eq!(
+            r_i32(off("prod_fx32")),
+            20736_i32 * 65536,
+            "{label} prod_fx32"
+        );
+        assert_eq!(
+            r_i64(off("prod_fx64")),
+            1_000_000_000_i64 * 4_294_967_296,
+            "{label} prod_fx64"
+        );
+        assert_eq!(r_u32(off("red_cnt")), 3, "{label} red_cnt");
+        assert_eq!(b[off("red_any")], 1, "{label} red_any");
+        assert_eq!(b[off("red_all")], 0, "{label} red_all");
+        assert_eq!(r_i32(off("tbl_tag")), -9, "{label} tbl_tag");
+        assert_eq!(r_f32(off("tbl_off_x")), -2.0, "{label} tbl_off_x");
+        assert_eq!(b[off("tbl_has_127")], 1, "{label} tbl_has_127");
+        assert_eq!(b[off("bs_has_70")], 1, "{label} bs_has_70");
+        assert_eq!(b[off("bs_has_1")], 0, "{label} bs_has_1");
+        assert_eq!(r_i32(off("mat2") + 2 * 4), 77, "{label} mat2[1][0]");
+        assert_eq!(r_i32(off("cube3") + 5 * 4), 88, "{label} cube3[1][0][1]");
+        assert_eq!(r_u32(off("sv_len")), 3, "{label} sv_len");
+        assert_eq!(r_i32(off("sv_sum")), 66, "{label} sv_sum");
+    }
+}
+
+#[test]
+fn wave3_ecs_flow_fsm_task_timeline_atomic_four_way_parity() {
+    let _parity_rg = parity_alloc_read_guard();
+    let mut src = String::from(
+        r#"
+module parity::wave3_ecs_flow @version(1.0.0);
+
+resource SimClock { dt: sec = 0.016_s }
+
+component SelBox { id: u32 = 0, val: i32 = 0 }
+component RetBox { id: u32 = 0, val: i32 = 0 }
+component BornComp { tag_id: u32 = 0 }
+component RelParent { pval: i32 = 0 }
+component RelChild { cval: i32 = 0, got_prop: i32 = 0 }
+component TxBox { id: u32 = 1, hp: f32 = 10.0, arr: [i32; 2] = [1, 2], flags: BitSet<32> = bits(1) }
+component TxRoll { id: u32 = 2, hp: f32 = 10.0 }
+component FlowOut {
+    id: u32 = 1,
+    sel_changed: u32 = 0,
+    ret_changed: u32 = 0,
+    added_seen: u32 = 0,
+    childof_sum: i32 = 0,
+    squad_sum: i32 = 0,
+    prop_sum: i32 = 0,
+    tl_fired: u32 = 0,
+    tl_w31_active: bool = false,
+    task_if_val: i32 = 0,
+    task_race_ticks: i32 = 0,
+    fsm_local_val: i32 = 0,
+}
+
+relation ChildOf;
+relation Squad { power: u32 }
+event PulseEvt { inc: i32 }
+
+object Sel1 { SelBox { id: 1, val: 0 } }
+object Sel2 { SelBox { id: 2, val: 0 } }
+object Sel3 { SelBox { id: 3, val: 0 } }
+object Ret1 { RetBox { id: 1, val: 0 } }
+object Ret2 { RetBox { id: 2, val: 0 } }
+
+object RootNode { RelParent { pval: 100 }, RelChild { cval: 1, got_prop: 0 } }
+object ChildNode { RelChild { cval: 20, got_prop: 0 } }
+object SquadChild { RelChild { cval: 30, got_prop: 0 } }
+
+object ActorNode { FlowOut { id: 1 }, TxBox { id: 1 }, TxRoll { id: 2 } }
+
+obs on_pulse(trg: &Trigger<PulseEvt>) {
+    if let Some(rc) = query_one(c: &mut RelChild).on(trg.entity) {
+        rc.c.got_prop += trg.payload.inc;
+    }
+}
+
+@sparse
+timeline WinTl @rate(60_hz) @duration(10_f) {
+"#,
+    );
+    for w in 0..32 {
+        let start = if w == 31 { 1 } else { 0 };
+        src.push_str(&format!("    window w{w} = {start}_f .. 10_f;\n"));
+    }
+    src.push_str(
+        r#"    at 2_f => {
+        for o in query(fo: &mut FlowOut) {
+            o.fo.tl_fired += 1_u32;
+        }
+    }
+}
+
+fsm PersistFsm @require(FlowOut) {
+    initial Boot;
+    state Boot {
+        to Active when true;
+    }
+    state Active {
+        local_cnt: i32 = 0,
+        on_enter {
+            local_cnt = 10;
+            for o in query(fo: &mut FlowOut) {
+                o.fo.fsm_local_val = local_cnt;
+            }
+        }
+        on_tick {
+            local_cnt += 1;
+            for o in query(fo: &mut FlowOut) {
+                o.fo.fsm_local_val = local_cnt;
+            }
+        }
+        to Active when false;
+    }
+}
+
+@sparse
+task BranchRaceTask(flag: bool)
+    on (fo: &mut FlowOut)
+    using (clk: &res SimClock)
+{
+    if flag {
+        fo.task_if_val += 1;
+        yield_tick;
+        fo.task_if_val += 10;
+    }
+    race {
+        branch {
+            wait 0.020_s;
+        }
+        branch {
+            loop {
+                fo.task_race_ticks += 1;
+                yield_tick;
+            }
+        }
+    }
+    fo.task_if_val += 100;
+}
+
+sys init_links() {
+    let root = query_one(p: &RelParent).on(RootNode).unwrap().id;
+    let c_ent = query_one(c: &RelChild).on(ChildNode).unwrap().id;
+    let s_ent = query_one(c: &RelChild).on(SquadChild).unwrap().id;
+    insert_relation<ChildOf>(c_ent, root);
+    insert_relation<Squad>(s_ent, root, Squad { power: 5 });
+    let _b = spawn { BornComp { tag_id: 1 } };
+    let act = query_one(fo: &FlowOut).on(ActorNode).unwrap().id;
+    insert(act, PersistFsm::start());
+    insert(act, WinTl::start());
+    insert(act, BranchRaceTask::start(true));
+}
+
+sys mutate_selective_and_spawn() {
+    for row in query(s: &mut? SelBox) {
+        if row.s.id == 1_u32 {
+            row.s.val += 10;
+        } else if row.s.id == 2_u32 {
+            break;
+        }
+    }
+    for row in query(r: &mut? RetBox) {
+        row.r.val += 20;
+        return;
+    }
+}
+
+sys count_sel_and_added() {
+    let mut sc: u32 = 0;
+    for _s in query(s: &SelBox).changed<SelBox>() {
+        sc += 1;
+    }
+    let mut rc: u32 = 0;
+    for _r in query(r: &RetBox).changed<RetBox>() {
+        rc += 1;
+    }
+    let mut ac: u32 = 0;
+    for _b in query(b: &BornComp).added<BornComp>() {
+        ac += 1;
+    }
+    let mut c_sum: i32 = 0;
+    for u1 in query(c: &RelChild, p: Option<&RelParent>).up<ChildOf>() {
+        if let Some(par) = u1.p {
+            c_sum += u1.c.cval + par.pval;
+        }
+    }
+    let mut s_sum: i32 = 0;
+    for u2 in query(c: &RelChild, p: Option<&RelParent>).up<Squad>() {
+        if let Some(par) = u2.p {
+            s_sum += u2.c.cval + par.pval;
+        }
+    }
+    let mut tl_w31: bool = false;
+    for row in query(tl: &WinTl) {
+        tl_w31 = row.tl.in(w31);
+    }
+    for o in query(f: &mut FlowOut) {
+        o.f.sel_changed = sc;
+        o.f.ret_changed = rc;
+        o.f.added_seen += ac;
+        o.f.childof_sum = c_sum;
+        o.f.squad_sum = s_sum;
+        o.f.tl_w31_active = tl_w31;
+    }
+}
+
+sys run_prop_and_atomic() {
+    let c_ent = query_one(c: &RelChild).on(ChildNode).unwrap().id;
+    trigger(c_ent, PulseEvt { inc: 7 }, propagate: true);
+
+    let mut psum: i32 = 0;
+    for row in query(c: &RelChild) {
+        psum += row.c.got_prop;
+    }
+    for o in query(f: &mut FlowOut) {
+        o.f.prop_sum = psum;
+    }
+
+    for row in query(tx: &mut TxBox) {
+        atomic {
+            row.tx.hp = 30.0;
+            row.tx.arr[0] = 300;
+            row.tx.flags.set(5);
+            atomic {
+                row.tx.hp = 99.0;
+                row.tx.arr[0] = 999;
+                row.tx.flags.set(9);
+                require_true(false);
+            }
+            require_true(true);
+        }
+    }
+    for row in query(tr: &mut TxRoll) {
+        atomic {
+            row.tr.hp = 77.0;
+            require_true(false);
+        }
+    }
+}
+
+schedule Startup { init_links }
+schedule FixedUpdate {
+    seq Frame {
+        mutate_selective_and_spawn,
+        count_sel_and_added,
+        run_prop_and_atomic,
+        WinTl,
+        PersistFsm,
+        BranchRaceTask,
+    }
+}
+"#,
+    );
+    let tier3_driver = r#"
+    app.world_mut().run_schedule(Startup);
+    capture_snapshot(&out_dir, "init", app.world());
+    app.world_mut().run_schedule(FixedUpdate);
+    capture_snapshot(&out_dir, "tick1", app.world());
+    app.world_mut().run_schedule(FixedUpdate);
+    capture_snapshot(&out_dir, "tick2", app.world());
+    app.world_mut().run_schedule(FixedUpdate);
+    app.world_mut().run_schedule(FixedUpdate);
+    capture_snapshot(&out_dir, "tick4", app.world());
+"#;
+    let (_tmp, mir, mut w_jit, mut w_c99, mut w_rg, tier3) =
+        setup_four_way_apps("wave3_ecs_flow", &src, tier3_driver);
+    let fo_layout = mir
+        .layouts
+        .iter()
+        .find(|l| l.canonical_name.ends_with("FlowOut"))
+        .unwrap();
+    let fo_off = |name: &str| {
+        fo_layout
+            .fields
+            .iter()
+            .find(|f| !f.is_padding && f.name == name)
+            .unwrap()
+            .offset
+    };
+    let tx_layout = mir
+        .layouts
+        .iter()
+        .find(|l| l.canonical_name.ends_with("TxBox"))
+        .unwrap();
+    let tx_off = |name: &str| {
+        tx_layout
+            .fields
+            .iter()
+            .find(|f| !f.is_padding && f.name == name)
+            .unwrap()
+            .offset
+    };
+    let tr_layout = mir
+        .layouts
+        .iter()
+        .find(|l| l.canonical_name.ends_with("TxRoll"))
+        .unwrap();
+    let tr_off = |name: &str| {
+        tr_layout
+            .fields
+            .iter()
+            .find(|f| !f.is_padding && f.name == name)
+            .unwrap()
+            .offset
+    };
+
+    assert_four_way_snapshot("init", &w_jit, &w_c99, &w_rg, &tier3);
+    for tag in ["tick1", "tick2"] {
+        for w in [&mut w_jit, &mut w_c99, &mut w_rg] {
+            w.world_mut().run_schedule(FixedUpdate);
+        }
+        assert_four_way_snapshot(tag, &w_jit, &w_c99, &w_rg, &tier3);
+    }
+    for w in [&mut w_jit, &mut w_c99, &mut w_rg] {
+        w.world_mut().run_schedule(FixedUpdate);
+        w.world_mut().run_schedule(FixedUpdate);
+    }
+    assert_four_way_snapshot("tick4", &w_jit, &w_c99, &w_rg, &tier3);
+
+    for (label, app) in [("jit", &w_jit), ("c99", &w_c99), ("rust_guest", &w_rg)] {
+        let fb = read_single_comp_bytes_by_u32_id(app.world(), "FlowOut", fo_off("id"), 1);
+        let r_u32 = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let r_i32 = |b: &[u8], o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let r_f32 = |b: &[u8], o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+
+        assert_eq!(r_u32(&fb, fo_off("sel_changed")), 1, "{label} sel_changed");
+        assert_eq!(r_u32(&fb, fo_off("ret_changed")), 1, "{label} ret_changed");
+        assert_eq!(r_u32(&fb, fo_off("added_seen")), 1, "{label} added_seen");
+        assert_eq!(
+            r_i32(&fb, fo_off("childof_sum")),
+            221,
+            "{label} childof_sum"
+        );
+        assert_eq!(r_i32(&fb, fo_off("squad_sum")), 231, "{label} squad_sum");
+        assert_eq!(r_i32(&fb, fo_off("prop_sum")), 56, "{label} prop_sum");
+        assert!(r_u32(&fb, fo_off("tl_fired")) >= 1, "{label} tl_fired");
+        assert_eq!(fb[fo_off("tl_w31_active")], 1, "{label} tl_w31_active");
+        assert_eq!(
+            r_i32(&fb, fo_off("task_if_val")),
+            111,
+            "{label} task_if_val"
+        );
+        assert_eq!(
+            r_i32(&fb, fo_off("task_race_ticks")),
+            2,
+            "{label} task_race_ticks"
+        );
+        assert_eq!(
+            r_i32(&fb, fo_off("fsm_local_val")),
+            13,
+            "{label} fsm_local_val"
+        );
+
+        let tb = read_single_comp_bytes_by_u32_id(app.world(), "TxBox", tx_off("id"), 1);
+        assert_eq!(
+            r_f32(&tb, tx_off("hp")),
+            30.0,
+            "{label} nested atomic outer hp"
+        );
+        assert_eq!(
+            r_i32(&tb, tx_off("arr")),
+            300,
+            "{label} nested atomic outer arr[0]"
+        );
+        let flags = r_u32(&tb, tx_off("flags"));
+        assert_ne!(flags & (1u32 << 5), 0, "{label} outer bit 5 must stay set");
+        assert_eq!(
+            flags & (1u32 << 9),
+            0,
+            "{label} inner rolled-back bit 9 must stay clear"
+        );
+
+        let rb = read_single_comp_bytes_by_u32_id(app.world(), "TxRoll", tr_off("id"), 2);
+        assert_eq!(
+            r_f32(&rb, tr_off("hp")),
+            10.0,
+            "{label} rolled-back TxRoll hp"
+        );
+    }
+}
+
+#[test]
+fn wave3_spatial_schedules_and_migrate_four_way_parity() {
+    let _parity_rg = parity_alloc_read_guard();
+    let src_v1 = r#"
+module parity::wave3_spat_sched @version(1.0.0);
+
+component MigBox { x: i32 = 30 }
+sys init_mig() { let _ = spawn { MigBox { x: 30 } }; }
+schedule Startup { init_mig }
+"#;
+    let src_v2 = r#"
+module parity::wave3_spat_sched @version(2.0.0);
+
+struct NestV2 {
+    scale: i32 = 7,
+    bs: BitSet<128> = bits(2, 70),
+}
+
+component MigBoxV1 { x: i32 = 0 }
+component MigBox {
+    x: i32 = 0,
+    flag: bool = true,
+    m3: mat3 = mat3::IDENTITY,
+    nest: NestV2 = NestV2 {},
+}
+
+migrate MigBox from 1.0.0 to 2.0.0 (old: &MigBoxV1) -> MigBox {
+    MigBox {
+        x: old.x + 5,
+        flag: true,
+        m3: mat3::IDENTITY,
+        nest: NestV2 {},
+    }
+}
+
+component Pos3 { xyz: vec3 = vec3(0.0, 0.0, 0.0) }
+tag SpatTag;
+
+spatial_grid GridXZ(
+    cell_size: 4.0_m,
+    bounds: vec2(-20.0_m, -20.0_m)..vec2(20.0_m, 20.0_m),
+    plane_axes: [0, 2],
+    capacity: 16,
+) over SpatTag by Pos3.xyz;
+
+spatial_history HistXZ(
+    frames: 4,
+    cell_size: 4.0_m,
+    bounds: vec2(-20.0_m, -20.0_m)..vec2(20.0_m, 20.0_m),
+    plane_axes: [0, 2],
+    capacity: 16,
+) over SpatTag by Pos3.xyz;
+
+component SpatOut {
+    id: u32 = 1,
+    xz_hits: u32 = 0,
+    seg_wide_hits: u32 = 0,
+    seg_narrow_hits: u32 = 0,
+    seg_oob_hits: u32 = 0,
+    sched_trace: i32 = 0,
+    never_ran: bool = false,
+}
+
+object UnitNearZ { Pos3 { xyz: vec3(2.0, 50.0, 2.0) }, SpatTag }
+object UnitMoveZ { Pos3 { xyz: vec3(2.0, -30.0, 12.0) }, SpatTag }
+object ProbeEnt { SpatOut { id: 1 } }
+
+sys move_z_in_range() {
+    for p in query(pos: &mut Pos3) {
+        if p.pos.xyz.z > 10.0 {
+            p.pos.xyz.z = 2.0;
+        }
+    }
+}
+
+sys scan_xz_and_hist(g: &res GridXZ, h: &res HistXZ) {
+    let mut xz: u32 = 0;
+    for _u in g.query_disc(vec2(2.0, 2.0), 1.5_m) {
+        xz += 1;
+    }
+    let mut sw: u32 = 0;
+    for _w in h.query_segment_at(0, vec3(0.0, 0.0, 0.0), vec3(4.0, 0.0, 0.0), 2.5_m) {
+        sw += 1;
+    }
+    let mut sn: u32 = 0;
+    for _n in h.query_segment_at(0, vec3(0.0, 0.0, 0.0), vec3(4.0, 0.0, 0.0), 0.5_m) {
+        sn += 1;
+    }
+    let mut soob: u32 = 0;
+    for _o in h.query_segment_at(999, vec3(0.0, 0.0, 0.0), vec3(4.0, 0.0, 0.0), 5.0_m) {
+        soob += 1;
+    }
+    for row in query(so: &mut SpatOut) {
+        row.so.xz_hits = xz;
+        row.so.seg_wide_hits = sw;
+        row.so.seg_narrow_hits = sn;
+        row.so.seg_oob_hits = soob;
+    }
+}
+
+sys step_a() {
+    for row in query(so: &mut SpatOut) {
+        row.so.sched_trace = 1;
+    }
+}
+
+sys step_b() {
+    for row in query(so: &mut SpatOut) {
+        row.so.sched_trace = row.so.sched_trace * 10 + 2;
+    }
+}
+
+sys blocked_sys() {
+    for row in query(so: &mut SpatOut) {
+        row.so.never_ran = true;
+    }
+}
+
+schedule FixedUpdate {
+    move_z_in_range before(scan_xz_and_hist)
+    scan_xz_and_hist
+    set GroupA before(GroupB) { step_a }
+    set GroupB after(GroupA) { step_b }
+}
+
+schedule FixedUpdate run_if(false) {
+    blocked_sys
+}
+"#;
+
+    // 1. 4-way differential parity on v2 spatial XZ, non-seq rebuild, radius/OOB, before/after, run_if(false)
+    let tier3_driver = r#"
+    app.world_mut().run_schedule(Startup);
+    capture_snapshot(&out_dir, "init", app.world());
+    app.world_mut().run_schedule(FixedUpdate);
+    capture_snapshot(&out_dir, "tick1", app.world());
+"#;
+    let (tmp, mir, mut w_jit, mut w_c99, mut w_rg, tier3) =
+        setup_four_way_apps("wave3_spat_sched", src_v2, tier3_driver);
+    let so_layout = mir
+        .layouts
+        .iter()
+        .find(|l| l.canonical_name.ends_with("SpatOut"))
+        .unwrap();
+    let so_off = |name: &str| {
+        so_layout
+            .fields
+            .iter()
+            .find(|f| !f.is_padding && f.name == name)
+            .unwrap()
+            .offset
+    };
+
+    assert_four_way_snapshot("init", &w_jit, &w_c99, &w_rg, &tier3);
+    for w in [&mut w_jit, &mut w_c99, &mut w_rg] {
+        w.world_mut().run_schedule(FixedUpdate);
+    }
+    assert_four_way_snapshot("tick1", &w_jit, &w_c99, &w_rg, &tier3);
+
+    for (label, app) in [("jit", &w_jit), ("c99", &w_c99), ("rust_guest", &w_rg)] {
+        let b = read_single_comp_bytes_by_u32_id(app.world(), "SpatOut", so_off("id"), 1);
+        let r_u32 = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let r_i32 = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        assert_eq!(r_u32(so_off("xz_hits")), 2, "{label} xz_hits");
+        assert_eq!(r_u32(so_off("seg_wide_hits")), 2, "{label} seg_wide_hits");
+        assert_eq!(
+            r_u32(so_off("seg_narrow_hits")),
+            0,
+            "{label} seg_narrow_hits"
+        );
+        assert_eq!(r_u32(so_off("seg_oob_hits")), 0, "{label} seg_oob_hits");
+        assert_eq!(r_i32(so_off("sched_trace")), 12, "{label} sched_trace");
+        assert_eq!(b[so_off("never_ran")], 0, "{label} run_if(false) never_ran");
+    }
+
+    // 2. Live Slot-67 v1 -> v2 migration with mat3 + nested BitSet<128> across JIT, C99, RustGuest
+    let v1_path = tmp.path().join("mig_adv_v1.strata");
+    let v2_path = tmp.path().join("mig_adv_v2.strata");
+    fs::write(&v1_path, src_v1).unwrap();
+    fs::write(&v2_path, src_v2).unwrap();
+
+    let mb_layout = mir
+        .layouts
+        .iter()
+        .find(|l| l.canonical_name.ends_with("MigBox"))
+        .unwrap();
+    let mb_off = |name: &str| {
+        mb_layout
+            .fields
+            .iter()
+            .find(|f| !f.is_padding && f.name == name)
+            .unwrap()
+            .offset
+    };
+
+    let mut mig_bytes = Vec::new();
+    for (label, target) in [
+        ("jit", BuildTarget::Jit),
+        ("c99", BuildTarget::C99),
+        ("rust_guest", BuildTarget::RustGuest),
+    ] {
+        let bin_v1 = build_target_bin(&v1_path, target, &tmp.path().join(format!("{label}_mv1")));
+        let bin_v2 = build_target_bin(&v2_path, target, &tmp.path().join(format!("{label}_mv2")));
+        let (mut app, mod_id) = setup_dynamic_app_with_mod(&bin_v1);
+        let h_v1 = find_component_handle(app.world(), "MigBox");
+        let ents = find_entities_with_handle(app.world(), h_v1);
+        assert_eq!(ents.len(), 1, "{label} v1 MigBox entity");
+        let ent = ents[0];
+
+        app.reload_mod_from(mod_id, &bin_v2, LoadOptions::default())
+            .unwrap_or_else(|e| panic!("{label} Slot-67 migrate failed: {e}"));
+        let h_v2 = find_component_handle(app.world(), "MigBox");
+        let bytes = read_entity_pod_bytes(app.world(), ent, h_v2).unwrap();
+        let x = i32::from_le_bytes(bytes[mb_off("x")..mb_off("x") + 4].try_into().unwrap());
+        assert_eq!(x, 35, "{label} migrated x");
+        assert_eq!(bytes[mb_off("flag")], 1, "{label} migrated flag");
+        let m0 = f32::from_le_bytes(bytes[mb_off("m3")..mb_off("m3") + 4].try_into().unwrap());
+        let m4 = f32::from_le_bytes(
+            bytes[mb_off("m3") + 16..mb_off("m3") + 20]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(
+            (m0 - 1.0).abs() < 1e-5 && (m4 - 1.0).abs() < 1e-5,
+            "{label} mat3::IDENTITY"
+        );
+        mig_bytes.push((label, bytes));
+    }
+    for (label, bytes) in &mig_bytes[1..] {
+        assert_eq!(
+            bytes, &mig_bytes[0].1,
+            "migrated MigBox bytes diverged for `{label}`"
+        );
+    }
+}
